@@ -8,6 +8,7 @@ Controls:
 - RIGHT CLICK: Toggle wall orientation (Horizontal <-> Vertical).
 - 'W' Key: Toggle between Move Mode and Wall Mode.
 - 'R' Key: Toggle wall orientation.
+- 'F' Key: Toggle who makes the first move and restart.
 - 'ESC': Quit.
 
 Features:
@@ -23,6 +24,7 @@ import math
 from collections import deque
 from enum import Enum
 from typing import List, Tuple, Set, Optional, Dict
+import concurrent.futures
 
 # --- Constants & Configuration ---
 BOARD_SIZE = 9
@@ -58,44 +60,72 @@ class WallOrientation(Enum):
     HORIZONTAL = 0
     VERTICAL = 1
 
+DIRECTIONS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+ALL_WALL_PLACEMENTS = tuple(
+    (orient, r, c)
+    for orient in (WallOrientation.HORIZONTAL, WallOrientation.VERTICAL)
+    for r in range(BOARD_SIZE - 1)
+    for c in range(BOARD_SIZE - 1)
+)
+
 # --- Game Logic Implementation ---
 
 class BarricadeState:
     def __init__(self):
-        # Pawns: (row, col). RED starts at (4, 0), BLUE at (4, 8)
-        self.pawns = {Player.RED: (4, 0), Player.BLUE: (4, 8)}
-        # Walls: Set of tuples.
-        # Horizontal: (r, c) means wall between (r,c) and (r,c+1) AND (r+1,c) and (r+1,c+1)?
-        # Let's define standard coordinate system for walls:
-        # A wall is defined by its top-left corner grid intersection relative to cells.
-        # Actually, simpler:
-        # Horizontal wall at (r, c) blocks movement between (r,c)-(r,c+1) and (r+1,c)-(r+1,c+1).
-        # Wait, standard barricade/quoridor walls are length 2.
-        # Let's store walls as: (orientation, r, c)
-        # If HORIZONTAL: blocks vertical movement? No, horizontal wall blocks vertical crossing?
-        # Clarification: A horizontal wall lies horizontally. It blocks vertical movement across it.
-        # It sits between row r and r+1. It spans column c to c+1.
-        # So HORIZONTAL (r, c) blocks: (r,c)->(r+1,c) and (r,c+1)->(r+1,c+1).
-        # VERTICAL (r, c) sits between col c and c+1. Spans row r to r+1.
-        # Blocks: (r,c)->(r,c+1) and (r+1,c)->(r+1,c+1).
-
+        # Pawns: (row, col). RED starts at (0, 4) (top), BLUE at (8, 4) (bottom)
+        self.pawns = {Player.RED: (0, 4), Player.BLUE: (8, 4)}
+        # HORIZONTAL (r, c) blocks vertical movement across row r/r+1 at columns c and c+1.
+        # VERTICAL (r, c) blocks horizontal movement across col c/c+1 at rows r and r+1.
         self.walls: Set[Tuple[WallOrientation, int, int]] = set()
         self.current_player = Player.RED
         self.winner = None
+        self.walls_left = {Player.RED: 10, Player.BLUE: 10}
 
-        # Cache for pathfinding to ensure fairness
+        self._valid_moves_cache_key = None
+        self._valid_moves_cache = None
         self._path_cache = {}
+        self._route_cache = {}
 
     def copy(self):
-        new_state = BarricadeState()
+        new_state = BarricadeState.__new__(BarricadeState)
         new_state.pawns = dict(self.pawns)
         new_state.walls = set(self.walls)
         new_state.current_player = self.current_player
         new_state.winner = self.winner
+        new_state.walls_left = dict(self.walls_left)
+        new_state._valid_moves_cache_key = None
+        new_state._valid_moves_cache = None
+        new_state._path_cache = self._path_cache
+        new_state._route_cache = self._route_cache
         return new_state
+
+    def _state_cache_key(self) -> Tuple:
+        return (
+            self.pawns[Player.RED],
+            self.pawns[Player.BLUE],
+            self.current_player,
+            self.winner,
+            self.walls_left[Player.RED],
+            self.walls_left[Player.BLUE],
+            frozenset(self.walls),
+        )
 
     def get_valid_moves(self) -> List[Tuple]:
         """Returns list of valid moves: ('move', r, c) or ('wall', orientation, r, c)"""
+        if self.winner is not None:
+            return []
+
+        key = self._state_cache_key()
+        if key == self._valid_moves_cache_key and self._valid_moves_cache is not None:
+            return list(self._valid_moves_cache)
+
+        moves = self.get_pawn_moves()
+        moves.extend(self.get_valid_wall_moves())
+        self._valid_moves_cache_key = key
+        self._valid_moves_cache = tuple(moves)
+        return moves
+
+    def get_pawn_moves(self) -> List[Tuple]:
         if self.winner is not None:
             return []
 
@@ -104,118 +134,66 @@ class BarricadeState:
         op = self.current_player.opposite()
         or_, oc = self.pawns[op]
 
-        # 1. Pawn Moves
-        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-        for dr, dc in directions:
+        for dr, dc in DIRECTIONS:
             nr, nc = pr + dr, pc + dc
 
-            # Check bounds
             if not (0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE):
                 continue
 
-            # Check wall blocking
             if self._is_blocked(pr, pc, nr, nc):
                 continue
 
-            # Check collision with opponent
             if (nr, nc) == (or_, oc):
-                # Try jump
                 jr, jc = nr + dr, nc + dc
-                if 0 <= jr < BOARD_SIZE and 0 <= jc < BOARD_SIZE:
-                    if not self._is_blocked(nr, nc, jr, jc):
-                        moves.append(('move', jr, jc))
-                # Side jumps? Standard Quoridor/Barricade often allows diagonal jumps if blocked straight.
-                # Rule provided: "jump over it and land one square beyond it".
-                # Does not explicitly mention side jumps. Sticking to straight jump for simplicity based on prompt.
-                # However, if straight jump is blocked by wall, can we jump side?
-                # Prompt says: "land one square beyond it, as long as that landing square is valid and not blocked."
-                # We'll stick to straight jump only as per strict reading.
+                can_jump_straight = (
+                    0 <= jr < BOARD_SIZE
+                    and 0 <= jc < BOARD_SIZE
+                    and not self._is_blocked(nr, nc, jr, jc)
+                )
+                if can_jump_straight:
+                    moves.append(('move', jr, jc))
+
+                side_dirs = ((0, -1), (0, 1)) if dr else ((-1, 0), (1, 0))
+                for sdr, sdc in side_dirs:
+                    sr, sc = nr + sdr, nc + sdc
+                    if 0 <= sr < BOARD_SIZE and 0 <= sc < BOARD_SIZE:
+                        if not self._is_blocked(nr, nc, sr, sc):
+                            moves.append(('move', sr, sc))
             else:
                 moves.append(('move', nr, nc))
 
-        # 2. Wall Moves
-        # Only if player has walls left? The prompt implies infinite walls or fixed count?
-        # "Each player controls: 1 pawn, 10 walls".
-        # We need to track wall count.
-        # For this implementation, let's assume max 10 walls per player.
-        # We need to add wall counts to state init.
-        # Adding attribute dynamically for now if missing (for backward compat if logic separated)
-        if not hasattr(self, 'walls_left'):
-            self.walls_left = {Player.RED: 10, Player.BLUE: 10}
-
-        if self.walls_left[self.current_player] > 0:
-            for orient in [WallOrientation.HORIZONTAL, WallOrientation.VERTICAL]:
-                for r in range(BOARD_SIZE - 1):
-                    for c in range(BOARD_SIZE - 1):
-                        if self._is_valid_wall_placement(orient, r, c):
-                            moves.append(('wall', orient, r, c))
-
         return moves
+
+    def get_valid_wall_moves(self, candidates=None) -> List[Tuple]:
+        if self.walls_left[self.current_player] <= 0:
+            return []
+
+        wall_moves = []
+        placements = ALL_WALL_PLACEMENTS if candidates is None else candidates
+        for orient, r, c in placements:
+            if self._is_valid_wall_placement(orient, r, c):
+                wall_moves.append(('wall', orient, r, c))
+
+        return wall_moves
 
     def _is_blocked(self, r1, c1, r2, c2) -> bool:
         """Check if a direct step between two adjacent cells is blocked by a wall."""
-        # Determine wall position that would block this
         if r1 == r2: # Horizontal move
             c_min = min(c1, c2)
-            # Vertical wall between c_min and c_min+1 at row r1 (and r1-1?)
-            # A vertical wall at (r, c) blocks (r,c)<->(r,c+1) and (r+1,c)<->(r+1,c+1)
-            # So if moving (r, c_min) to (r, c_min+1), we check Vertical wall at (r, c_min) OR (r-1, c_min)
-            # Actually, standard representation: Vertical wall at (r, c) is between col c and c+1, spanning row r to r+1.
-            # So it blocks (r,c)-(r,c+1) and (r+1,c)-(r+1,c+1).
-            # We need to check if any vertical wall covers this edge.
             for wr in [r1, r1 - 1]:
-                if (WallOrientation.VERTICAL, wr, c_min) in self.walls:
+                if 0 <= wr < BOARD_SIZE - 1 and (WallOrientation.VERTICAL, wr, c_min) in self.walls:
                     return True
         elif c1 == c2: # Vertical move
             r_min = min(r1, r2)
-            # Horizontal wall at (r, c) blocks (r,c)-(r+1,c) and (r,c+1)-(r+1,c+1)
-            # Moving (r_min, c) to (r_min+1, c). Check Horizontal wall at (r_min, c) or (r_min, c-1)
             for wc in [c1, c1 - 1]:
-                if (WallOrientation.HORIZONTAL, r_min, wc) in self.walls:
+                if 0 <= wc < BOARD_SIZE - 1 and (WallOrientation.HORIZONTAL, r_min, wc) in self.walls:
                     return True
         return False
 
     def _is_valid_wall_placement(self, orient: WallOrientation, r: int, c: int) -> bool:
-        # 1. Bounds check (already handled by loop ranges usually, but safe check)
-        if r < 0 or r >= BOARD_SIZE - 1 or c < 0 or c >= BOARD_SIZE - 1:
+        if not self._is_wall_shape_available(orient, r, c):
             return False
 
-        # 2. Overlap check
-        if (orient, r, c) in self.walls:
-            return False
-
-        # 3. Intersection check
-        # Horizontal at (r,c) intersects Vertical at (r,c), (r-1,c), (r,c-1), (r-1,c-1)?
-        # H (r,c) spans rows r,r+1 and cols c,c+1 (blocking vertical crossings)
-        # Wait, my definition: H(r,c) blocks (r,c)-(r+1,c) and (r,c+1)-(r+1,c+1).
-        # Visually, it's a bar between row r and r+1, from col c to c+1.
-        # V(r,c) is a bar between col c and c+1, from row r to r+1.
-        # They intersect if they share the same central point?
-        # H(r,c) center is (r+0.5, c+0.5) relative to grid lines? No.
-        # Let's visualize grid points (intersections).
-        # Cells are (0..8, 0..8).
-        # H wall at (r,c) sits on the line between row r and r+1, from x=c to x=c+1.
-        # V wall at (r,c) sits on the line between col c and c+1, from y=r to y=r+1.
-        # Intersection happens if:
-        # H(r, c) and V(r, c) -> Cross at (r+0.5, c+0.5)?
-        # H(r,c) covers y=r+0.5, x in [c, c+1].
-        # V(r,c) covers x=c+0.5, y in [r, r+1].
-        # Yes, they cross.
-        # Also H(r,c) crosses V(r-1, c), H(r,c) crosses V(r, c-1), H(r,c) crosses V(r-1, c-1).
-        # Basically, if we place H(r,c), we cannot place V anywhere that touches that segment.
-        # Touching V candidates: (r, c), (r-1, c), (r, c-1), (r-1, c-1).
-
-        if orient == WallOrientation.HORIZONTAL:
-            for vr, vc in [(r, c), (r-1, c), (r, c-1), (r-1, c-1)]:
-                if (WallOrientation.VERTICAL, vr, vc) in self.walls:
-                    return False
-        else: # Vertical
-            for hr, hc in [(r, c), (r, c-1), (r-1, c), (r-1, c-1)]:
-                if (WallOrientation.HORIZONTAL, hr, hc) in self.walls:
-                    return False
-
-        # 4. Path blocking check (BFS)
-        # Temporarily add wall
         self.walls.add((orient, r, c))
         can_reach_red = self._has_path(Player.RED)
         can_reach_blue = self._has_path(Player.BLUE)
@@ -223,26 +201,86 @@ class BarricadeState:
 
         return can_reach_red and can_reach_blue
 
+    def _is_wall_shape_available(self, orient: WallOrientation, r: int, c: int) -> bool:
+        if r < 0 or r >= BOARD_SIZE - 1 or c < 0 or c >= BOARD_SIZE - 1:
+            return False
+
+        if orient == WallOrientation.HORIZONTAL:
+            if (WallOrientation.HORIZONTAL, r, c) in self.walls: return False
+            if (WallOrientation.HORIZONTAL, r, c - 1) in self.walls: return False
+            if (WallOrientation.HORIZONTAL, r, c + 1) in self.walls: return False
+            if (WallOrientation.VERTICAL, r, c) in self.walls: return False
+        else: # Vertical
+            if (WallOrientation.VERTICAL, r, c) in self.walls: return False
+            if (WallOrientation.VERTICAL, r - 1, c) in self.walls: return False
+            if (WallOrientation.VERTICAL, r + 1, c) in self.walls: return False
+            if (WallOrientation.HORIZONTAL, r, c) in self.walls: return False
+
+        return True
+
     def _has_path(self, player: Player) -> bool:
+        return self.shortest_path_length(player) is not None
+
+    def shortest_path_length(self, player: Player) -> Optional[int]:
+        key = ('distance', player, self.pawns[player], frozenset(self.walls))
+        if key in self._path_cache:
+            return self._path_cache[key]
+
         start = self.pawns[player]
         target_row = 8 if player == Player.RED else 0
 
-        queue = deque([start])
+        queue = deque([(start, 0)])
         visited = set([start])
 
         while queue:
-            r, c = queue.popleft()
+            (r, c), dist = queue.popleft()
             if r == target_row:
-                return True
+                self._path_cache[key] = dist
+                return dist
 
-            for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
+            for dr, dc in DIRECTIONS:
                 nr, nc = r + dr, c + dc
                 if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
                     if (nr, nc) not in visited:
                         if not self._is_blocked(r, c, nr, nc):
                             visited.add((nr, nc))
-                            queue.append((nr, nc))
-        return False
+                            queue.append(((nr, nc), dist + 1))
+
+        self._path_cache[key] = None
+        return None
+
+    def shortest_path_cells(self, player: Player) -> Optional[Tuple[Tuple[int, int], ...]]:
+        key = ('route', player, self.pawns[player], frozenset(self.walls))
+        if key in self._route_cache:
+            return self._route_cache[key]
+
+        start = self.pawns[player]
+        target_row = 8 if player == Player.RED else 0
+        queue = deque([start])
+        parent = {start: None}
+
+        while queue:
+            r, c = queue.popleft()
+            if r == target_row:
+                path = []
+                node = (r, c)
+                while node is not None:
+                    path.append(node)
+                    node = parent[node]
+                result = tuple(reversed(path))
+                self._route_cache[key] = result
+                return result
+
+            for dr, dc in DIRECTIONS:
+                nr, nc = r + dr, c + dc
+                nxt = (nr, nc)
+                if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE and nxt not in parent:
+                    if not self._is_blocked(r, c, nr, nc):
+                        parent[nxt] = (r, c)
+                        queue.append(nxt)
+
+        self._route_cache[key] = None
+        return None
 
     def apply_move(self, move: Tuple) -> 'BarricadeState':
         new_state = self.copy()
@@ -259,8 +297,6 @@ class BarricadeState:
         elif type_ == 'wall':
             _, orient, r, c = move
             new_state.walls.add((orient, r, c))
-            if not hasattr(new_state, 'walls_left'):
-                new_state.walls_left = {Player.RED: 10, Player.BLUE: 10}
             new_state.walls_left[new_state.current_player] -= 1
 
         new_state.current_player = new_state.current_player.opposite()
@@ -269,27 +305,27 @@ class BarricadeState:
 # --- AI Implementation ---
 
 class BarricadeAI:
-    def __init__(self, player: Player, max_depth: int = 3):
+    def __init__(self, player: Player, max_depth: int = 3, max_wall_moves: int = 24):
         self.player = player
         self.max_depth = max_depth
+        self.max_wall_moves = max_wall_moves
+        self.tt = {}
+        self._search_moves_cache = {}
 
     def get_best_move(self, state: BarricadeState) -> Optional[Tuple]:
-        moves = state.get_valid_moves()
+        self.tt.clear()
+        self._search_moves_cache.clear()
+        moves = self._ordered_moves(state, self.max_depth)
         if not moves:
             return None
 
-        # Sort moves for better pruning (heuristic: moves closer to goal first, walls that block opponent)
-        # Simple shuffle or sort could work, but let's just run minimax
         best_score = -math.inf
         best_move = moves[0]
-
         alpha = -math.inf
         beta = math.inf
 
-        # Limit depth if board is large, but 3 is okay for 9x9 with BFS heuristic
         for move in moves:
-            next_state = state.apply_move(move)
-            score = self._minimax(next_state, self.max_depth - 1, alpha, beta, False)
+            score = self._minimax(state.apply_move(move), self.max_depth - 1, alpha, beta, False)
             if score > best_score:
                 best_score = score
                 best_move = move
@@ -297,39 +333,109 @@ class BarricadeAI:
 
         return best_move
 
+    def _state_hash(self, state: BarricadeState) -> tuple:
+        return state._state_cache_key()
+
     def _minimax(self, state: BarricadeState, depth: int, alpha: float, beta: float, is_maximizing: bool) -> float:
+        s_hash = self._state_hash(state)
+        if s_hash in self.tt and self.tt[s_hash][1] >= depth:
+            return self.tt[s_hash][0]
+
         if state.winner is not None:
             if state.winner == self.player:
-                return 1000 + depth # Prefer faster wins
+                score = 1000 + depth # Prefer faster wins
             else:
-                return -1000 - depth
+                score = -1000 - depth
+            self.tt[s_hash] = (score, depth)
+            return score
 
         if depth == 0:
-            return self._evaluate(state)
+            score = self._evaluate(state)
+            self.tt[s_hash] = (score, depth)
+            return score
 
-        moves = state.get_valid_moves()
+        moves = self._ordered_moves(state, depth)
         if not moves:
-            # No moves means loss? Or stalemate? Assuming loss if no moves and not won.
-            return -1000
+            moves = state.get_valid_moves()
+        if not moves:
+            score = -1000
+            self.tt[s_hash] = (score, depth)
+            return score
 
         if is_maximizing:
             max_eval = -math.inf
+            completed = True
             for move in moves:
                 eval_score = self._minimax(state.apply_move(move), depth - 1, alpha, beta, False)
                 max_eval = max(max_eval, eval_score)
                 alpha = max(alpha, eval_score)
                 if beta <= alpha:
+                    completed = False
                     break
+            if completed:
+                self.tt[s_hash] = (max_eval, depth)
             return max_eval
         else:
             min_eval = math.inf
+            completed = True
             for move in moves:
                 eval_score = self._minimax(state.apply_move(move), depth - 1, alpha, beta, True)
                 min_eval = min(min_eval, eval_score)
                 beta = min(beta, eval_score)
                 if beta <= alpha:
+                    completed = False
                     break
+            if completed:
+                self.tt[s_hash] = (min_eval, depth)
             return min_eval
+
+    def _ordered_moves(self, state: BarricadeState, depth: int) -> List[Tuple]:
+        cache_key = (state._state_cache_key(), depth)
+        if cache_key in self._search_moves_cache:
+            return list(self._search_moves_cache[cache_key])
+
+        moves = state.get_pawn_moves()
+        if state.walls_left[state.current_player] > 0:
+            candidates = self._candidate_wall_placements(state)
+            wall_moves = state.get_valid_wall_moves(candidates)
+            wall_moves.sort(key=lambda move: self._move_order_score(state, move), reverse=True)
+            wall_limit = self.max_wall_moves if depth >= self.max_depth - 1 else max(8, self.max_wall_moves // 2)
+            moves.extend(wall_moves[:wall_limit])
+
+        moves.sort(key=lambda move: self._move_order_score(state, move), reverse=True)
+        self._search_moves_cache[cache_key] = tuple(moves)
+        return moves
+
+    def _candidate_wall_placements(self, state: BarricadeState) -> List[Tuple[WallOrientation, int, int]]:
+        focus_cells = set(state.pawns.values())
+        for player in (Player.RED, Player.BLUE):
+            path = state.shortest_path_cells(player)
+            if path:
+                focus_cells.update(path)
+
+        candidates = set()
+        for row, col in focus_cells:
+            for r in range(row - 1, row + 2):
+                for c in range(col - 1, col + 2):
+                    if 0 <= r < BOARD_SIZE - 1 and 0 <= c < BOARD_SIZE - 1:
+                        candidates.add((WallOrientation.HORIZONTAL, r, c))
+                        candidates.add((WallOrientation.VERTICAL, r, c))
+
+        return sorted(candidates, key=lambda item: (item[0].value, item[1], item[2]))
+
+    def _move_order_score(self, state: BarricadeState, move: Tuple) -> float:
+        current = state.current_player
+        if move[0] == 'move':
+            _, r, c = move
+            progress = r if current == Player.RED else (BOARD_SIZE - 1 - r)
+            center_bonus = BOARD_SIZE // 2 - abs(c - BOARD_SIZE // 2)
+            return 100 + progress * 4 + center_bonus
+
+        _, _, r, c = move
+        opponent = current.opposite()
+        op_r, op_c = state.pawns[opponent]
+        distance_to_opponent = abs(r - op_r) + abs(c - op_c)
+        return 60 - distance_to_opponent * 3
 
     def _evaluate(self, state: BarricadeState) -> float:
         # Heuristic: Distance to goal - Opponent distance to goal + Wall advantage
@@ -345,28 +451,15 @@ class BarricadeAI:
         if hasattr(state, 'walls_left'):
             score += (state.walls_left[self.player] - state.walls_left[self.player.opposite()]) * 2
 
+        my_pos = state.pawns[self.player]
+        opp_pos = state.pawns[self.player.opposite()]
+        score += (4 - abs(my_pos[1] - 4)) * 0.5
+        score -= (4 - abs(opp_pos[1] - 4)) * 0.5
+
         return score
 
     def _shortest_path(self, state: BarricadeState, player: Player) -> Optional[int]:
-        start = state.pawns[player]
-        target_row = 8 if player == Player.RED else 0
-
-        queue = deque([(start, 0)])
-        visited = set([start])
-
-        while queue:
-            (r, c), dist = queue.popleft()
-            if r == target_row:
-                return dist
-
-            for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < BOARD_SIZE and 0 <= nc < BOARD_SIZE:
-                    if (nr, nc) not in visited:
-                        if not state._is_blocked(r, c, nr, nc):
-                            visited.add((nr, nc))
-                            queue.append(((nr, nc), dist + 1))
-        return None
+        return state.shortest_path_length(player)
 
 # --- Pygame UI Implementation ---
 
@@ -381,6 +474,7 @@ class BarricadeUI:
 
         self.state = BarricadeState()
         self.ai = BarricadeAI(Player.BLUE, max_depth=3) # AI plays Blue
+        self.engine_starts = False
 
         self.mode = 'move' # 'move' or 'wall'
         self.wall_orientation = WallOrientation.HORIZONTAL
@@ -388,10 +482,34 @@ class BarricadeUI:
         self.hover_pos = None # (row, col) for cell hover
         self.hover_wall_pos = None # (orient, r, c) for wall hover
         self.valid_moves_cache = []
+        self.valid_moves_set = set()
 
-        self.message = "Your Turn (Red)"
         self.game_over = False
         self.ai_thinking = False
+        self.last_click_time = 0
+        
+        self.ai_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.ai_future = None
+        self.reset_game()
+
+    def refresh_valid_moves(self):
+        self.valid_moves_cache = self.state.get_valid_moves()
+        self.valid_moves_set = set(self.valid_moves_cache)
+
+    def reset_game(self):
+        self.state = BarricadeState()
+        if self.engine_starts:
+            self.state.current_player = Player.BLUE
+
+        self.game_over = False
+        self.ai_thinking = self.engine_starts
+        self.ai_future = None
+        self.message = "AI Thinking..." if self.engine_starts else "Your Turn (Red)"
+        self.refresh_valid_moves()
+
+    def toggle_first_move(self):
+        self.engine_starts = not self.engine_starts
+        self.reset_game()
 
     def run(self):
         running = True
@@ -404,17 +522,18 @@ class BarricadeUI:
             pygame.display.flip()
 
             if self.ai_thinking and not self.game_over:
-                # Run AI in a separate step or yield?
-                # For simplicity in single thread, we do it here but it freezes UI briefly.
-                # For depth 3 on 9x9, it should be fast enough (<1s).
-                best_move = self.ai.get_best_move(self.state)
-                if best_move:
-                    self.state = self.state.apply_move(best_move)
-                    self.check_game_status()
-                    if not self.game_over:
-                        self.message = "Your Turn (Red)"
-                        self.valid_moves_cache = self.state.get_valid_moves()
-                self.ai_thinking = False
+                if self.ai_future is None:
+                    self.ai_future = self.ai_executor.submit(self.ai.get_best_move, self.state.copy())
+                elif self.ai_future.done():
+                    best_move = self.ai_future.result()
+                    if best_move:
+                        self.state = self.state.apply_move(best_move)
+                        self.check_game_status()
+                        if not self.game_over:
+                            self.message = "Your Turn (Red)"
+                            self.refresh_valid_moves()
+                    self.ai_thinking = False
+                    self.ai_future = None
 
         pygame.quit()
         sys.exit()
@@ -426,11 +545,11 @@ class BarricadeUI:
                 sys.exit()
 
             if self.game_over:
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
-                    self.state = BarricadeState()
-                    self.game_over = False
-                    self.message = "Your Turn (Red)"
-                    self.valid_moves_cache = self.state.get_valid_moves()
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_r:
+                        self.reset_game()
+                    elif event.key == pygame.K_f:
+                        self.toggle_first_move()
                 continue
 
             if self.ai_thinking:
@@ -445,8 +564,12 @@ class BarricadeUI:
                     sys.exit()
                 if event.key == pygame.K_w:
                     self.mode = 'wall' if self.mode == 'move' else 'move'
+                    # Refresh cache when mode changes to show correct highlights
+                    self.refresh_valid_moves()
                 if event.key == pygame.K_r:
                     self.wall_orientation = WallOrientation.VERTICAL if self.wall_orientation == WallOrientation.HORIZONTAL else WallOrientation.HORIZONTAL
+                if event.key == pygame.K_f:
+                    self.toggle_first_move()
 
             if event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1: # Left Click
@@ -525,7 +648,7 @@ class BarricadeUI:
 
             # Candidate H wall: row_boundary = round(row) - 1?
             # If mouse is at y=10.2 (cell 10), top boundary is 10, bottom is 11.
-            # If ry < 0.5, closer to top (c_row). Wall row = c_row - 1?
+            # If ry < 0.5, closer to top (c_row). Wall row = c_row-1?
             # Wait, H wall at (r, c) is BETWEEN row r and r+1.
             # So if we are near the line y=c_row, the wall row is c_row-1 (if c_row>0) or c_row (if c_row<9)?
             # Actually, if we are in cell (r, c), the top edge corresponds to H wall at (r-1, c) or (r-1, c-1).
@@ -560,28 +683,37 @@ class BarricadeUI:
                         self.hover_wall_pos = (WallOrientation.VERTICAL, v_r, v_c)
 
     def handle_click(self):
+        import time
+        current_time = time.time()
+        # Debounce to prevent double-click issues
+        if current_time - self.last_click_time < 0.1:
+            return
+        self.last_click_time = current_time
+
         if self.mode == 'move' and self.hover_pos:
             r, c = self.hover_pos
             # Check if valid move
             target_move = ('move', r, c)
-            if target_move in self.valid_moves_cache:
+            if target_move in self.valid_moves_set:
                 self.state = self.state.apply_move(target_move)
                 self.check_game_status()
                 if not self.game_over:
                     self.ai_thinking = True
                     self.message = "AI Thinking..."
-                self.valid_moves_cache = self.state.get_valid_moves()
+                # Update cache for next frame
+                self.refresh_valid_moves()
 
         elif self.mode == 'wall' and self.hover_wall_pos:
             orient, r, c = self.hover_wall_pos
             target_move = ('wall', orient, r, c)
-            if target_move in self.valid_moves_cache:
+            if target_move in self.valid_moves_set:
                 self.state = self.state.apply_move(target_move)
                 self.check_game_status()
                 if not self.game_over:
                     self.ai_thinking = True
                     self.message = "AI Thinking..."
-                self.valid_moves_cache = self.state.get_valid_moves()
+                # Update cache for next frame
+                self.refresh_valid_moves()
 
     def check_game_status(self):
         if self.state.winner:
@@ -591,7 +723,7 @@ class BarricadeUI:
             else:
                 self.message = "AI Wins! Press 'R' to restart."
         else:
-            self.valid_moves_cache = self.state.get_valid_moves()
+            self.refresh_valid_moves()
             if not self.valid_moves_cache:
                 # No moves available? Loss for current player?
                 # In this game, if you can't move, you lose? Or just skip?
@@ -640,6 +772,22 @@ class BarricadeUI:
             self.screen.blit(txt, (panel_x, info_y))
             info_y += 25
 
+        # Walls left display
+        info_y += 10
+        first_move = "Engine" if self.engine_starts else "Human"
+        txt = self.font.render(f"First Move: {first_move}", True, COLOR_TEXT)
+        self.screen.blit(txt, (panel_x, info_y))
+        info_y += 25
+
+        walls_red = self.state.walls_left[Player.RED] if hasattr(self.state, 'walls_left') else 10
+        walls_blue = self.state.walls_left[Player.BLUE] if hasattr(self.state, 'walls_left') else 10
+        txt = self.font.render(f"Red Walls: {walls_red}", True, COLOR_RED)
+        self.screen.blit(txt, (panel_x, info_y))
+        info_y += 25
+        txt = self.font.render(f"Blue Walls: {walls_blue}", True, COLOR_BLUE)
+        self.screen.blit(txt, (panel_x, info_y))
+        info_y += 25
+
         # Controls
         info_y += 20
         controls = [
@@ -648,6 +796,7 @@ class BarricadeUI:
             "- R-Click: Rotate Wall",
             "- 'W': Toggle Mode",
             "- 'R': Rotate Wall",
+            "- 'F': Toggle First",
             "- ESC: Quit"
         ]
         for line in controls:
@@ -677,7 +826,7 @@ class BarricadeUI:
         if self.mode == 'move' and self.hover_pos and not self.ai_thinking:
             r, c = self.hover_pos
             rect = pygame.Rect(MARGIN + c * CELL_SIZE, MARGIN + r * CELL_SIZE, CELL_SIZE, CELL_SIZE)
-            if ('move', r, c) in self.valid_moves_cache:
+            if ('move', r, c) in self.valid_moves_set:
                 s = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)
                 pygame.draw.rect(s, COLOR_HIGHLIGHT_VALID, (0, 0, CELL_SIZE, CELL_SIZE))
                 self.screen.blit(s, rect.topleft)
@@ -730,7 +879,7 @@ class BarricadeUI:
                 h_len = CELL_SIZE * 2
 
             s = pygame.Surface((w_len, h_len), pygame.SRCALPHA)
-            if move_tuple in self.valid_moves_cache:
+            if move_tuple in self.valid_moves_set:
                 pygame.draw.rect(s, COLOR_WALL_PREVIEW, (0, 0, w_len, h_len))
             else:
                 pygame.draw.rect(s, COLOR_WALL_INVALID, (0, 0, w_len, h_len))
