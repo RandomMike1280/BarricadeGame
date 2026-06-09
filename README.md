@@ -29,6 +29,31 @@ print(reward, terminated, truncated)
 print(info["current_player"], info["winner"])
 ```
 
+You can change the initial pawn positions and wall counts when creating the
+environment:
+
+```python
+env = BarricadeEnv(
+    red_start=(0, 2),
+    blue_start=(8, 6),
+    red_walls=5,
+    blue_walls=5,
+)
+```
+
+You can also override them per episode through `reset(options=...)`:
+
+```python
+obs, info = env.reset(
+    options={
+        "red_start": (2, 4),
+        "blue_start": (6, 4),
+        "red_walls": 3,
+        "blue_walls": 7,
+    }
+)
+```
+
 ## Action space
 
 The environment uses a fixed discrete action space with 132 actions:

@@ -38,7 +38,9 @@ except ImportError:  # pragma: no cover - exercised only when gymnasium is absen
 
 BOARD_SIZE = 9
 WALL_BOARD_SIZE = BOARD_SIZE - 1
-WALLS_PER_PLAYER = 10
+DEFAULT_WALLS_PER_PLAYER = 10
+DEFAULT_RED_START = (0, 4)
+DEFAULT_BLUE_START = (8, 4)
 
 MOVE_ACTIONS = 4
 WALL_ACTIONS_PER_ORIENTATION = WALL_BOARD_SIZE * WALL_BOARD_SIZE
@@ -111,6 +113,22 @@ def coerce_move_direction(direction: MoveDirection | str | int) -> MoveDirection
     return MoveDirection(direction)
 
 
+def coerce_position(position: Sequence[int], name: str) -> Tuple[int, int]:
+    if len(position) != 2:
+        raise ValueError(f"{name} must contain exactly two values: (row, col).")
+    row, col = int(position[0]), int(position[1])
+    if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
+        raise ValueError(f"{name} must be on the {BOARD_SIZE}x{BOARD_SIZE} board.")
+    return row, col
+
+
+def coerce_wall_count(count: int, name: str) -> int:
+    count = int(count)
+    if count < 0:
+        raise ValueError(f"{name} must be non-negative.")
+    return count
+
+
 def encode_move(move: Move) -> int:
     """Encode a move tuple into the fixed discrete action id."""
     move_type = move[0]
@@ -167,12 +185,28 @@ def decode_action(action: int) -> Move:
 class BarricadeState:
     """Pure game state and rule engine for Barricade."""
 
-    def __init__(self) -> None:
-        self.pawns = {Player.RED: (0, 4), Player.BLUE: (8, 4)}
+    def __init__(
+        self,
+        *,
+        red_start: Sequence[int] = DEFAULT_RED_START,
+        blue_start: Sequence[int] = DEFAULT_BLUE_START,
+        red_walls: int = DEFAULT_WALLS_PER_PLAYER,
+        blue_walls: int = DEFAULT_WALLS_PER_PLAYER,
+    ) -> None:
+        red_start = coerce_position(red_start, "red_start")
+        blue_start = coerce_position(blue_start, "blue_start")
+        if red_start == blue_start:
+            raise ValueError("red_start and blue_start cannot be the same square.")
+
+        red_walls = coerce_wall_count(red_walls, "red_walls")
+        blue_walls = coerce_wall_count(blue_walls, "blue_walls")
+
+        self.pawns = {Player.RED: red_start, Player.BLUE: blue_start}
         self.walls: Set[WallPlacement] = set()
         self.current_player = Player.RED
         self.winner: Optional[Player] = None
-        self.walls_left = {Player.RED: WALLS_PER_PLAYER, Player.BLUE: WALLS_PER_PLAYER}
+        self.initial_walls = {Player.RED: red_walls, Player.BLUE: blue_walls}
+        self.walls_left = {Player.RED: red_walls, Player.BLUE: blue_walls}
 
         self._valid_moves_cache_key: Optional[Tuple[Any, ...]] = None
         self._valid_moves_cache: Optional[Tuple[Move, ...]] = None
@@ -185,6 +219,7 @@ class BarricadeState:
         new_state.walls = set(self.walls)
         new_state.current_player = self.current_player
         new_state.winner = self.winner
+        new_state.initial_walls = dict(self.initial_walls)
         new_state.walls_left = dict(self.walls_left)
         new_state._valid_moves_cache_key = None
         new_state._valid_moves_cache = None
@@ -504,6 +539,10 @@ class BarricadeEnv(BaseEnv):
         self,
         *,
         starting_player: Player | str | int = Player.RED,
+        red_start: Sequence[int] = DEFAULT_RED_START,
+        blue_start: Sequence[int] = DEFAULT_BLUE_START,
+        red_walls: int = DEFAULT_WALLS_PER_PLAYER,
+        blue_walls: int = DEFAULT_WALLS_PER_PLAYER,
         max_steps: int = 500,
         invalid_action_mode: str = "terminate",
         render_mode: Optional[str] = None,
@@ -518,6 +557,17 @@ class BarricadeEnv(BaseEnv):
             raise ValueError("render_mode must be None, 'ansi', or 'human'.")
 
         self.starting_player = coerce_player(starting_player)
+        self.red_start = coerce_position(red_start, "red_start")
+        self.blue_start = coerce_position(blue_start, "blue_start")
+        self.red_walls = coerce_wall_count(red_walls, "red_walls")
+        self.blue_walls = coerce_wall_count(blue_walls, "blue_walls")
+        self._validate_initial_config(
+            self.red_start,
+            self.blue_start,
+            self.red_walls,
+            self.blue_walls,
+        )
+
         self.max_steps = int(max_steps)
         self.invalid_action_mode = invalid_action_mode
         self.render_mode = render_mode
@@ -527,7 +577,12 @@ class BarricadeEnv(BaseEnv):
         self.invalid_action_penalty = float(invalid_action_penalty)
 
         self.rng = random.Random()
-        self.state = BarricadeState()
+        self.state = self._new_state(
+            self.red_start,
+            self.blue_start,
+            self.red_walls,
+            self.blue_walls,
+        )
         self.steps = 0
         self.terminated = False
         self.truncated = False
@@ -566,8 +621,13 @@ class BarricadeEnv(BaseEnv):
 
         options = options or {}
         starting_player = coerce_player(options.get("starting_player", self.starting_player))
+        red_start = coerce_position(options.get("red_start", self.red_start), "red_start")
+        blue_start = coerce_position(options.get("blue_start", self.blue_start), "blue_start")
+        red_walls = coerce_wall_count(options.get("red_walls", self.red_walls), "red_walls")
+        blue_walls = coerce_wall_count(options.get("blue_walls", self.blue_walls), "blue_walls")
+        self._validate_initial_config(red_start, blue_start, red_walls, blue_walls)
 
-        self.state = BarricadeState()
+        self.state = self._new_state(red_start, blue_start, red_walls, blue_walls)
         self.state.current_player = starting_player
         self.steps = 0
         self.terminated = False
@@ -651,6 +711,32 @@ class BarricadeEnv(BaseEnv):
     def close(self) -> None:
         pass
 
+    def _new_state(
+        self,
+        red_start: Tuple[int, int],
+        blue_start: Tuple[int, int],
+        red_walls: int,
+        blue_walls: int,
+    ) -> BarricadeState:
+        return BarricadeState(
+            red_start=red_start,
+            blue_start=blue_start,
+            red_walls=red_walls,
+            blue_walls=blue_walls,
+        )
+
+    @staticmethod
+    def _validate_initial_config(
+        red_start: Tuple[int, int],
+        blue_start: Tuple[int, int],
+        red_walls: int,
+        blue_walls: int,
+    ) -> None:
+        if red_start == blue_start:
+            raise ValueError("red_start and blue_start cannot be the same square.")
+        if red_walls < 0 or blue_walls < 0:
+            raise ValueError("Initial wall counts must be non-negative.")
+
     @staticmethod
     def encode_move(move: Move) -> int:
         return encode_move(move)
@@ -718,8 +804,8 @@ class BarricadeEnv(BaseEnv):
         blue_distance = self.state.greedy_path_length(Player.BLUE)
         features_data = [
             float(self.state.current_player.value),
-            self.state.walls_left[Player.RED] / WALLS_PER_PLAYER,
-            self.state.walls_left[Player.BLUE] / WALLS_PER_PLAYER,
+            self._normalize_wall_count(Player.RED),
+            self._normalize_wall_count(Player.BLUE),
             self._normalize_distance(red_distance),
             self._normalize_distance(blue_distance),
         ]
@@ -746,6 +832,8 @@ class BarricadeEnv(BaseEnv):
             "blue_position": self.state.pawns[Player.BLUE],
             "red_walls_left": self.state.walls_left[Player.RED],
             "blue_walls_left": self.state.walls_left[Player.BLUE],
+            "red_initial_walls": self.state.initial_walls[Player.RED],
+            "blue_initial_walls": self.state.initial_walls[Player.BLUE],
             "red_greedy_path_length": red_distance,
             "blue_greedy_path_length": blue_distance,
             "legal_actions": self.legal_actions(),
@@ -788,6 +876,12 @@ class BarricadeEnv(BaseEnv):
         if distance is None:
             return 1.0
         return min(float(distance) / float(BOARD_SIZE * BOARD_SIZE), 1.0)
+
+    def _normalize_wall_count(self, player: Player) -> float:
+        initial_count = self.state.initial_walls[player]
+        if initial_count <= 0:
+            return 0.0
+        return self.state.walls_left[player] / initial_count
 
     @staticmethod
     def _zeros(shape: Tuple[int, int, int]) -> Any:
