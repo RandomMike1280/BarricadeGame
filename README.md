@@ -84,3 +84,47 @@ action ids and rule-engine move tuples.
 Rewards are from the perspective of the player who just acted. By default,
 legal non-terminal moves receive `0`, winning moves receive `1`, and invalid
 actions terminate the episode with `-1`.
+
+When an episode ends, `info["lead"]` reports the signed terminal race margin:
+positive means Blue is ahead, negative means Red is ahead. For example, if Red
+wins and Blue still needs two pawn moves to reach its goal, `lead == -2`.
+`info["N_moves"]` reports how many pawn moves each player made; wall placement
+turns are not counted.
+
+## AlphaZero network
+
+`network.py` contains a PyTorch AlphaZero-style policy/value network and a
+state encoder for stacked `9x9` planes.
+
+```python
+import torch
+
+from barricade_env import BarricadeEnv
+from network import build_network, encode_state_stack
+
+env = BarricadeEnv()
+obs, info = env.reset()
+
+state_tensor = encode_state_stack(env.state, history_length=2).unsqueeze(0)
+model = build_network(history_length=2, conv_channels=128, num_residual_layers=10)
+
+policy_logits, value = model(state_tensor)
+policy_probs, value = model.predict(
+    state_tensor,
+    action_mask=torch.as_tensor(info["action_mask"]).unsqueeze(0),
+)
+```
+
+## Self-play training
+
+`train.py` provides the AlphaZero-style training pipeline:
+
+```powershell
+python train.py self-play --games 16 --base-simulations 128
+python train.py train --replay-dir data/selfplay --epochs 1
+python train.py loop --iterations 10 --games 16 --base-simulations 128
+python train.py eval --checkpoint checkpoints/latest.pt --baseline-checkpoint checkpoints/model_iter_000001.pt
+```
+
+Replay chunks are written under `data/selfplay/` and checkpoints under
+`checkpoints/` by default.

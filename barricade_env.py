@@ -584,6 +584,7 @@ class BarricadeEnv(BaseEnv):
             self.blue_walls,
         )
         self.steps = 0
+        self.pawn_moves = {Player.RED: 0, Player.BLUE: 0}
         self.terminated = False
         self.truncated = False
 
@@ -630,6 +631,7 @@ class BarricadeEnv(BaseEnv):
         self.state = self._new_state(red_start, blue_start, red_walls, blue_walls)
         self.state.current_player = starting_player
         self.steps = 0
+        self.pawn_moves = {Player.RED: 0, Player.BLUE: 0}
         self.terminated = False
         self.truncated = False
 
@@ -653,6 +655,8 @@ class BarricadeEnv(BaseEnv):
             )
 
         self.state = self.state.apply_move(decoded_move)
+        if decoded_move[0] == "move":
+            self.pawn_moves[acting_player] += 1
         self.steps += 1
 
         reward = self.step_penalty
@@ -824,12 +828,30 @@ class BarricadeEnv(BaseEnv):
     def _get_info(self) -> Dict[str, Any]:
         red_distance = self.state.greedy_path_length(Player.RED)
         blue_distance = self.state.greedy_path_length(Player.BLUE)
+        lead = self._terminal_lead(red_distance, blue_distance)
         return {
             "current_player": self.state.current_player.name,
             "winner": self.state.winner.name if self.state.winner else None,
             "steps": self.steps,
+            "lead": lead,
             "red_position": self.state.pawns[Player.RED],
             "blue_position": self.state.pawns[Player.BLUE],
+            "red_pawn_moves": self.pawn_moves[Player.RED],
+            "blue_pawn_moves": self.pawn_moves[Player.BLUE],
+            "red_moves_to_win": red_distance,
+            "blue_moves_to_win": blue_distance,
+            "n_moves": {
+                "RED": self.pawn_moves[Player.RED],
+                "BLUE": self.pawn_moves[Player.BLUE],
+            },
+            "N_moves": {
+                "RED": self.pawn_moves[Player.RED],
+                "BLUE": self.pawn_moves[Player.BLUE],
+            },
+            "moves_to_win": {
+                "RED": red_distance,
+                "BLUE": blue_distance,
+            },
             "red_walls_left": self.state.walls_left[Player.RED],
             "blue_walls_left": self.state.walls_left[Player.BLUE],
             "red_initial_walls": self.state.initial_walls[Player.RED],
@@ -882,6 +904,17 @@ class BarricadeEnv(BaseEnv):
         if initial_count <= 0:
             return 0.0
         return self.state.walls_left[player] / initial_count
+
+    def _terminal_lead(
+        self,
+        red_moves_to_win: Optional[int],
+        blue_moves_to_win: Optional[int],
+    ) -> Optional[int]:
+        if self.state.winner is None:
+            return None
+        if red_moves_to_win is None or blue_moves_to_win is None:
+            return None
+        return red_moves_to_win - blue_moves_to_win
 
     @staticmethod
     def _zeros(shape: Tuple[int, int, int]) -> Any:
