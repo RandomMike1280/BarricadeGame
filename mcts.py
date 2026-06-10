@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 from torch import Tensor
 
-from barricade_env import ACTION_SIZE, BarricadeState, Move, encode_move
+from barricade_env import ACTION_SIZE, BarricadeState, Move, Player, encode_move
 from network import encode_state_stack
 
 
@@ -35,6 +35,14 @@ class MCTSConfig:
     history_length: int = 0
     device: Optional[str] = None
     add_root_noise: bool = True
+    lead_weight: float = 0.01
+    lead_scale: float = 10.0
+
+
+@dataclass(frozen=True)
+class SearchEvaluation:
+    value: float
+    lead: float
 
 
 @dataclass
@@ -46,6 +54,7 @@ class SearchEdge:
     visits: int = 0
     virtual_visits: int = 0
     value_sum: float = 0.0
+    lead_sum: float = 0.0
 
     @property
     def effective_visits(self) -> int:
@@ -57,6 +66,12 @@ class SearchEdge:
             return 0.0
         return self.value_sum / self.visits
 
+    @property
+    def lead_q(self) -> float:
+        if self.visits == 0:
+            return 0.0
+        return self.lead_sum / self.visits
+
 
 @dataclass
 class SearchNode:
@@ -66,6 +81,7 @@ class SearchNode:
     is_expanded: bool = False
     in_flight: int = 0
     value_estimate: Optional[float] = None
+    lead_estimate: Optional[float] = None
     root_noise_applied: bool = False
 
     @property
@@ -85,7 +101,9 @@ class ActionStats:
     visits: int
     virtual_visits: int
     q: float
+    lead_q: float
     value_sum: float
+    lead_sum: float
     policy: float
 
 
@@ -94,6 +112,7 @@ class MCTSResult:
     action: int
     policy_target: List[float]
     root_value: float
+    root_lead: float
     root: SearchNode
     stats: List[ActionStats]
     diagnostics: Dict[str, int] = field(default_factory=dict)
@@ -115,7 +134,7 @@ class MCTS:
     ) -> MCTSResult:
         root = self._prepare_root(state, history, root)
 
-        if self._terminal_value(root) is None and not root.is_expanded:
+        if self._terminal_evaluation(root) is None and not root.is_expanded:
             self._evaluate_and_expand([root])
 
         if (
@@ -132,7 +151,7 @@ class MCTS:
         evaluated_leaves = 0
         while completed < self.config.num_simulations:
             pending: List[Tuple[SearchNode, List[SearchEdge]]] = []
-            terminal_paths: List[Tuple[List[SearchEdge], float]] = []
+            terminal_paths: List[Tuple[List[SearchEdge], SearchEvaluation]] = []
             target_batch = min(
                 max(1, self.config.batch_size),
                 self.config.num_simulations - completed,
@@ -140,7 +159,7 @@ class MCTS:
 
             while len(pending) + len(terminal_paths) < target_batch:
                 selection = self._select_leaf(root)
-                kind, leaf, path, value = selection
+                kind, leaf, path, evaluation = selection
 
                 if kind == "collision":
                     self._release_virtual_visits(path)
@@ -152,7 +171,7 @@ class MCTS:
 
                 collision_streak = 0
                 if kind == "terminal":
-                    terminal_paths.append((path, value))
+                    terminal_paths.append((path, evaluation))
                 elif kind == "leaf":
                     pending.append((leaf, path))
                 else:
@@ -164,17 +183,17 @@ class MCTS:
             if not pending and not terminal_paths:
                 break
 
-            for path, value in terminal_paths:
-                self._backpropagate(path, value)
+            for path, evaluation in terminal_paths:
+                self._backpropagate(path, evaluation)
             completed += len(terminal_paths)
 
             if pending:
                 neural_batches += 1
                 evaluated_leaves += len(pending)
-                values = self._evaluate_and_expand([leaf for leaf, _ in pending])
-                for (leaf, path), value in zip(pending, values):
+                evaluations = self._evaluate_and_expand([leaf for leaf, _ in pending])
+                for (leaf, path), evaluation in zip(pending, evaluations):
                     leaf.in_flight = max(0, leaf.in_flight - 1)
-                    self._backpropagate(path, value)
+                    self._backpropagate(path, evaluation)
                 completed += len(pending)
 
         self._clear_virtual_visits(root)
@@ -185,6 +204,7 @@ class MCTS:
             action=action,
             policy_target=policy_target,
             root_value=self._root_value(root),
+            root_lead=self._root_lead(root),
             root=root,
             stats=stats,
             diagnostics={
@@ -222,14 +242,14 @@ class MCTS:
 
     def _select_leaf(
         self, root: SearchNode
-    ) -> Tuple[str, Optional[SearchNode], List[SearchEdge], Optional[float]]:
+    ) -> Tuple[str, Optional[SearchNode], List[SearchEdge], Optional[SearchEvaluation]]:
         node = root
         path: List[SearchEdge] = []
 
         while True:
-            terminal_value = self._terminal_value(node)
-            if terminal_value is not None:
-                return "terminal", node, path, terminal_value
+            terminal_evaluation = self._terminal_evaluation(node)
+            if terminal_evaluation is not None:
+                return "terminal", node, path, terminal_evaluation
 
             if not node.is_expanded:
                 if node.in_flight > 0:
@@ -238,7 +258,10 @@ class MCTS:
                 return "leaf", node, path, None
 
             if not node.edges:
-                return "terminal", node, path, -1.0
+                return "terminal", node, path, SearchEvaluation(
+                    value=-1.0,
+                    lead=self._state_lead(node.state),
+                )
 
             edge = self._select_edge(node)
             edge.virtual_visits += 1
@@ -254,6 +277,7 @@ class MCTS:
         parent_effective_visits = max(1, node.effective_visits)
         cpuct = self._cpuct(parent_effective_visits)
         parent_q = self._parent_q(node)
+        parent_lead_q = self._parent_lead_q(node)
         explored_prior = sum(
             edge.prior for edge in node.edges.values() if edge.effective_visits > 0
         )
@@ -265,13 +289,14 @@ class MCTS:
         best_edge = None
         for edge in node.edges.values():
             q_value = edge.q if edge.visits > 0 else fpu_q
+            lead_value = edge.lead_q if edge.visits > 0 else parent_lead_q
             u_value = (
                 cpuct
                 * edge.prior
                 * math.sqrt(parent_effective_visits)
                 / (1 + edge.effective_visits)
             )
-            score = q_value + u_value
+            score = q_value + u_value + self._lead_bonus(lead_value)
             if score > best_score:
                 best_score = score
                 best_edge = edge
@@ -280,7 +305,7 @@ class MCTS:
             raise RuntimeError("Cannot select from a node with no edges.")
         return best_edge
 
-    def _evaluate_and_expand(self, nodes: Sequence[SearchNode]) -> List[float]:
+    def _evaluate_and_expand(self, nodes: Sequence[SearchNode]) -> List[SearchEvaluation]:
         if not nodes:
             return []
 
@@ -299,21 +324,29 @@ class MCTS:
         was_training = self.model.training
         self.model.eval()
         with torch.no_grad():
-            logits, values = self.model(batch)
+            logits, values, leads = self._model_inference(batch)
         if was_training:
             self.model.train()
 
         logits = logits.detach().cpu()
         values = values.detach().cpu().view(-1)
+        leads = leads.detach().cpu().view(-1)
 
-        result_values = []
-        for node, node_logits, node_value in zip(nodes, logits, values):
+        evaluations = []
+        for node, node_logits, node_value, node_lead in zip(nodes, logits, values, leads):
             value = float(node_value.item())
-            self._expand_node(node, node_logits, value)
-            result_values.append(value)
-        return result_values
+            lead = self._lead_for_player(float(node_lead.item()), node.state.current_player)
+            evaluation = SearchEvaluation(value=value, lead=lead)
+            self._expand_node(node, node_logits, evaluation)
+            evaluations.append(evaluation)
+        return evaluations
 
-    def _expand_node(self, node: SearchNode, logits: Tensor, value: float) -> None:
+    def _expand_node(
+        self,
+        node: SearchNode,
+        logits: Tensor,
+        evaluation: SearchEvaluation,
+    ) -> None:
         legal_moves = node.state.get_valid_moves()
         legal_actions = [encode_move(move) for move in legal_moves]
         priors = self._masked_priors(logits, legal_actions)
@@ -325,7 +358,8 @@ class MCTS:
                 prior=priors.get(action, 0.0),
             )
         node.edges = dict(sorted(edges.items()))
-        node.value_estimate = value
+        node.value_estimate = evaluation.value
+        node.lead_estimate = evaluation.lead
         node.is_expanded = True
 
     def _masked_priors(self, logits: Tensor, legal_actions: Sequence[int]) -> Dict[int, float]:
@@ -373,14 +407,22 @@ class MCTS:
                 edge.prior /= total_prior
         root.root_noise_applied = True
 
-    def _backpropagate(self, path: Sequence[SearchEdge], leaf_value: float) -> None:
-        node_value = float(leaf_value)
+    def _backpropagate(
+        self,
+        path: Sequence[SearchEdge],
+        leaf_evaluation: SearchEvaluation,
+    ) -> None:
+        node_value = float(leaf_evaluation.value)
+        node_lead = float(leaf_evaluation.lead)
         for edge in reversed(path):
             edge.virtual_visits = max(0, edge.virtual_visits - 1)
             parent_value = -node_value
+            parent_lead = -node_lead
             edge.value_sum += parent_value
+            edge.lead_sum += parent_lead
             edge.visits += 1
             node_value = parent_value
+            node_lead = parent_lead
 
     def _release_virtual_visits(self, path: Sequence[SearchEdge]) -> None:
         for edge in path:
@@ -394,11 +436,12 @@ class MCTS:
             edge.virtual_visits = 0
             self._clear_virtual_visits(edge.child)
 
-    def _terminal_value(self, node: SearchNode) -> Optional[float]:
+    def _terminal_evaluation(self, node: SearchNode) -> Optional[SearchEvaluation]:
         if node.state.winner is not None:
-            return 1.0 if node.state.winner == node.state.current_player else -1.0
+            value = 1.0 if node.state.winner == node.state.current_player else -1.0
+            return SearchEvaluation(value=value, lead=self._state_lead(node.state))
         if not node.state.get_valid_moves():
-            return -1.0
+            return SearchEvaluation(value=-1.0, lead=self._state_lead(node.state))
         return None
 
     def _child_history(self, node: SearchNode) -> Tuple[BarricadeState, ...]:
@@ -426,6 +469,19 @@ class MCTS:
             return 0.0
         return sum(edge.value_sum for edge in node.edges.values()) / visits
 
+    @staticmethod
+    def _parent_lead_q(node: SearchNode) -> float:
+        visits = sum(edge.visits for edge in node.edges.values())
+        if visits == 0:
+            return 0.0
+        return sum(edge.lead_sum for edge in node.edges.values()) / visits
+
+    def _lead_bonus(self, lead: float) -> float:
+        if self.config.lead_weight <= 0:
+            return 0.0
+        scale = max(float(self.config.lead_scale), 1e-6)
+        return self.config.lead_weight * math.tanh(float(lead) / scale)
+
     def _policy_target(self, root: SearchNode, temperature: float) -> List[float]:
         stats = [
             (action, edge.visits)
@@ -442,7 +498,14 @@ class MCTS:
             return policy
 
         if temperature <= 0:
-            best_action, _ = max(stats, key=lambda item: item[1])
+            best_action, _ = max(
+                stats,
+                key=lambda item: (
+                    item[1],
+                    root.edges[item[0]].q,
+                    root.edges[item[0]].lead_q,
+                ),
+            )
             policy[best_action] = 1.0
             return policy
 
@@ -473,7 +536,7 @@ class MCTS:
             return policy
 
         if temperature <= 0:
-            best = max(stats, key=lambda item: item.visits)
+            best = max(stats, key=lambda item: (item.visits, item.q, item.lead_q))
             policy[best.action] = 1.0
             return policy
 
@@ -501,7 +564,9 @@ class MCTS:
                 visits=edge.visits,
                 virtual_visits=edge.virtual_visits,
                 q=edge.q,
+                lead_q=edge.lead_q,
                 value_sum=edge.value_sum,
+                lead_sum=edge.lead_sum,
                 policy=policy_target[edge.action],
             )
             for edge in sorted(root.edges.values(), key=lambda item: item.action)
@@ -511,10 +576,44 @@ class MCTS:
         visits = root.real_visits
         if visits > 0:
             return sum(edge.value_sum for edge in root.edges.values()) / visits
-        terminal_value = self._terminal_value(root)
-        if terminal_value is not None:
-            return terminal_value
+        terminal_evaluation = self._terminal_evaluation(root)
+        if terminal_evaluation is not None:
+            return terminal_evaluation.value
         return float(root.value_estimate or 0.0)
+
+    def _root_lead(self, root: SearchNode) -> float:
+        visits = root.real_visits
+        if visits > 0:
+            return sum(edge.lead_sum for edge in root.edges.values()) / visits
+        terminal_evaluation = self._terminal_evaluation(root)
+        if terminal_evaluation is not None:
+            return terminal_evaluation.lead
+        return float(root.lead_estimate or 0.0)
+
+    def _model_inference(self, batch: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        if hasattr(self.model, "inference"):
+            return self.model.inference(batch)
+
+        outputs = self.model(batch)
+        if not isinstance(outputs, tuple):
+            raise RuntimeError("MCTS model must return policy logits and value.")
+        if len(outputs) >= 3:
+            return outputs[0], outputs[1], outputs[2]
+        logits, values = outputs[:2]
+        leads = torch.zeros_like(values)
+        return logits, values, leads
+
+    def _state_lead(self, state: BarricadeState) -> float:
+        red_distance = state.greedy_path_length(Player.RED)
+        blue_distance = state.greedy_path_length(Player.BLUE)
+        if red_distance is None or blue_distance is None:
+            return 0.0
+        raw_lead = float(red_distance - blue_distance)
+        return self._lead_for_player(raw_lead, state.current_player)
+
+    @staticmethod
+    def _lead_for_player(raw_lead: float, player: Player) -> float:
+        return float(raw_lead) if player == Player.BLUE else -float(raw_lead)
 
     def _resolve_device(self, configured_device: Optional[str]) -> torch.device:
         if configured_device is not None:

@@ -93,8 +93,9 @@ turns are not counted.
 
 ## AlphaZero network
 
-`network.py` contains a PyTorch AlphaZero-style policy/value network and a
-state encoder for stacked `9x9` planes.
+`network.py` contains a PyTorch AlphaZero-style network and a state encoder for
+stacked `9x9` planes. The inference path uses policy, value, and lead heads;
+future-occupancy and score heads are auxiliary training heads.
 
 ```python
 import torch
@@ -108,8 +109,8 @@ obs, info = env.reset()
 state_tensor = encode_state_stack(env.state, history_length=2).unsqueeze(0)
 model = build_network(history_length=2, conv_channels=128, num_residual_layers=10)
 
-policy_logits, value = model(state_tensor)
-policy_probs, value = model.predict(
+policy_logits, value, lead, future_logits, score = model(state_tensor)
+policy_probs, value, lead = model.predict(
     state_tensor,
     action_mask=torch.as_tensor(info["action_mask"]).unsqueeze(0),
 )

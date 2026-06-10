@@ -20,7 +20,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from barricade_env import ACTION_SIZE, BarricadeEnv, Player
+from barricade_env import ACTION_SIZE, BOARD_SIZE, BarricadeEnv, Player
 from mcts import MCTS, MCTSConfig
 from network import EncoderConfig, build_network, encode_state_stack
 
@@ -62,6 +62,9 @@ class TrainConfig:
     batch_size: int = 256
     learning_rate: float = 1e-3
     value_loss_weight: float = 1.0
+    lead_loss_weight: float = 0.1
+    future_loss_weight: float = 0.1
+    score_loss_weight: float = 0.01
     grad_clip: float = 1.0
     weight_decay: float = 1e-4
     seed: int = 1
@@ -99,12 +102,47 @@ class ReplayDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> Tuple[Tensor, Tensor, Tensor]:
+    def __getitem__(
+        self,
+        index: int,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         sample = self.samples[index]
         state_planes = sample["state_planes"].float()
         policy_target = sample["policy_target"].float()
         value_target = torch.as_tensor(sample["value_target"], dtype=torch.float32)
-        return state_planes, policy_target, value_target
+        lead_target = torch.as_tensor(
+            sample.get("lead_target", sample.get("lead", 0.0)) or 0.0,
+            dtype=torch.float32,
+        )
+        lead_mask = torch.as_tensor(
+            sample.get(
+                "lead_mask",
+                1.0 if sample.get("lead", None) is not None else 0.0,
+            ),
+            dtype=torch.float32,
+        )
+
+        future_map_target = sample.get("future_map_target")
+        if future_map_target is None:
+            future_map_target = torch.zeros((2, BOARD_SIZE, BOARD_SIZE), dtype=torch.float32)
+            future_map_mask = 0.0
+        else:
+            future_map_target = torch.as_tensor(future_map_target, dtype=torch.float32)
+            future_map_mask = sample.get("future_map_mask", 1.0)
+
+        score_target = torch.as_tensor(sample.get("score_target", 0.0), dtype=torch.float32)
+        score_mask = torch.as_tensor(sample.get("score_mask", 0.0), dtype=torch.float32)
+        return (
+            state_planes,
+            policy_target,
+            value_target,
+            lead_target,
+            lead_mask,
+            future_map_target,
+            torch.as_tensor(future_map_mask, dtype=torch.float32),
+            score_target,
+            score_mask,
+        )
 
 
 def sample_playout_cap(base_simulations: int, rng: random.Random) -> int:
@@ -199,6 +237,7 @@ def run_self_play(
         _, info = env.reset(options=_env_options(handicap))
         history = []
         pending: List[Dict[str, Any]] = []
+        pawn_visits: List[Tuple[int, str, Tuple[int, int]]] = []
         root = None
         terminated = False
         truncated = False
@@ -207,7 +246,7 @@ def run_self_play(
         while not terminated and not truncated:
             player_to_move = env.state.current_player
             state_before = env.state.copy()
-            history_before = tuple(history[-network_config.history_length :])
+            history_before = _history_window(history, network_config.history_length)
             state_planes = encode_state_stack(
                 state_before,
                 history_before,
@@ -249,13 +288,21 @@ def run_self_play(
 
             history.append(state_before)
             _, _, terminated, truncated, info = env.step(action)
+            last_move = info.get("last_move") or {}
+            acting_player = info.get("acting_player")
+            if last_move.get("type") == "move" and acting_player in {"RED", "BLUE"}:
+                position_key = (
+                    "red_position" if acting_player == "RED" else "blue_position"
+                )
+                pawn_visits.append((ply, acting_player, tuple(info[position_key])))
             root = mcts.advance_root(result.root, action)
             ply += 1
 
         winner = info.get("winner")
+        lead = info.get("lead")
         final_metadata = {
             "winner": winner,
-            "lead": info.get("lead"),
+            "lead": lead,
             "N_moves": info.get("N_moves"),
             "game_length": info.get("steps"),
             "truncated": bool(truncated),
@@ -263,6 +310,23 @@ def run_self_play(
         for sample in pending:
             sample.update(final_metadata)
             sample["value_target"] = _value_target(sample["side_to_move"], winner, truncated)
+            sample["lead_target"] = float(lead) if lead is not None else 0.0
+            sample["lead_mask"] = 1.0 if lead is not None else 0.0
+            sample["future_map_target"] = _future_map_target(
+                sample["side_to_move"],
+                int(sample["ply"]),
+                pawn_visits,
+            )
+            sample["future_map_mask"] = 1.0
+            score_target, score_mask = _score_target(
+                sample["side_to_move"],
+                winner,
+                bool(truncated),
+                int(sample["ply"]),
+                int(info.get("steps") or 0),
+            )
+            sample["score_target"] = score_target
+            sample["score_mask"] = score_mask
         samples.extend(pending)
 
         if len(samples) >= config.chunk_size:
@@ -321,17 +385,53 @@ def train_from_replay(
         total_loss_sum = 0.0
         policy_loss_sum = 0.0
         value_loss_sum = 0.0
+        lead_loss_sum = 0.0
+        future_loss_sum = 0.0
+        score_loss_sum = 0.0
         batches = 0
 
-        for state_planes, policy_target, value_target in loader:
+        for (
+            state_planes,
+            policy_target,
+            value_target,
+            lead_target,
+            lead_mask,
+            future_map_target,
+            future_map_mask,
+            score_target,
+            score_mask,
+        ) in loader:
             state_planes = state_planes.to(resolved_device)
             policy_target = policy_target.to(resolved_device)
             value_target = value_target.to(resolved_device)
+            lead_target = lead_target.to(resolved_device)
+            lead_mask = lead_mask.to(resolved_device)
+            future_map_target = future_map_target.to(resolved_device)
+            future_map_mask = future_map_mask.to(resolved_device)
+            score_target = score_target.to(resolved_device)
+            score_mask = score_mask.to(resolved_device)
 
-            logits, value = model(state_planes)
+            logits, value, lead, future_logits, score = model(state_planes)
             policy_loss = soft_target_cross_entropy(logits, policy_target)
             value_loss = F.mse_loss(value.squeeze(-1), value_target)
-            loss = policy_loss + config.value_loss_weight * value_loss
+            lead_loss = masked_mse_loss(lead.squeeze(-1), lead_target, lead_mask)
+            future_loss = masked_binary_cross_entropy(
+                future_logits,
+                future_map_target,
+                future_map_mask,
+            )
+            score_loss = masked_smooth_l1_loss(
+                score.squeeze(-1),
+                score_target,
+                score_mask,
+            )
+            loss = (
+                policy_loss
+                + config.value_loss_weight * value_loss
+                + config.lead_loss_weight * lead_loss
+                + config.future_loss_weight * future_loss
+                + config.score_loss_weight * score_loss
+            )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -342,6 +442,9 @@ def train_from_replay(
             total_loss_sum += float(loss.item())
             policy_loss_sum += float(policy_loss.item())
             value_loss_sum += float(value_loss.item())
+            lead_loss_sum += float(lead_loss.item())
+            future_loss_sum += float(future_loss.item())
+            score_loss_sum += float(score_loss.item())
             batches += 1
 
         epoch_stats = {
@@ -349,6 +452,9 @@ def train_from_replay(
             "total_loss": total_loss_sum / max(1, batches),
             "policy_loss": policy_loss_sum / max(1, batches),
             "value_loss": value_loss_sum / max(1, batches),
+            "lead_loss": lead_loss_sum / max(1, batches),
+            "future_loss": future_loss_sum / max(1, batches),
+            "score_loss": score_loss_sum / max(1, batches),
             "batches": batches,
             "samples": len(dataset),
         }
@@ -356,7 +462,10 @@ def train_from_replay(
         print(
             f"epoch={epoch} total={epoch_stats['total_loss']:.4f} "
             f"policy={epoch_stats['policy_loss']:.4f} "
-            f"value={epoch_stats['value_loss']:.4f}"
+            f"value={epoch_stats['value_loss']:.4f} "
+            f"lead={epoch_stats['lead_loss']:.4f} "
+            f"future={epoch_stats['future_loss']:.4f} "
+            f"score={epoch_stats['score_loss']:.4f}"
         )
 
     checkpoint_dir = Path(config.checkpoint_dir)
@@ -409,7 +518,7 @@ def evaluate_models(
             current = env.state.current_player
             model = candidate_model if current == candidate_player else baseline_model
             state_before = env.state.copy()
-            history_before = tuple(history[-network_config.history_length :])
+            history_before = _history_window(history, network_config.history_length)
             mcts_config = MCTSConfig(
                 num_simulations=config.simulations,
                 batch_size=config.batch_size,
@@ -503,6 +612,30 @@ def soft_target_cross_entropy(logits: Tensor, target: Tensor) -> Tensor:
     return -(target * log_probs).sum(dim=1).mean()
 
 
+def masked_mse_loss(prediction: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+    per_sample = F.mse_loss(prediction, target, reduction="none")
+    return _masked_mean(per_sample, mask, prediction)
+
+
+def masked_smooth_l1_loss(prediction: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+    per_sample = F.smooth_l1_loss(prediction, target, reduction="none")
+    return _masked_mean(per_sample, mask, prediction)
+
+
+def masked_binary_cross_entropy(logits: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+    per_cell = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    per_sample = per_cell.mean(dim=(1, 2, 3))
+    return _masked_mean(per_sample, mask, logits)
+
+
+def _masked_mean(per_sample: Tensor, mask: Tensor, fallback: Tensor) -> Tensor:
+    mask = mask.to(device=per_sample.device, dtype=per_sample.dtype).view_as(per_sample)
+    denominator = mask.sum()
+    if float(denominator.item()) <= 0.0:
+        return fallback.sum() * 0.0
+    return (per_sample * mask).sum() / denominator
+
+
 def build_model(config: NetworkConfig) -> nn.Module:
     return build_network(
         history_length=config.history_length,
@@ -518,7 +651,7 @@ def load_model_from_checkpoint(path: str | Path, device: Optional[str] = None) -
     payload = torch.load(path, map_location=device or "cpu")
     network_config = NetworkConfig(**payload.get("network_config", {}))
     model = build_model(network_config)
-    model.load_state_dict(payload["model_state"])
+    _load_model_state(model, payload["model_state"])
     if device:
         model.to(torch.device(device))
     return model, network_config
@@ -532,10 +665,36 @@ def _load_checkpoint_into(
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
     payload = torch.load(path, map_location=device or "cpu")
-    model.load_state_dict(payload["model_state"])
+    _load_model_state(model, payload["model_state"])
     if optimizer is not None and "optimizer_state" in payload:
-        optimizer.load_state_dict(payload["optimizer_state"])
+        try:
+            optimizer.load_state_dict(payload["optimizer_state"])
+        except ValueError:
+            pass
     return payload
+
+
+def _load_model_state(model: nn.Module, state_dict: Dict[str, Tensor]) -> None:
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    _initialize_missing_auxiliary_outputs(model, incompatible.missing_keys)
+
+
+def _initialize_missing_auxiliary_outputs(
+    model: nn.Module,
+    missing_keys: Sequence[str],
+) -> None:
+    if not any(
+        key.startswith(("lead_head.", "future_map_head.", "score_head."))
+        for key in missing_keys
+    ):
+        return
+
+    for module_name in ("lead_head.fc2", "future_map_head.conv2", "score_head.fc2"):
+        module = model.get_submodule(module_name)
+        if hasattr(module, "weight"):
+            module.weight.data.zero_()
+        if getattr(module, "bias", None) is not None:
+            module.bias.data.zero_()
 
 
 def _write_replay_chunk(
@@ -564,6 +723,39 @@ def _value_target(side_to_move: str, winner: Optional[str], truncated: bool) -> 
     if winner is None:
         return 0.0
     return 1.0 if side_to_move == winner else -1.0
+
+
+def _future_map_target(
+    side_to_move: str,
+    ply: int,
+    pawn_visits: Sequence[Tuple[int, str, Tuple[int, int]]],
+) -> Tensor:
+    target = torch.zeros((2, BOARD_SIZE, BOARD_SIZE), dtype=torch.float32)
+    for visit_ply, player, position in pawn_visits:
+        if visit_ply < ply:
+            continue
+        row, col = position
+        channel = 0 if player == side_to_move else 1
+        target[channel, int(row), int(col)] = 1.0
+    return target
+
+
+def _score_target(
+    side_to_move: str,
+    winner: Optional[str],
+    truncated: bool,
+    ply: int,
+    terminal_steps: int,
+) -> Tuple[float, float]:
+    if truncated or winner is None or side_to_move != winner:
+        return 0.0, 0.0
+    return float(max(0, terminal_steps - ply)), 1.0
+
+
+def _history_window(history: Sequence[Any], history_length: int) -> Tuple[Any, ...]:
+    if history_length <= 0:
+        return ()
+    return tuple(history[-history_length:])
 
 
 def _env_options(handicap: Dict[str, Any]) -> Dict[str, Any]:
@@ -636,6 +828,9 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--train-batch-size", type=int, default=256)
     train.add_argument("--learning-rate", type=float, default=1e-3)
     train.add_argument("--value-loss-weight", type=float, default=1.0)
+    train.add_argument("--lead-loss-weight", type=float, default=0.1)
+    train.add_argument("--future-loss-weight", type=float, default=0.1)
+    train.add_argument("--score-loss-weight", type=float, default=0.01)
     train.add_argument("--grad-clip", type=float, default=1.0)
     train.add_argument("--weight-decay", type=float, default=1e-4)
     train.add_argument("--seed", type=int, default=1)
@@ -665,6 +860,9 @@ def parse_args() -> argparse.Namespace:
     loop.add_argument("--train-batch-size", type=int, default=256)
     loop.add_argument("--learning-rate", type=float, default=1e-3)
     loop.add_argument("--value-loss-weight", type=float, default=1.0)
+    loop.add_argument("--lead-loss-weight", type=float, default=0.1)
+    loop.add_argument("--future-loss-weight", type=float, default=0.1)
+    loop.add_argument("--score-loss-weight", type=float, default=0.01)
     loop.add_argument("--grad-clip", type=float, default=1.0)
     loop.add_argument("--weight-decay", type=float, default=1e-4)
     loop.add_argument("--eval-games", type=int, default=10)
@@ -718,6 +916,9 @@ def main() -> None:
             batch_size=args.train_batch_size,
             learning_rate=args.learning_rate,
             value_loss_weight=args.value_loss_weight,
+            lead_loss_weight=args.lead_loss_weight,
+            future_loss_weight=args.future_loss_weight,
+            score_loss_weight=args.score_loss_weight,
             grad_clip=args.grad_clip,
             weight_decay=args.weight_decay,
             seed=args.seed,
@@ -767,6 +968,9 @@ def main() -> None:
             batch_size=args.train_batch_size,
             learning_rate=args.learning_rate,
             value_loss_weight=args.value_loss_weight,
+            lead_loss_weight=args.lead_loss_weight,
+            future_loss_weight=args.future_loss_weight,
+            score_loss_weight=args.score_loss_weight,
             grad_clip=args.grad_clip,
             weight_decay=args.weight_decay,
             seed=args.seed,

@@ -4,6 +4,9 @@ AlphaZero-style PyTorch network and state encoder for Barricade.
 The model consumes a stack of 9x9 feature planes and returns:
     policy_logits: shape (batch, ACTION_SIZE)
     value: shape (batch, 1), bounded to [-1, 1]
+    lead: shape (batch, 1), unbounded race-margin estimate
+    future_logits: shape (batch, 2, 9, 9)
+    score: shape (batch, 1), non-negative steps-to-win estimate
 """
 
 from __future__ import annotations
@@ -108,8 +111,9 @@ def encode_state_stack(
     planes: List[Tensor] = [encode_state_planes(current_state, dtype=dtype)]
     history = list(history or [])
 
-    for state in reversed(history[-history_length:]):
-        planes.append(encode_state_planes(state, dtype=dtype))
+    if history_length > 0:
+        for state in reversed(history[-history_length:]):
+            planes.append(encode_state_planes(state, dtype=dtype))
 
     missing = history_length - (len(planes) - 1)
     for _ in range(max(0, missing)):
@@ -186,6 +190,41 @@ class ValueHead(nn.Module):
         return torch.tanh(self.fc2(out))
 
 
+class ScalarHead(nn.Module):
+    """1x1 scalar head for auxiliary regression targets."""
+
+    def __init__(self, channels: int, hidden_size: int, *, positive: bool = False) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(channels, 1, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(1)
+        self.fc1 = nn.Linear(BOARD_SIZE * BOARD_SIZE, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, 1)
+        self.positive = positive
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = F.relu(self.bn(self.conv(x)))
+        out = torch.flatten(out, start_dim=1)
+        out = F.relu(self.fc1(out))
+        out = self.fc2(out)
+        if self.positive:
+            out = F.softplus(out)
+        return out
+
+
+class FutureMapHead(nn.Module):
+    """Per-square future-occupancy logits for side-to-move and opponent."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, 2, kernel_size=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = F.relu(self.bn1(self.conv1(x)))
+        return self.conv2(out)
+
+
 class AlphaZeroNetwork(nn.Module):
     """
     AlphaZero-style policy/value network.
@@ -242,27 +281,53 @@ class AlphaZeroNetwork(nn.Module):
         )
         self.policy_head = PolicyHead(residual_channels, action_size)
         self.value_head = ValueHead(residual_channels, value_hidden_size)
+        self.lead_head = ScalarHead(residual_channels, value_hidden_size)
+        self.future_map_head = FutureMapHead(residual_channels)
+        self.score_head = ScalarHead(
+            residual_channels,
+            value_hidden_size,
+            positive=True,
+        )
 
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+    def _features(self, x: Tensor) -> Tensor:
         out = self.conv_tower(x)
         out = self.residual_projection(out)
-        out = self.residual_tower(out)
-        return self.policy_head(out), self.value_head(out)
+        return self.residual_tower(out)
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        out = self._features(x)
+        return (
+            self.policy_head(out),
+            self.value_head(out),
+            self.lead_head(out),
+            self.future_map_head(out),
+            self.score_head(out),
+        )
+
+    def inference(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Return only the heads needed by MCTS/inference."""
+
+        out = self._features(x)
+        return self.policy_head(out), self.value_head(out), self.lead_head(out)
 
     @torch.no_grad()
-    def predict(self, x: Tensor, action_mask: Optional[Tensor] = None) -> tuple[Tensor, Tensor]:
+    def predict(
+        self,
+        x: Tensor,
+        action_mask: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
         """
-        Return masked policy probabilities and value for inference.
+        Return masked policy probabilities, value, and lead for inference.
 
         ``forward`` returns logits for training. This helper is for MCTS/action
         selection and applies softmax, optionally masking illegal actions.
         """
 
-        logits, value = self.forward(x)
+        logits, value, lead = self.inference(x)
         if action_mask is not None:
             action_mask = action_mask.to(device=logits.device, dtype=torch.bool)
             logits = logits.masked_fill(~action_mask, torch.finfo(logits.dtype).min)
-        return torch.softmax(logits, dim=1), value
+        return torch.softmax(logits, dim=1), value, lead
 
 
 def build_network(
