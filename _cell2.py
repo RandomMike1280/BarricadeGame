@@ -724,7 +724,7 @@ class MCTS:
             raise RuntimeError("Cannot select from an unexpanded node.")
         return best_edge
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _expand(self, node: SearchNode) -> SearchEvaluation:
         legal_actions = node.state.legal_actions()
         if not legal_actions:
@@ -1262,7 +1262,7 @@ def train_on_samples(
     return {key: value / divisor for key, value in totals.items()}
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def select_model_action(
     model: AlphaZeroNet,
     state: GameState,

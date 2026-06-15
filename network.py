@@ -310,7 +310,7 @@ class AlphaZeroNetwork(nn.Module):
         out = self._features(x)
         return self.policy_head(out), self.value_head(out), self.lead_head(out)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict(
         self,
         x: Tensor,
