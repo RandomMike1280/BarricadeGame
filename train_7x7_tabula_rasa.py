@@ -25,9 +25,8 @@ Fast smoke test:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from dataclasses import dataclass
-from enum import Enum
-import math
 from pathlib import Path
 import random
 import time
@@ -37,345 +36,85 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+from barricade_env import (
+    BarricadeState as GameState,
+    Move,
+    MoveDirection,
+    Player,
+    WallOrientation,
+    action_size_for_board_size,
+    apply_selected_action,
+    decode_action_for_board_size,
+    encode_move_for_board_size,
+    path_score_for_player,
+    state_lead_for_player,
+)
+from mcts import MCTS, MCTSConfig
+
 
 BOARD_SIZE = 7
 WALL_BOARD_SIZE = BOARD_SIZE - 1
-DEFAULT_WALLS_PER_PLAYER = 2
+DEFAULT_WALLS_PER_PLAYER = 5
 DEFAULT_MAX_STEPS = 96
 
 MOVE_ACTIONS = 4
 WALL_ACTIONS_PER_ORIENTATION = WALL_BOARD_SIZE * WALL_BOARD_SIZE
 HORIZONTAL_WALL_OFFSET = MOVE_ACTIONS
 VERTICAL_WALL_OFFSET = HORIZONTAL_WALL_OFFSET + WALL_ACTIONS_PER_ORIENTATION
-ACTION_SIZE = MOVE_ACTIONS + WALL_ACTIONS_PER_ORIENTATION * 2
+ACTION_SIZE = action_size_for_board_size(BOARD_SIZE)
 
 INPUT_PLANES = 9
-DIRECTIONS = ((-1, 0), (1, 0), (0, -1), (0, 1))
-
-
-class Player(Enum):
-    RED = 0
-    BLUE = 1
-
-    def opposite(self) -> "Player":
-        return Player.BLUE if self == Player.RED else Player.RED
-
-
-class WallOrientation(Enum):
-    HORIZONTAL = 0
-    VERTICAL = 1
-
-
-class MoveDirection(Enum):
-    UP = 0
-    DOWN = 1
-    LEFT = 2
-    RIGHT = 3
-
-
-Move = Tuple[object, ...]
-WallPlacement = Tuple[WallOrientation, int, int]
-
-MOVE_DELTAS = {
-    MoveDirection.UP: (-1, 0),
-    MoveDirection.DOWN: (1, 0),
-    MoveDirection.LEFT: (0, -1),
-    MoveDirection.RIGHT: (0, 1),
-}
-
-ALL_WALL_PLACEMENTS: Tuple[WallPlacement, ...] = tuple(
-    (orientation, row, col)
-    for orientation in (WallOrientation.HORIZONTAL, WallOrientation.VERTICAL)
-    for row in range(WALL_BOARD_SIZE)
-    for col in range(WALL_BOARD_SIZE)
-)
 
 
 def encode_move(move: Move) -> int:
-    if move[0] == "move":
-        return MoveDirection(move[1]).value
-
-    _, orientation, row, col = move
-    orientation = WallOrientation(orientation)
-    offset = (
-        HORIZONTAL_WALL_OFFSET
-        if orientation == WallOrientation.HORIZONTAL
-        else VERTICAL_WALL_OFFSET
-    )
-    return offset + int(row) * WALL_BOARD_SIZE + int(col)
+    return encode_move_for_board_size(move, BOARD_SIZE)
 
 
 def decode_action(action: int) -> Move:
-    action = int(action)
-    if 0 <= action < MOVE_ACTIONS:
-        return ("move", MoveDirection(action))
-
-    if HORIZONTAL_WALL_OFFSET <= action < VERTICAL_WALL_OFFSET:
-        index = action - HORIZONTAL_WALL_OFFSET
-        return (
-            "wall",
-            WallOrientation.HORIZONTAL,
-            index // WALL_BOARD_SIZE,
-            index % WALL_BOARD_SIZE,
-        )
-
-    if VERTICAL_WALL_OFFSET <= action < ACTION_SIZE:
-        index = action - VERTICAL_WALL_OFFSET
-        return (
-            "wall",
-            WallOrientation.VERTICAL,
-            index // WALL_BOARD_SIZE,
-            index % WALL_BOARD_SIZE,
-        )
-
-    raise ValueError(f"Action must be in [0, {ACTION_SIZE - 1}], got {action}.")
+    return decode_action_for_board_size(action, BOARD_SIZE)
 
 
-def coerce_position(position: Sequence[int], name: str) -> Tuple[int, int]:
-    if len(position) != 2:
-        raise ValueError(f"{name} must contain exactly two integers.")
-    row, col = int(position[0]), int(position[1])
-    if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
-        raise ValueError(f"{name} must be on the {BOARD_SIZE}x{BOARD_SIZE} board.")
-    return row, col
+def _build_canonical_flip_permutation() -> Tuple[int, ...]:
+    """Action permutation applied when the side-to-move is BLUE.
+
+    Both players are presented to the network in a canonical frame where the
+    side-to-move always advances toward increasing row index. For BLUE this is
+    the board flipped about the horizontal axis, so actions must be remapped:
+    UP<->DOWN, LEFT/RIGHT unchanged, and wall rows reflected (r -> WB-1-r).
+    The permutation is its own inverse (an involution).
+    """
+    perm = [0] * ACTION_SIZE
+    perm[MoveDirection.UP.value] = MoveDirection.DOWN.value
+    perm[MoveDirection.DOWN.value] = MoveDirection.UP.value
+    perm[MoveDirection.LEFT.value] = MoveDirection.LEFT.value
+    perm[MoveDirection.RIGHT.value] = MoveDirection.RIGHT.value
+    for offset in (HORIZONTAL_WALL_OFFSET, VERTICAL_WALL_OFFSET):
+        for row in range(WALL_BOARD_SIZE):
+            for col in range(WALL_BOARD_SIZE):
+                perm[offset + row * WALL_BOARD_SIZE + col] = (
+                    offset + (WALL_BOARD_SIZE - 1 - row) * WALL_BOARD_SIZE + col
+                )
+    return tuple(perm)
 
 
-class GameState:
-    def __init__(
-        self,
-        *,
-        red_start: Sequence[int] = (0, BOARD_SIZE // 2),
-        blue_start: Sequence[int] = (BOARD_SIZE - 1, BOARD_SIZE // 2),
-        red_walls: int = DEFAULT_WALLS_PER_PLAYER,
-        blue_walls: int = DEFAULT_WALLS_PER_PLAYER,
-        starting_player: Player = Player.RED,
-    ) -> None:
-        red_start = coerce_position(red_start, "red_start")
-        blue_start = coerce_position(blue_start, "blue_start")
-        if red_start == blue_start:
-            raise ValueError("red_start and blue_start cannot be the same square.")
-
-        self.pawns = {Player.RED: red_start, Player.BLUE: blue_start}
-        self.walls: set[WallPlacement] = set()
-        self.current_player = starting_player
-        self.winner: Optional[Player] = None
-        self.initial_walls = {Player.RED: int(red_walls), Player.BLUE: int(blue_walls)}
-        self.walls_left = dict(self.initial_walls)
-        self._valid_actions_cache_key: Optional[Tuple[object, ...]] = None
-        self._valid_actions_cache: Optional[Tuple[int, ...]] = None
-        self._path_cache: Dict[Tuple[object, ...], Optional[int]] = {}
-
-    def copy(self) -> "GameState":
-        new_state = GameState.__new__(GameState)
-        new_state.pawns = dict(self.pawns)
-        new_state.walls = set(self.walls)
-        new_state.current_player = self.current_player
-        new_state.winner = self.winner
-        new_state.initial_walls = dict(self.initial_walls)
-        new_state.walls_left = dict(self.walls_left)
-        new_state._valid_actions_cache_key = None
-        new_state._valid_actions_cache = None
-        new_state._path_cache = self._path_cache
-        return new_state
-
-    def cache_key(self) -> Tuple[object, ...]:
-        return (
-            self.pawns[Player.RED],
-            self.pawns[Player.BLUE],
-            self.current_player,
-            self.winner,
-            self.walls_left[Player.RED],
-            self.walls_left[Player.BLUE],
-            frozenset(self.walls),
-        )
-
-    def legal_actions(self) -> List[int]:
-        if self.winner is not None:
-            return []
-
-        key = self.cache_key()
-        if key == self._valid_actions_cache_key and self._valid_actions_cache is not None:
-            return list(self._valid_actions_cache)
-
-        actions = [encode_move(move) for move in self._pawn_moves()]
-        if self.walls_left[self.current_player] > 0:
-            actions.extend(
-                encode_move(("wall", orientation, row, col))
-                for orientation, row, col in ALL_WALL_PLACEMENTS
-                if self.is_valid_wall_placement(orientation, row, col)
-            )
-
-        self._valid_actions_cache_key = key
-        self._valid_actions_cache = tuple(actions)
-        return actions
-
-    def action_mask(self) -> Tensor:
-        mask = torch.zeros(ACTION_SIZE, dtype=torch.bool)
-        for action in self.legal_actions():
-            mask[action] = True
-        return mask
-
-    def _pawn_moves(self) -> List[Move]:
-        moves: List[Move] = []
-        row, col = self.pawns[self.current_player]
-        occupied = set(self.pawns.values())
-
-        for direction, (row_delta, col_delta) in MOVE_DELTAS.items():
-            next_row = row + row_delta
-            next_col = col + col_delta
-            if not (0 <= next_row < BOARD_SIZE and 0 <= next_col < BOARD_SIZE):
-                continue
-            if (next_row, next_col) in occupied:
-                continue
-            if self.is_blocked(row, col, next_row, next_col):
-                continue
-            moves.append(("move", direction))
-
-        return moves
-
-    def is_blocked(self, row1: int, col1: int, row2: int, col2: int) -> bool:
-        if row1 == row2:
-            col_min = min(col1, col2)
-            for wall_row in (row1, row1 - 1):
-                if (
-                    0 <= wall_row < WALL_BOARD_SIZE
-                    and (WallOrientation.VERTICAL, wall_row, col_min) in self.walls
-                ):
-                    return True
-        elif col1 == col2:
-            row_min = min(row1, row2)
-            for wall_col in (col1, col1 - 1):
-                if (
-                    0 <= wall_col < WALL_BOARD_SIZE
-                    and (WallOrientation.HORIZONTAL, row_min, wall_col) in self.walls
-                ):
-                    return True
-        return False
-
-    def is_wall_shape_available(
-        self,
-        orientation: WallOrientation,
-        row: int,
-        col: int,
-    ) -> bool:
-        if row < 0 or row >= WALL_BOARD_SIZE or col < 0 or col >= WALL_BOARD_SIZE:
-            return False
-
-        if orientation == WallOrientation.HORIZONTAL:
-            return not (
-                (WallOrientation.HORIZONTAL, row, col) in self.walls
-                or (WallOrientation.HORIZONTAL, row, col - 1) in self.walls
-                or (WallOrientation.HORIZONTAL, row, col + 1) in self.walls
-                or (WallOrientation.VERTICAL, row, col) in self.walls
-            )
-
-        return not (
-            (WallOrientation.VERTICAL, row, col) in self.walls
-            or (WallOrientation.VERTICAL, row - 1, col) in self.walls
-            or (WallOrientation.VERTICAL, row + 1, col) in self.walls
-            or (WallOrientation.HORIZONTAL, row, col) in self.walls
-        )
-
-    def is_valid_wall_placement(
-        self,
-        orientation: WallOrientation,
-        row: int,
-        col: int,
-    ) -> bool:
-        if not self.is_wall_shape_available(orientation, row, col):
-            return False
-
-        wall = (orientation, int(row), int(col))
-        self.walls.add(wall)
-        red_has_path = self.has_path(Player.RED)
-        blue_has_path = self.has_path(Player.BLUE)
-        self.walls.remove(wall)
-        return red_has_path and blue_has_path
-
-    def has_path(self, player: Player) -> bool:
-        return self.shortest_path_length(player) is not None
-
-    def shortest_path_length(self, player: Player) -> Optional[int]:
-        key = ("distance", player, self.pawns[player], frozenset(self.walls))
-        if key in self._path_cache:
-            return self._path_cache[key]
-
-        start = self.pawns[player]
-        target_row = BOARD_SIZE - 1 if player == Player.RED else 0
-        queue = [(start, 0)]
-        visited = {start}
-        index = 0
-
-        while index < len(queue):
-            (row, col), distance = queue[index]
-            index += 1
-            if row == target_row:
-                self._path_cache[key] = distance
-                return distance
-
-            for row_delta, col_delta in DIRECTIONS:
-                next_row = row + row_delta
-                next_col = col + col_delta
-                next_cell = (next_row, next_col)
-                if not (0 <= next_row < BOARD_SIZE and 0 <= next_col < BOARD_SIZE):
-                    continue
-                if next_cell in visited:
-                    continue
-                if self.is_blocked(row, col, next_row, next_col):
-                    continue
-                visited.add(next_cell)
-                queue.append((next_cell, distance + 1))
-
-        self._path_cache[key] = None
-        return None
-
-    def apply_action(self, action: int, *, validate: bool = True) -> "GameState":
-        if validate and action not in set(self.legal_actions()):
-            raise ValueError(f"Illegal action {action} for current state.")
-
-        new_state = self.copy()
-        move = decode_action(action)
-        if move[0] == "move":
-            _, direction = move
-            row_delta, col_delta = MOVE_DELTAS[MoveDirection(direction)]
-            row, col = new_state.pawns[new_state.current_player]
-            next_row = row + row_delta
-            next_col = col + col_delta
-            new_state.pawns[new_state.current_player] = (next_row, next_col)
-            if next_row == BOARD_SIZE - 1 and new_state.current_player == Player.RED:
-                new_state.winner = Player.RED
-            elif next_row == 0 and new_state.current_player == Player.BLUE:
-                new_state.winner = Player.BLUE
-        else:
-            _, orientation, row, col = move
-            new_state.walls.add((WallOrientation(orientation), int(row), int(col)))
-            new_state.walls_left[new_state.current_player] -= 1
-
-        new_state.current_player = new_state.current_player.opposite()
-        return new_state
+CANONICAL_FLIP_PERMUTATION: Tuple[int, ...] = _build_canonical_flip_permutation()
 
 
-def apply_selected_action(state: GameState, action: int, legal_actions: Sequence[int]) -> GameState:
-    if action not in legal_actions:
-        raise RuntimeError(
-            f"Policy selected illegal action {action}; legal actions were {list(legal_actions)}"
-        )
-    return state.apply_action(action, validate=False)
+def canonical_action(action: int, player: "Player") -> int:
+    """Map a raw board action into the canonical (side-to-move) frame."""
+    if player == Player.RED:
+        return int(action)
+    return CANONICAL_FLIP_PERMUTATION[int(action)]
 
 
-def state_lead_for_player(state: GameState, player: Player) -> float:
-    own_distance = state.shortest_path_length(player)
-    opponent_distance = state.shortest_path_length(player.opposite())
-    if own_distance is None or opponent_distance is None:
-        return 0.0
-    return float(opponent_distance - own_distance)
-
-
-def path_score_for_player(state: GameState, player: Player) -> float:
-    distance = state.shortest_path_length(player)
-    if distance is None:
-        return float(BOARD_SIZE * BOARD_SIZE)
-    return float(distance)
+def canonicalize_action_vector(vector: Tensor, player: "Player") -> Tensor:
+    """Reindex a per-action vector (policy target / mask) into canonical frame."""
+    if player == Player.RED:
+        return vector
+    index = torch.as_tensor(CANONICAL_FLIP_PERMUTATION, dtype=torch.long, device=vector.device)
+    canonical = torch.empty_like(vector)
+    canonical[index] = vector
+    return canonical
 
 
 def adjudicated_winner(state: GameState, *, enabled: bool) -> Optional[Player]:
@@ -396,31 +135,45 @@ def adjudicated_winner(state: GameState, *, enabled: bool) -> Optional[Player]:
 
 
 def encode_state(state: GameState, device: Optional[torch.device] = None) -> Tensor:
+    """Encode the board in a canonical frame from the side-to-move perspective.
+
+    The board is presented as if the side-to-move always advances toward the
+    last row. For BLUE this flips the board about the horizontal axis (rows
+    r -> BOARD_SIZE-1-r on the cell grid, r -> WALL_BOARD_SIZE-1-r on the wall
+    grid). This makes mirrored RED/BLUE positions encode identically, so a
+    single shared policy/value head no longer has to learn two opposite notions
+    of "forward". Plane 0 is a constant so it carries no absolute-color signal.
+    """
     planes = torch.zeros((INPUT_PLANES, BOARD_SIZE, BOARD_SIZE), dtype=torch.float32)
     current = state.current_player
     opponent = current.opposite()
+    flip = current == Player.BLUE
 
-    if current == Player.RED:
-        planes[0].fill_(1.0)
+    def cell_row(row: int) -> int:
+        return BOARD_SIZE - 1 - row if flip else row
+
+    def wall_row(row: int) -> int:
+        return WALL_BOARD_SIZE - 1 - row if flip else row
+
+    planes[0].fill_(1.0)
 
     own_row, own_col = state.pawns[current]
     opp_row, opp_col = state.pawns[opponent]
-    planes[1, own_row, own_col] = 1.0
-    planes[2, opp_row, opp_col] = 1.0
+    planes[1, cell_row(own_row), own_col] = 1.0
+    planes[2, cell_row(opp_row), opp_col] = 1.0
 
     for orientation, row, col in state.walls:
         plane = 3 if orientation == WallOrientation.HORIZONTAL else 4
-        planes[plane, row, col] = 1.0
+        planes[plane, wall_row(row), col] = 1.0
 
     own_initial = max(1, state.initial_walls[current])
     opp_initial = max(1, state.initial_walls[opponent])
     planes[5].fill_(state.walls_left[current] / own_initial)
     planes[6].fill_(state.walls_left[opponent] / opp_initial)
 
-    own_goal = BOARD_SIZE - 1 if current == Player.RED else 0
-    opp_goal = BOARD_SIZE - 1 if opponent == Player.RED else 0
-    planes[7, own_goal, :] = 1.0
-    planes[8, opp_goal, :] = 1.0
+    # In the canonical frame the side-to-move always targets the last row.
+    planes[7, BOARD_SIZE - 1, :] = 1.0
+    planes[8, 0, :] = 1.0
 
     if device is not None:
         return planes.to(device)
@@ -515,291 +268,6 @@ class AlphaZeroNet(nn.Module):
 
 
 @dataclass
-class MCTSConfig:
-    num_simulations: int = 64
-    cpuct: float = 1.5
-    fpu_reduction: float = 0.25
-    policy_temperature: float = 1.0
-    root_dirichlet_alpha: float = 0.3
-    root_exploration_fraction: float = 0.25
-    policy_target_temperature: float = 1.0
-    action_temperature: float = 1.0
-    lead_weight: float = 0.02
-    lead_scale: float = 5.0
-    add_root_noise: bool = True
-
-
-@dataclass
-class SearchEvaluation:
-    value: float
-    lead: float
-
-
-@dataclass
-class SearchEdge:
-    action: int
-    prior: float
-    child: Optional["SearchNode"] = None
-    visits: int = 0
-    value_sum: float = 0.0
-    lead_sum: float = 0.0
-
-    @property
-    def q(self) -> float:
-        if self.visits == 0:
-            return 0.0
-        return self.value_sum / self.visits
-
-    @property
-    def lead_q(self) -> float:
-        if self.visits == 0:
-            return 0.0
-        return self.lead_sum / self.visits
-
-
-@dataclass
-class SearchNode:
-    state: GameState
-    edges: Dict[int, SearchEdge]
-    is_expanded: bool = False
-    value_estimate: float = 0.0
-    lead_estimate: float = 0.0
-
-    @property
-    def visits(self) -> int:
-        return sum(edge.visits for edge in self.edges.values())
-
-
-@dataclass
-class MCTSResult:
-    action: int
-    policy_target: Tensor
-    root_value: float
-    root_lead: float
-    diagnostics: Dict[str, int]
-
-
-class MCTS:
-    def __init__(
-        self,
-        model: AlphaZeroNet,
-        *,
-        device: torch.device,
-        rng: random.Random,
-        config: MCTSConfig,
-    ) -> None:
-        self.model = model
-        self.device = device
-        self.rng = rng
-        self.config = config
-
-    def search(self, state: GameState) -> MCTSResult:
-        root = SearchNode(state=state.copy(), edges={})
-        evaluation = self._terminal_evaluation(root)
-        if evaluation is None:
-            self._expand(root)
-            if self.config.add_root_noise:
-                self._add_root_noise(root)
-
-        completed = 0
-        while completed < self.config.num_simulations:
-            node = root
-            path: List[SearchEdge] = []
-
-            while node.is_expanded and node.edges:
-                edge = self._select_edge(node)
-                path.append(edge)
-                if edge.child is None:
-                    child_state = apply_selected_action(
-                        node.state,
-                        edge.action,
-                        list(node.edges.keys()),
-                    )
-                    edge.child = SearchNode(state=child_state, edges={})
-                node = edge.child
-
-            evaluation = self._terminal_evaluation(node)
-            if evaluation is None:
-                evaluation = self._expand(node)
-
-            self._backpropagate(path, evaluation)
-            completed += 1
-
-        policy_target = self._policy_target(root, self.config.policy_target_temperature)
-        action_policy = self._policy_target(root, self.config.action_temperature)
-        action = self._sample_policy(action_policy)
-        return MCTSResult(
-            action=action,
-            policy_target=torch.as_tensor(policy_target, dtype=torch.float32),
-            root_value=self._root_value(root),
-            root_lead=self._root_lead(root),
-            diagnostics={"completed_simulations": completed},
-        )
-
-    def _select_edge(self, node: SearchNode) -> SearchEdge:
-        parent_visits = max(1, node.visits)
-        best_score = -math.inf
-        best_edge: Optional[SearchEdge] = None
-        parent_q = self._parent_q(node)
-        explored_prior = sum(
-            edge.prior for edge in node.edges.values() if edge.visits > 0
-        )
-        fpu_q = parent_q - self.config.fpu_reduction * math.sqrt(
-            max(0.0, explored_prior)
-        )
-
-        for edge in node.edges.values():
-            q_value = edge.q if edge.visits > 0 else fpu_q
-            u_value = (
-                self.config.cpuct
-                * edge.prior
-                * math.sqrt(parent_visits)
-                / (1 + edge.visits)
-            )
-            lead_bonus = self.config.lead_weight * math.tanh(
-                edge.lead_q / max(1.0e-6, self.config.lead_scale)
-            )
-            score = q_value + u_value + lead_bonus
-            if score > best_score:
-                best_score = score
-                best_edge = edge
-
-        if best_edge is None:
-            raise RuntimeError("Cannot select from an unexpanded node.")
-        return best_edge
-
-    @torch.no_grad()
-    def _expand(self, node: SearchNode) -> SearchEvaluation:
-        legal_actions = node.state.legal_actions()
-        if not legal_actions:
-            node.state.winner = node.state.current_player.opposite()
-            node.is_expanded = True
-            return SearchEvaluation(value=-1.0, lead=state_lead_for_player(node.state, node.state.current_player))
-
-        self.model.eval()
-        state_tensor = encode_state(node.state, self.device).unsqueeze(0)
-        logits, value, lead = self.model.inference(state_tensor)
-        logits = torch.nan_to_num(logits.squeeze(0), nan=0.0, posinf=30.0, neginf=-30.0)
-        legal_tensor = torch.as_tensor(legal_actions, dtype=torch.long, device=self.device)
-        legal_logits = logits.index_select(0, legal_tensor).clamp(-30.0, 30.0)
-        temperature = max(self.config.policy_temperature, 1.0e-6)
-        priors = torch.softmax(legal_logits / temperature, dim=0).detach().cpu().tolist()
-        if not all(math.isfinite(float(prob)) for prob in priors) or sum(priors) <= 0:
-            priors = [1.0 / len(legal_actions)] * len(legal_actions)
-
-        total_prior = sum(float(prob) for prob in priors)
-        node.edges = {
-            action: SearchEdge(action=action, prior=float(prob) / total_prior)
-            for action, prob in zip(legal_actions, priors)
-        }
-        node.is_expanded = True
-        node.value_estimate = float(value.squeeze(0).item())
-        node.lead_estimate = float(lead.squeeze(0).item())
-        return SearchEvaluation(value=node.value_estimate, lead=node.lead_estimate)
-
-    def _add_root_noise(self, root: SearchNode) -> None:
-        if not root.edges:
-            return
-
-        alpha = self.config.root_dirichlet_alpha
-        fraction = self.config.root_exploration_fraction
-        if alpha <= 0.0 or fraction <= 0.0:
-            return
-
-        actions = list(root.edges.keys())
-        noise = [self.rng.gammavariate(alpha, 1.0) for _ in actions]
-        total = sum(noise)
-        if total <= 0.0:
-            return
-        noise = [value / total for value in noise]
-        for action, noise_value in zip(actions, noise):
-            edge = root.edges[action]
-            edge.prior = (1.0 - fraction) * edge.prior + fraction * noise_value
-
-    def _backpropagate(
-        self,
-        path: Sequence[SearchEdge],
-        leaf_evaluation: SearchEvaluation,
-    ) -> None:
-        node_value = float(leaf_evaluation.value)
-        node_lead = float(leaf_evaluation.lead)
-        for edge in reversed(path):
-            parent_value = -node_value
-            parent_lead = -node_lead
-            edge.value_sum += parent_value
-            edge.lead_sum += parent_lead
-            edge.visits += 1
-            node_value = parent_value
-            node_lead = parent_lead
-
-    def _terminal_evaluation(self, node: SearchNode) -> Optional[SearchEvaluation]:
-        if node.state.winner is not None:
-            value = 1.0 if node.state.winner == node.state.current_player else -1.0
-            return SearchEvaluation(
-                value=value,
-                lead=state_lead_for_player(node.state, node.state.current_player),
-            )
-        return None
-
-    @staticmethod
-    def _parent_q(node: SearchNode) -> float:
-        visits = sum(edge.visits for edge in node.edges.values())
-        if visits <= 0:
-            return 0.0
-        return sum(edge.value_sum for edge in node.edges.values()) / visits
-
-    def _policy_target(self, root: SearchNode, temperature: float) -> List[float]:
-        policy = [0.0] * ACTION_SIZE
-        visited_edges = [edge for edge in root.edges.values() if edge.visits > 0]
-        if not visited_edges:
-            legal_actions = list(root.edges.keys())
-            if not legal_actions:
-                return policy
-            for action in legal_actions:
-                policy[action] = 1.0 / len(legal_actions)
-            return policy
-
-        if temperature <= 0.0:
-            best = max(visited_edges, key=lambda edge: (edge.visits, edge.q, edge.lead_q))
-            policy[best.action] = 1.0
-            return policy
-
-        weights = [
-            (edge.action, float(edge.visits) ** (1.0 / max(temperature, 1.0e-6)))
-            for edge in visited_edges
-        ]
-        total = sum(weight for _, weight in weights)
-        if total <= 0.0:
-            for edge in visited_edges:
-                policy[edge.action] = 1.0 / len(visited_edges)
-            return policy
-
-        for action, weight in weights:
-            policy[action] = weight / total
-        return policy
-
-    def _sample_policy(self, policy: Sequence[float]) -> int:
-        total = float(sum(policy))
-        if total <= 0.0:
-            return -1
-        return int(self.rng.choices(range(len(policy)), weights=policy, k=1)[0])
-
-    @staticmethod
-    def _root_value(root: SearchNode) -> float:
-        visits = root.visits
-        if visits <= 0:
-            return root.value_estimate
-        return sum(edge.value_sum for edge in root.edges.values()) / visits
-
-    @staticmethod
-    def _root_lead(root: SearchNode) -> float:
-        visits = root.visits
-        if visits <= 0:
-            return root.lead_estimate
-        return sum(edge.lead_sum for edge in root.edges.values()) / visits
-
-
-@dataclass
 class ReplaySample:
     state: Tensor
     mask: Tensor
@@ -858,12 +326,14 @@ def masked_smooth_l1_loss(prediction: Tensor, target: Tensor, mask: Tensor) -> T
 
 def sample_playout_cap(base_simulations: int, rng: random.Random) -> int:
     roll = rng.random()
-    if roll < 0.70:
-        cap = base_simulations
-    elif roll < 0.90:
-        cap = max(1, base_simulations // 2)
+    if roll < 0.60:
+        cap = base_simulations          # 60% — full
+    elif roll < 0.80:
+        cap = max(1, base_simulations // 2)   # 20% — half
+    elif roll < 0.93:
+        cap = max(1, base_simulations // 4)   # 13% — quarter
     else:
-        cap = base_simulations * 2
+        cap = base_simulations * 2      # 7%  — double (*4 dropped)
     return max(1, int(cap))
 
 
@@ -917,6 +387,7 @@ def make_state_from_handicap(handicap: Dict[str, object]) -> GameState:
         red_walls=int(handicap["red_walls"]),
         blue_walls=int(handicap["blue_walls"]),
         starting_player=handicap["starting_player"],
+        board_size=BOARD_SIZE,
     )
 
 
@@ -925,20 +396,42 @@ def future_traverse_target(
     ply: int,
     pawn_visits: Sequence[Tuple[int, Player, Tuple[int, int]]],
 ) -> Tensor:
+    """Future pawn-visit map in the canonical (side-to-move) frame.
+
+    Rows are flipped for BLUE so the spatial target lines up with the
+    canonical board fed to the network in encode_state.
+    """
+    flip = side_to_move == Player.BLUE
     target = torch.zeros((2, BOARD_SIZE, BOARD_SIZE), dtype=torch.float32)
     for visit_ply, player, position in pawn_visits:
         if visit_ply < ply:
             continue
         row, col = position
+        if flip:
+            row = BOARD_SIZE - 1 - row
         channel = 0 if player == side_to_move else 1
         target[channel, int(row), int(col)] = 1.0
     return target
 
 
-def value_target(side_to_move: Player, winner: Optional[Player]) -> float:
+def value_target(
+    side_to_move: Player,
+    winner: Optional[Player],
+    *,
+    plies_to_end: int = 0,
+    discount: float = 1.0,
+) -> float:
+    """Outcome from the side-to-move perspective, optionally discounted.
+
+    With discount < 1.0 the reward decays by ``discount ** plies_to_end`` so a
+    win reached sooner is worth more than the same win reached later. This gives
+    the value head (and therefore MCTS) a gradient toward finishing the game
+    instead of shuffling pawns until adjudication.
+    """
     if winner is None:
         return 0.0
-    return 1.0 if side_to_move == winner else -1.0
+    magnitude = discount ** max(0, int(plies_to_end)) if discount < 1.0 else 1.0
+    return magnitude if side_to_move == winner else -magnitude
 
 
 def score_target(state: GameState, side_to_move: Player) -> Tuple[float, float]:
@@ -953,6 +446,42 @@ def action_description(action: int) -> str:
     return f"wall {WallOrientation(orientation).name} r={row} c={col}"
 
 
+def encode_state_for_mcts(
+    state: GameState,
+    history: Sequence[GameState],
+    history_length: int,
+) -> Tensor:
+    return encode_state(state)
+
+
+def policy_action_for_mcts(action: int, state: GameState) -> int:
+    return canonical_action(action, state.current_player)
+
+
+def lead_for_mcts(lead: float, state: GameState) -> float:
+    return float(lead)
+
+
+def build_mcts(
+    model: AlphaZeroNet,
+    *,
+    device: torch.device,
+    rng: random.Random,
+    config: MCTSConfig,
+) -> MCTS:
+    return MCTS(
+        model,
+        config=config,
+        device=device,
+        rng=rng,
+        state_encoder=encode_state_for_mcts,
+        action_size=ACTION_SIZE,
+        encode_move_fn=encode_move,
+        policy_action_transform=policy_action_for_mcts,
+        lead_transform=lead_for_mcts,
+    )
+
+
 def generate_self_play_episode(
     model: AlphaZeroNet,
     *,
@@ -964,12 +493,20 @@ def generate_self_play_episode(
     temperature_drop_ply: int,
     mcts_policy_temperature: float,
     adjudicate_step_limit: bool,
+    value_discount: float = 1.0,
+    no_progress_limit: int = 50,
 ) -> Tuple[List[ReplaySample], Optional[Player], bool, int, Dict[str, object]]:
     handicap = sample_handicap(base_walls, rng)
     state = make_state_from_handicap(handicap)
     samples: List[ReplaySample] = []
     pawn_visits: List[Tuple[int, Player, Tuple[int, int]]] = []
     truncated = False
+
+    best_distance = {
+        Player.RED: state.shortest_path_length(Player.RED),
+        Player.BLUE: state.shortest_path_length(Player.BLUE),
+    }
+    stalled_plies = 0
 
     for ply in range(max_steps):
         if state.winner is not None:
@@ -982,15 +519,19 @@ def generate_self_play_episode(
 
         side_to_move = state.current_player
         simulations = sample_playout_cap(base_simulations, rng)
-        mcts = MCTS(
+        mcts = build_mcts(
             model,
             device=device,
             rng=rng,
             config=MCTSConfig(
                 num_simulations=simulations,
+                cpuct_init=1.5,
                 policy_temperature=mcts_policy_temperature,
+                policy_target_temperature=1.0,
                 action_temperature=1.0 if ply < temperature_drop_ply else 0.0,
                 add_root_noise=True,
+                lead_weight=0.02,
+                lead_scale=5.0,
             ),
         )
         result = mcts.search(state)
@@ -1002,8 +543,14 @@ def generate_self_play_episode(
         samples.append(
             ReplaySample(
                 state=encode_state(state).cpu(),
-                mask=state.action_mask().cpu(),
-                policy_target=result.policy_target.cpu(),
+                mask=canonicalize_action_vector(
+                    torch.as_tensor(state.action_mask(), dtype=torch.bool),
+                    side_to_move,
+                ).cpu(),
+                policy_target=canonicalize_action_vector(
+                    torch.as_tensor(result.policy_target, dtype=torch.float32),
+                    side_to_move,
+                ).cpu(),
                 side_to_move=side_to_move,
                 ply=ply,
                 playout_cap=simulations,
@@ -1016,6 +563,24 @@ def generate_self_play_episode(
         state = apply_selected_action(state, action, legal_actions)
         if decode_action(action)[0] == "move":
             pawn_visits.append((ply, side_to_move, state.pawns[side_to_move]))
+
+        # No-progress tracking: a ply counts as progress only if it strictly
+        # reduces some player's shortest distance to goal (a pawn step forward
+        # or a wall that lengthens the opponent does not reset the mover's own
+        # best distance). Pure pawn oscillation never improves either best, so
+        # the counter climbs and the game is cut off and adjudicated.
+        if no_progress_limit > 0:
+            progressed = False
+            for player in (Player.RED, Player.BLUE):
+                distance = state.shortest_path_length(player)
+                previous = best_distance[player]
+                if distance is not None and (previous is None or distance < previous):
+                    best_distance[player] = distance
+                    progressed = True
+            stalled_plies = 0 if progressed else stalled_plies + 1
+            if stalled_plies >= no_progress_limit and state.winner is None:
+                truncated = True
+                break
     else:
         truncated = state.winner is None
 
@@ -1027,8 +592,14 @@ def generate_self_play_episode(
             truncated = False
 
     terminal_steps = len(samples)
-    for sample in samples:
-        sample.value_target = value_target(sample.side_to_move, final_winner)
+    for index, sample in enumerate(samples):
+        plies_to_end = terminal_steps - index
+        sample.value_target = value_target(
+            sample.side_to_move,
+            final_winner,
+            plies_to_end=plies_to_end,
+            discount=value_discount,
+        )
         sample.future_target = future_traverse_target(
             sample.side_to_move,
             sample.ply,
@@ -1147,8 +718,7 @@ def train_on_samples(
     divisor = max(1, batches)
     return {key: value / divisor for key, value in totals.items()}
 
-
-@torch.no_grad()
+@torch.inference_mode()
 def select_model_action(
     model: AlphaZeroNet,
     state: GameState,
@@ -1163,7 +733,9 @@ def select_model_action(
     model.eval()
     logits, _, _ = model.inference(encode_state(state, device).unsqueeze(0))
     logits = torch.nan_to_num(logits.squeeze(0), nan=0.0, posinf=30.0, neginf=-30.0)
-    legal_tensor = torch.as_tensor(legal_actions, dtype=torch.long, device=device)
+    player = state.current_player
+    canonical_legal = [canonical_action(action, player) for action in legal_actions]
+    legal_tensor = torch.as_tensor(canonical_legal, dtype=torch.long, device=device)
     legal_logits = logits.index_select(0, legal_tensor).clamp(-30.0, 30.0)
     return int(legal_actions[int(torch.argmax(legal_logits).item())])
 
@@ -1179,14 +751,18 @@ def choose_trained_action(
     if simulations <= 0:
         return select_model_action(model, state, device=device, rng=rng)
 
-    result = MCTS(
+    result = build_mcts(
         model,
         device=device,
         rng=rng,
         config=MCTSConfig(
             num_simulations=simulations,
+            cpuct_init=1.5,
+            policy_target_temperature=1.0,
             action_temperature=0.0,
             add_root_noise=False,
+            lead_weight=0.02,
+            lead_scale=5.0,
         ),
     ).search(state)
     action = int(result.action)
@@ -1430,27 +1006,53 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a 7x7 Barricade AlphaZero-style policy from self-play MCTS."
     )
-    parser.add_argument("--episodes", type=int, default=400)
+    parser.add_argument("--episodes", type=int, default=2000)
     parser.add_argument("--walls", type=int, default=DEFAULT_WALLS_PER_PLAYER)
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
-    parser.add_argument("--base-simulations", type=int, default=32)
-    parser.add_argument("--eval-simulations", type=int, default=16)
+    parser.add_argument("--base-simulations", type=int, default=512)
+    parser.add_argument("--eval-simulations", type=int, default=256)
     parser.add_argument("--mcts-policy-temperature", type=float, default=1.0)
     parser.add_argument("--temperature-drop-ply", type=int, default=16)
-    parser.add_argument("--update-every", type=int, default=10)
-    parser.add_argument("--train-epochs", type=int, default=2)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--update-every", type=int, default=50)
+    parser.add_argument("--train-epochs", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument(
+        "--replay-capacity",
+        type=int,
+        default=30000,
+        help="Sliding-window replay buffer capacity (samples kept across updates).",
+    )
+    parser.add_argument(
+        "--samples-per-update",
+        type=int,
+        default=4096,
+        help="Number of replay samples drawn (with reuse) for each training update.",
+    )
+    parser.add_argument(
+        "--value-discount",
+        type=float,
+        default=0.98,
+        help="Per-ply discount on the outcome target so faster wins are worth "
+        "more. Set to 1.0 to disable discounting.",
+    )
+    parser.add_argument(
+        "--no-progress-limit",
+        type=int,
+        default=BOARD_SIZE**2,
+        help="End a self-play game as a draw after this many consecutive plies "
+        "without any player reducing its shortest distance to goal. 0 disables.",
+    )
     parser.add_argument("--learning-rate", type=float, default=3.0e-4)
     parser.add_argument("--weight-decay", type=float, default=1.0e-5)
     parser.add_argument("--value-loss-weight", type=float, default=1.0)
-    parser.add_argument("--lead-loss-weight", type=float, default=0.1)
+    parser.add_argument("--lead-loss-weight", type=float, default=0.15)
     parser.add_argument("--future-loss-weight", type=float, default=0.1)
     parser.add_argument("--score-loss-weight", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--hidden-channels", type=int, default=64)
     parser.add_argument("--residual-blocks", type=int, default=4)
-    parser.add_argument("--eval-games", type=int, default=80)
-    parser.add_argument("--show-games", type=int, default=3)
+    parser.add_argument("--eval-games", type=int, default=256)
+    parser.add_argument("--show-games", type=int, default=50)
     parser.add_argument("--max-moves-to-print", type=int, default=80)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=7)
@@ -1481,6 +1083,9 @@ def main() -> None:
         hidden_channels=args.hidden_channels,
         residual_blocks=args.residual_blocks,
     ).to(device)
+    # load model
+    state_dict = torch.load("checkpoint_copies/7x7_mcts_2000it.pt", map_location=device)
+    model.load_state_dict(state_dict["model_state"])
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -1508,7 +1113,7 @@ def main() -> None:
         ),
     )
 
-    buffer: List[ReplaySample] = []
+    buffer: "deque[ReplaySample]" = deque(maxlen=max(1, args.replay_capacity))
     recent_winners: List[Optional[Player]] = []
     recent_lengths: List[int] = []
     recent_draws = 0
@@ -1534,6 +1139,8 @@ def main() -> None:
             temperature_drop_ply=args.temperature_drop_ply,
             mcts_policy_temperature=args.mcts_policy_temperature,
             adjudicate_step_limit=not args.no_adjudicate_step_limit,
+            value_discount=args.value_discount,
+            no_progress_limit=args.no_progress_limit,
         )
         buffer.extend(samples)
         recent_winners.append(winner)
@@ -1542,11 +1149,15 @@ def main() -> None:
         if truncated:
             recent_draws += 1
 
-        if episode % args.update_every == 0:
+        if episode % args.update_every == 0 and buffer:
+            if len(buffer) > args.samples_per_update:
+                training_pool = rng.sample(list(buffer), args.samples_per_update)
+            else:
+                training_pool = list(buffer)
             last_stats = train_on_samples(
                 model,
                 optimizer,
-                buffer,
+                training_pool,
                 device=device,
                 batch_size=args.batch_size,
                 epochs=args.train_epochs,
@@ -1557,7 +1168,6 @@ def main() -> None:
                 grad_clip=args.grad_clip,
                 rng=rng,
             )
-            buffer.clear()
 
         if episode % args.log_every == 0 or episode == args.episodes:
             window = max(1, len(recent_winners))
@@ -1587,10 +1197,14 @@ def main() -> None:
             recent_caps.clear()
 
     if buffer:
+        if len(buffer) > args.samples_per_update:
+            training_pool = rng.sample(list(buffer), args.samples_per_update)
+        else:
+            training_pool = list(buffer)
         last_stats = train_on_samples(
             model,
             optimizer,
-            buffer,
+            training_pool,
             device=device,
             batch_size=args.batch_size,
             epochs=args.train_epochs,
@@ -1601,7 +1215,6 @@ def main() -> None:
             grad_clip=args.grad_clip,
             rng=rng,
         )
-        buffer.clear()
         print(
             f"final_update loss={last_stats['loss']:.4f} "
             f"policy={last_stats['policy_loss']:.4f} "

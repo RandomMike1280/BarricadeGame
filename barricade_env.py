@@ -21,7 +21,7 @@ from __future__ import annotations
 from enum import Enum
 import heapq
 import random
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 try:
     import numpy as np
@@ -49,6 +49,18 @@ VERTICAL_WALL_OFFSET = HORIZONTAL_WALL_OFFSET + WALL_ACTIONS_PER_ORIENTATION
 ACTION_SIZE = MOVE_ACTIONS + WALL_ACTIONS_PER_ORIENTATION * 2
 
 DIRECTIONS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+
+
+def wall_board_size_for_board_size(board_size: int) -> int:
+    board_size = int(board_size)
+    if board_size < 2:
+        raise ValueError("board_size must be at least 2.")
+    return board_size - 1
+
+
+def action_size_for_board_size(board_size: int) -> int:
+    wall_board_size = wall_board_size_for_board_size(board_size)
+    return MOVE_ACTIONS + wall_board_size * wall_board_size * 2
 
 
 class Player(Enum):
@@ -87,6 +99,159 @@ ALL_WALL_PLACEMENTS = tuple(
     for r in range(WALL_BOARD_SIZE)
     for c in range(WALL_BOARD_SIZE)
 )
+_CELL_ADJACENCY_CACHE: Dict[int, Tuple[Tuple[Any, ...], ...]] = {}
+_PATH_GRAPH_CACHE: Dict[int, "PathGraph"] = {}
+
+
+class PathGraph(NamedTuple):
+    adjacency: Tuple[Tuple[Tuple[int, int], ...], ...]
+    horizontal_wall_masks: Tuple[int, ...]
+    vertical_wall_masks: Tuple[int, ...]
+    red_heuristics: Tuple[int, ...]
+    blue_heuristics: Tuple[int, ...]
+    red_goal_mask: int
+    blue_goal_mask: int
+    index_to_cell: Tuple[Tuple[int, int], ...]
+
+
+def all_wall_placements_for_board_size(board_size: int) -> Tuple[WallPlacement, ...]:
+    wall_board_size = wall_board_size_for_board_size(board_size)
+    return tuple(
+        (orient, row, col)
+        for orient in (WallOrientation.HORIZONTAL, WallOrientation.VERTICAL)
+        for row in range(wall_board_size)
+        for col in range(wall_board_size)
+    )
+
+
+def cell_adjacency_for_board_size(board_size: int) -> Tuple[Tuple[Any, ...], ...]:
+    board_size = int(board_size)
+    cached = _CELL_ADJACENCY_CACHE.get(board_size)
+    if cached is not None:
+        return cached
+
+    adjacency = []
+    for row in range(board_size):
+        for col in range(board_size):
+            neighbors = []
+            for row_delta, col_delta in DIRECTIONS:
+                next_row = row + row_delta
+                next_col = col + col_delta
+                if not (0 <= next_row < board_size and 0 <= next_col < board_size):
+                    continue
+
+                if row_delta:
+                    row_min = row if row < next_row else next_row
+                    neighbors.append(
+                        (
+                            (next_row, next_col),
+                            True,
+                            (row_min, col),
+                            (row_min, col - 1),
+                        )
+                    )
+                else:
+                    col_min = col if col < next_col else next_col
+                    neighbors.append(
+                        (
+                            (next_row, next_col),
+                            False,
+                            (row, col_min),
+                            (row - 1, col_min),
+                        )
+                    )
+            adjacency.append(tuple(neighbors))
+
+    cached = tuple(adjacency)
+    _CELL_ADJACENCY_CACHE[board_size] = cached
+    return cached
+
+
+def path_graph_for_board_size(board_size: int) -> PathGraph:
+    board_size = int(board_size)
+    cached = _PATH_GRAPH_CACHE.get(board_size)
+    if cached is not None:
+        return cached
+
+    wall_board_size = wall_board_size_for_board_size(board_size)
+    index_to_cell = tuple(
+        (row, col)
+        for row in range(board_size)
+        for col in range(board_size)
+    )
+
+    edge_bits: Dict[Tuple[int, int], int] = {}
+    next_bit = 1
+    adjacency: List[List[Tuple[int, int]]] = [
+        [] for _ in range(board_size * board_size)
+    ]
+
+    for row in range(board_size):
+        for col in range(board_size):
+            cell_index = row * board_size + col
+            for row_delta, col_delta in DIRECTIONS:
+                next_row = row + row_delta
+                next_col = col + col_delta
+                if not (0 <= next_row < board_size and 0 <= next_col < board_size):
+                    continue
+                next_index = next_row * board_size + next_col
+                edge_key = (
+                    (cell_index, next_index)
+                    if cell_index < next_index
+                    else (next_index, cell_index)
+                )
+                edge_bit = edge_bits.get(edge_key)
+                if edge_bit is None:
+                    edge_bit = next_bit
+                    edge_bits[edge_key] = edge_bit
+                    next_bit <<= 1
+                adjacency[cell_index].append((next_index, edge_bit))
+
+    def edge_between(row1: int, col1: int, row2: int, col2: int) -> int:
+        first = row1 * board_size + col1
+        second = row2 * board_size + col2
+        edge_key = (first, second) if first < second else (second, first)
+        return edge_bits[edge_key]
+
+    horizontal_wall_masks: List[int] = []
+    vertical_wall_masks: List[int] = []
+    for row in range(wall_board_size):
+        for col in range(wall_board_size):
+            horizontal_wall_masks.append(
+                edge_between(row, col, row + 1, col)
+                | edge_between(row, col + 1, row + 1, col + 1)
+            )
+            vertical_wall_masks.append(
+                edge_between(row, col, row, col + 1)
+                | edge_between(row + 1, col, row + 1, col + 1)
+            )
+
+    red_target = board_size - 1
+    blue_target = 0
+    red_goal_mask = 0
+    blue_goal_mask = 0
+    red_heuristics: List[int] = []
+    blue_heuristics: List[int] = []
+    for index, (row, _) in enumerate(index_to_cell):
+        red_heuristics.append(abs(row - red_target))
+        blue_heuristics.append(abs(row - blue_target))
+        if row == red_target:
+            red_goal_mask |= 1 << index
+        if row == blue_target:
+            blue_goal_mask |= 1 << index
+
+    cached = PathGraph(
+        adjacency=tuple(tuple(neighbors) for neighbors in adjacency),
+        horizontal_wall_masks=tuple(horizontal_wall_masks),
+        vertical_wall_masks=tuple(vertical_wall_masks),
+        red_heuristics=tuple(red_heuristics),
+        blue_heuristics=tuple(blue_heuristics),
+        red_goal_mask=red_goal_mask,
+        blue_goal_mask=blue_goal_mask,
+        index_to_cell=index_to_cell,
+    )
+    _PATH_GRAPH_CACHE[board_size] = cached
+    return cached
 
 
 def coerce_player(player: Player | str | int) -> Player:
@@ -114,11 +279,20 @@ def coerce_move_direction(direction: MoveDirection | str | int) -> MoveDirection
 
 
 def coerce_position(position: Sequence[int], name: str) -> Tuple[int, int]:
+    return coerce_position_for_board_size(position, name, BOARD_SIZE)
+
+
+def coerce_position_for_board_size(
+    position: Sequence[int],
+    name: str,
+    board_size: int,
+) -> Tuple[int, int]:
+    board_size = int(board_size)
     if len(position) != 2:
         raise ValueError(f"{name} must contain exactly two values: (row, col).")
     row, col = int(position[0]), int(position[1])
-    if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
-        raise ValueError(f"{name} must be on the {BOARD_SIZE}x{BOARD_SIZE} board.")
+    if not (0 <= row < board_size and 0 <= col < board_size):
+        raise ValueError(f"{name} must be on the {board_size}x{board_size} board.")
     return row, col
 
 
@@ -131,6 +305,12 @@ def coerce_wall_count(count: int, name: str) -> int:
 
 def encode_move(move: Move) -> int:
     """Encode a move tuple into the fixed discrete action id."""
+    return encode_move_for_board_size(move, BOARD_SIZE)
+
+
+def encode_move_for_board_size(move: Move, board_size: int) -> int:
+    """Encode a move tuple for a specific board size."""
+    wall_board_size = wall_board_size_for_board_size(board_size)
     move_type = move[0]
     if move_type == "move":
         if len(move) != 2:
@@ -143,43 +323,52 @@ def encode_move(move: Move) -> int:
         orientation = coerce_orientation(orientation)
         row = int(row)
         col = int(col)
-        if not (0 <= row < WALL_BOARD_SIZE and 0 <= col < WALL_BOARD_SIZE):
+        if not (0 <= row < wall_board_size and 0 <= col < wall_board_size):
             raise ValueError(f"Wall anchor out of bounds: {(row, col)}")
         offset = (
             HORIZONTAL_WALL_OFFSET
             if orientation == WallOrientation.HORIZONTAL
-            else VERTICAL_WALL_OFFSET
+            else HORIZONTAL_WALL_OFFSET + wall_board_size * wall_board_size
         )
-        return offset + row * WALL_BOARD_SIZE + col
+        return offset + row * wall_board_size + col
 
     raise ValueError(f"Unknown move type: {move_type!r}")
 
 
 def decode_action(action: int) -> Move:
     """Decode a discrete action id into a game move tuple."""
+    return decode_action_for_board_size(action, BOARD_SIZE)
+
+
+def decode_action_for_board_size(action: int, board_size: int) -> Move:
+    """Decode a discrete action id for a specific board size."""
+    wall_board_size = wall_board_size_for_board_size(board_size)
+    horizontal_wall_offset = MOVE_ACTIONS
+    vertical_wall_offset = horizontal_wall_offset + wall_board_size * wall_board_size
+    action_size = action_size_for_board_size(board_size)
     action = int(action)
     if 0 <= action < MOVE_ACTIONS:
         return ("move", MoveDirection(action))
 
-    if HORIZONTAL_WALL_OFFSET <= action < VERTICAL_WALL_OFFSET:
-        index = action - HORIZONTAL_WALL_OFFSET
+    if horizontal_wall_offset <= action < vertical_wall_offset:
+        index = action - horizontal_wall_offset
         return (
             "wall",
             WallOrientation.HORIZONTAL,
-            index // WALL_BOARD_SIZE,
-            index % WALL_BOARD_SIZE,
+            index // wall_board_size,
+            index % wall_board_size,
         )
 
-    if VERTICAL_WALL_OFFSET <= action < ACTION_SIZE:
-        index = action - VERTICAL_WALL_OFFSET
+    if vertical_wall_offset <= action < action_size:
+        index = action - vertical_wall_offset
         return (
             "wall",
             WallOrientation.VERTICAL,
-            index // WALL_BOARD_SIZE,
-            index % WALL_BOARD_SIZE,
+            index // wall_board_size,
+            index % wall_board_size,
         )
 
-    raise ValueError(f"Action must be in [0, {ACTION_SIZE - 1}], got {action}")
+    raise ValueError(f"Action must be in [0, {action_size - 1}], got {action}")
 
 
 class BarricadeState:
@@ -192,29 +381,51 @@ class BarricadeState:
         blue_start: Sequence[int] = DEFAULT_BLUE_START,
         red_walls: int = DEFAULT_WALLS_PER_PLAYER,
         blue_walls: int = DEFAULT_WALLS_PER_PLAYER,
+        starting_player: Player | str | int = Player.RED,
+        board_size: int = BOARD_SIZE,
     ) -> None:
-        red_start = coerce_position(red_start, "red_start")
-        blue_start = coerce_position(blue_start, "blue_start")
+        board_size = int(board_size)
+        wall_board_size = wall_board_size_for_board_size(board_size)
+        red_start = coerce_position_for_board_size(red_start, "red_start", board_size)
+        blue_start = coerce_position_for_board_size(blue_start, "blue_start", board_size)
         if red_start == blue_start:
             raise ValueError("red_start and blue_start cannot be the same square.")
 
         red_walls = coerce_wall_count(red_walls, "red_walls")
         blue_walls = coerce_wall_count(blue_walls, "blue_walls")
+        starting_player = coerce_player(starting_player)
 
+        self.board_size = board_size
+        self.wall_board_size = wall_board_size
+        self.action_size = action_size_for_board_size(board_size)
+        self.all_wall_placements = all_wall_placements_for_board_size(board_size)
+        self._cell_adjacency = cell_adjacency_for_board_size(board_size)
+        self._path_graph = path_graph_for_board_size(board_size)
+        self._blocked_edge_mask = 0
+        self._wall_cache_key: Optional[frozenset[WallPlacement]] = frozenset()
         self.pawns = {Player.RED: red_start, Player.BLUE: blue_start}
         self.walls: Set[WallPlacement] = set()
-        self.current_player = Player.RED
+        self.current_player = starting_player
         self.winner: Optional[Player] = None
         self.initial_walls = {Player.RED: red_walls, Player.BLUE: blue_walls}
         self.walls_left = {Player.RED: red_walls, Player.BLUE: blue_walls}
 
         self._valid_moves_cache_key: Optional[Tuple[Any, ...]] = None
         self._valid_moves_cache: Optional[Tuple[Move, ...]] = None
+        self._valid_action_moves_cache: Optional[Tuple[Tuple[int, Move], ...]] = None
         self._path_cache: Dict[Tuple[Any, ...], Optional[int]] = {}
         self._route_cache: Dict[Tuple[Any, ...], Optional[Tuple[Tuple[int, int], ...]]] = {}
 
     def copy(self) -> "BarricadeState":
         new_state = BarricadeState.__new__(BarricadeState)
+        new_state.board_size = self.board_size
+        new_state.wall_board_size = self.wall_board_size
+        new_state.action_size = self.action_size
+        new_state.all_wall_placements = self.all_wall_placements
+        new_state._cell_adjacency = self._cell_adjacency
+        new_state._path_graph = self._path_graph
+        new_state._blocked_edge_mask = self._blocked_edge_mask
+        new_state._wall_cache_key = self._wall_cache_key
         new_state.pawns = dict(self.pawns)
         new_state.walls = set(self.walls)
         new_state.current_player = self.current_player
@@ -223,12 +434,14 @@ class BarricadeState:
         new_state.walls_left = dict(self.walls_left)
         new_state._valid_moves_cache_key = None
         new_state._valid_moves_cache = None
+        new_state._valid_action_moves_cache = None
         new_state._path_cache = self._path_cache
         new_state._route_cache = self._route_cache
         return new_state
 
     def state_cache_key(self) -> Tuple[Any, ...]:
         return (
+            self.board_size,
             self.pawns[Player.RED],
             self.pawns[Player.BLUE],
             self.current_player,
@@ -246,80 +459,215 @@ class BarricadeState:
         if key == self._valid_moves_cache_key and self._valid_moves_cache is not None:
             return list(self._valid_moves_cache)
 
-        moves = self.get_pawn_moves()
-        moves.extend(self.get_valid_wall_moves())
-        self._valid_moves_cache_key = key
-        self._valid_moves_cache = tuple(moves)
-        return moves
+        action_moves = self._compute_valid_action_moves()
+        self._cache_valid_action_moves(key, action_moves)
+        return [move for _, move in action_moves]
 
-    def get_pawn_moves(self) -> List[Move]:
+    def legal_moves(self) -> List[Move]:
+        """Alias for ``get_valid_moves`` used by action-centric callers."""
+        return self.get_valid_moves()
+
+    def legal_actions(self) -> List[int]:
+        """Return legal moves encoded in the fixed discrete action space."""
+        return [action for action, _ in self.legal_action_moves()]
+
+    def legal_action_moves(self) -> List[Tuple[int, Move]]:
+        """Return legal actions paired with their rule-engine move tuples."""
         if self.winner is not None:
             return []
 
-        moves: List[Move] = []
+        key = self.state_cache_key()
+        if (
+            key == self._valid_moves_cache_key
+            and self._valid_action_moves_cache is not None
+        ):
+            return list(self._valid_action_moves_cache)
+
+        action_moves = self._compute_valid_action_moves()
+        self._cache_valid_action_moves(key, action_moves)
+        return action_moves
+
+    def _cache_valid_action_moves(
+        self,
+        key: Tuple[Any, ...],
+        action_moves: List[Tuple[int, Move]],
+    ) -> None:
+        self._valid_moves_cache_key = key
+        self._valid_action_moves_cache = tuple(action_moves)
+        self._valid_moves_cache = tuple(move for _, move in action_moves)
+
+    def _compute_valid_action_moves(self) -> List[Tuple[int, Move]]:
+        action_moves = self._get_pawn_action_moves()
+        action_moves.extend(self._get_valid_wall_action_moves())
+        return action_moves
+
+    def action_mask(self) -> List[int]:
+        """Return a 0/1 legal-action mask as a plain Python list."""
+        mask = [0] * self.action_size
+        for action in self.legal_actions():
+            mask[action] = 1
+        return mask
+
+    def get_pawn_moves(self) -> List[Move]:
+        return [move for _, move in self._get_pawn_action_moves()]
+
+    def _get_pawn_action_moves(self) -> List[Tuple[int, Move]]:
+        if self.winner is not None:
+            return []
+
+        moves: List[Tuple[int, Move]] = []
         pawn_row, pawn_col = self.pawns[self.current_player]
+        opponent_position = self.pawns[self.current_player.opposite()]
 
         for direction, (row_delta, col_delta) in MOVE_DIRECTION_DELTAS.items():
             next_row = pawn_row + row_delta
             next_col = pawn_col + col_delta
 
-            if not (0 <= next_row < BOARD_SIZE and 0 <= next_col < BOARD_SIZE):
+            if not (
+                0 <= next_row < self.board_size
+                and 0 <= next_col < self.board_size
+            ):
                 continue
             if self.is_blocked(pawn_row, pawn_col, next_row, next_col):
                 continue
-            if (next_row, next_col) in self.pawns.values():
+            if (next_row, next_col) == opponent_position:
                 continue
 
-            moves.append(("move", direction))
+            moves.append((direction.value, ("move", direction)))
 
         return moves
 
     def get_valid_wall_moves(
         self, candidates: Optional[Iterable[WallPlacement]] = None
     ) -> List[Move]:
+        return [move for _, move in self._get_valid_wall_action_moves(candidates)]
+
+    def _get_valid_wall_action_moves(
+        self, candidates: Optional[Iterable[WallPlacement]] = None
+    ) -> List[Tuple[int, Move]]:
         if self.walls_left[self.current_player] <= 0:
             return []
 
-        wall_moves: List[Move] = []
-        placements = ALL_WALL_PLACEMENTS if candidates is None else candidates
+        wall_moves: List[Tuple[int, Move]] = []
+        placements = self.all_wall_placements if candidates is None else candidates
+        horizontal_walls, vertical_walls = self._wall_lookup(self.walls)
+        base_blocked_edge_mask = self._current_blocked_edge_mask()
+        red_route = self.greedy_path_cells(Player.RED)
+        blue_route = self.greedy_path_cells(Player.BLUE)
+        red_route_blockers = (
+            self._path_blocking_walls(red_route) if red_route is not None else None
+        )
+        blue_route_blockers = (
+            self._path_blocking_walls(blue_route) if blue_route is not None else None
+        )
         for orientation, row, col in placements:
-            if self.is_valid_wall_placement(orientation, row, col):
-                wall_moves.append(("wall", orientation, row, col))
+            if self._is_valid_wall_placement(
+                orientation,
+                row,
+                col,
+                red_route_blockers,
+                blue_route_blockers,
+                horizontal_walls,
+                vertical_walls,
+                base_blocked_edge_mask,
+            ):
+                offset = (
+                    HORIZONTAL_WALL_OFFSET
+                    if orientation == WallOrientation.HORIZONTAL
+                    else HORIZONTAL_WALL_OFFSET
+                    + self.wall_board_size * self.wall_board_size
+                )
+                action = offset + row * self.wall_board_size + col
+                wall_moves.append((action, ("wall", orientation, row, col)))
 
         return wall_moves
 
     def is_blocked(self, row1: int, col1: int, row2: int, col2: int) -> bool:
         """Return True when a direct adjacent step is blocked by a wall."""
+        horizontal = WallOrientation.HORIZONTAL
+        vertical = WallOrientation.VERTICAL
+        walls = self.walls
+        wall_board_size = self.wall_board_size
         if row1 == row2:
-            col_min = min(col1, col2)
-            for wall_row in (row1, row1 - 1):
-                if (
-                    0 <= wall_row < WALL_BOARD_SIZE
-                    and (WallOrientation.VERTICAL, wall_row, col_min) in self.walls
-                ):
-                    return True
+            col_min = col1 if col1 < col2 else col2
+            return (
+                0 <= row1 < wall_board_size
+                and (vertical, row1, col_min) in walls
+            ) or (
+                0 <= row1 - 1 < wall_board_size
+                and (vertical, row1 - 1, col_min) in walls
+            )
         elif col1 == col2:
-            row_min = min(row1, row2)
-            for wall_col in (col1, col1 - 1):
-                if (
-                    0 <= wall_col < WALL_BOARD_SIZE
-                    and (WallOrientation.HORIZONTAL, row_min, wall_col) in self.walls
-                ):
-                    return True
+            row_min = row1 if row1 < row2 else row2
+            return (
+                0 <= col1 < wall_board_size
+                and (horizontal, row_min, col1) in walls
+            ) or (
+                0 <= col1 - 1 < wall_board_size
+                and (horizontal, row_min, col1 - 1) in walls
+            )
         return False
 
     def is_valid_wall_placement(
         self, orientation: WallOrientation | str | int, row: int, col: int
     ) -> bool:
+        return self._is_valid_wall_placement(orientation, row, col, None, None)
+
+    def _is_valid_wall_placement(
+        self,
+        orientation: WallOrientation | str | int,
+        row: int,
+        col: int,
+        red_route_blockers: Optional[Set[WallPlacement]],
+        blue_route_blockers: Optional[Set[WallPlacement]],
+        horizontal_walls: Optional[Set[Tuple[int, int]]] = None,
+        vertical_walls: Optional[Set[Tuple[int, int]]] = None,
+        base_blocked_edge_mask: Optional[int] = None,
+    ) -> bool:
         orientation = coerce_orientation(orientation)
-        if not self.is_wall_shape_available(orientation, row, col):
+        if horizontal_walls is None or vertical_walls is None:
+            horizontal_walls, vertical_walls = self._wall_lookup(self.walls)
+        if not self._is_wall_shape_available_from_sets(
+            orientation,
+            row,
+            col,
+            horizontal_walls,
+            vertical_walls,
+        ):
             return False
 
         wall = (orientation, row, col)
-        self.walls.add(wall)
-        can_reach_red = self.has_path(Player.RED)
-        can_reach_blue = self.has_path(Player.BLUE)
-        self.walls.remove(wall)
+        red_needs_search = red_route_blockers is None or wall in red_route_blockers
+        blue_needs_search = blue_route_blockers is None or wall in blue_route_blockers
+        if not red_needs_search and not blue_needs_search:
+            return True
+
+        if base_blocked_edge_mask is None:
+            base_blocked_edge_mask = self._current_blocked_edge_mask()
+        blocked_edge_mask = base_blocked_edge_mask | self._wall_edge_mask(
+            orientation,
+            row,
+            col,
+        )
+        can_reach_red = (
+            self._has_path_with_mask(
+                Player.RED,
+                blocked_edge_mask,
+            )
+            if red_needs_search
+            else True
+        )
+        can_reach_blue = (
+            can_reach_red
+            and (
+                self._has_path_with_mask(
+                    Player.BLUE,
+                    blocked_edge_mask,
+                )
+                if blue_needs_search
+                else True
+            )
+        )
 
         return can_reach_red and can_reach_blue
 
@@ -327,148 +675,221 @@ class BarricadeState:
         self, orientation: WallOrientation | str | int, row: int, col: int
     ) -> bool:
         orientation = coerce_orientation(orientation)
-        if row < 0 or row >= WALL_BOARD_SIZE or col < 0 or col >= WALL_BOARD_SIZE:
+        horizontal_walls, vertical_walls = self._wall_lookup(self.walls)
+        return self._is_wall_shape_available_from_sets(
+            orientation,
+            row,
+            col,
+            horizontal_walls,
+            vertical_walls,
+        )
+
+    def _is_wall_shape_available_from_sets(
+        self,
+        orientation: WallOrientation,
+        row: int,
+        col: int,
+        horizontal_walls: Set[Tuple[int, int]],
+        vertical_walls: Set[Tuple[int, int]],
+    ) -> bool:
+        if (
+            row < 0
+            or row >= self.wall_board_size
+            or col < 0
+            or col >= self.wall_board_size
+        ):
             return False
 
         if orientation == WallOrientation.HORIZONTAL:
-            if (WallOrientation.HORIZONTAL, row, col) in self.walls:
+            if (row, col) in horizontal_walls:
                 return False
-            if (WallOrientation.HORIZONTAL, row, col - 1) in self.walls:
+            if (row, col - 1) in horizontal_walls:
                 return False
-            if (WallOrientation.HORIZONTAL, row, col + 1) in self.walls:
+            if (row, col + 1) in horizontal_walls:
                 return False
-            if (WallOrientation.VERTICAL, row, col) in self.walls:
+            if (row, col) in vertical_walls:
                 return False
         else:
-            if (WallOrientation.VERTICAL, row, col) in self.walls:
+            if (row, col) in vertical_walls:
                 return False
-            if (WallOrientation.VERTICAL, row - 1, col) in self.walls:
+            if (row - 1, col) in vertical_walls:
                 return False
-            if (WallOrientation.VERTICAL, row + 1, col) in self.walls:
+            if (row + 1, col) in vertical_walls:
                 return False
-            if (WallOrientation.HORIZONTAL, row, col) in self.walls:
+            if (row, col) in horizontal_walls:
                 return False
 
         return True
 
+    def _path_blocking_walls(
+        self,
+        path: Tuple[Tuple[int, int], ...],
+    ) -> Set[WallPlacement]:
+        blockers: Set[WallPlacement] = set()
+        wall_board_size = self.wall_board_size
+        for index in range(len(path) - 1):
+            row1, col1 = path[index]
+            row2, col2 = path[index + 1]
+            if col1 == col2:
+                row_min = row1 if row1 < row2 else row2
+                if 0 <= row_min < wall_board_size:
+                    if 0 <= col1 < wall_board_size:
+                        blockers.add((WallOrientation.HORIZONTAL, row_min, col1))
+                    if 0 <= col1 - 1 < wall_board_size:
+                        blockers.add((WallOrientation.HORIZONTAL, row_min, col1 - 1))
+            elif row1 == row2:
+                col_min = col1 if col1 < col2 else col2
+                if 0 <= col_min < wall_board_size:
+                    if 0 <= row1 < wall_board_size:
+                        blockers.add((WallOrientation.VERTICAL, row1, col_min))
+                    if 0 <= row1 - 1 < wall_board_size:
+                        blockers.add((WallOrientation.VERTICAL, row1 - 1, col_min))
+        return blockers
+
     def has_path(self, player: Player | str | int) -> bool:
         player = coerce_player(player)
-        key = ("greedy_reachable", player, self.pawns[player], frozenset(self.walls))
+        return self._has_path_with_mask(player, self._current_blocked_edge_mask())
+
+    def _has_path_with_mask(self, player: Player, blocked_edge_mask: int) -> bool:
+        key = ("reachable_edges", player, self.pawns[player], blocked_edge_mask)
         if key in self._path_cache:
             return bool(self._path_cache[key])
 
         start = self.pawns[player]
-        target_row = BOARD_SIZE - 1 if player == Player.RED else 0
-        frontier = [(self._path_heuristic(start, target_row), start)]
-        visited = {start}
+        start_index = start[0] * self.board_size + start[1]
+        graph = self._path_graph
+        if player == Player.RED:
+            goal_mask = graph.red_goal_mask
+            heuristics = graph.red_heuristics
+        else:
+            goal_mask = graph.blue_goal_mask
+            heuristics = graph.blue_heuristics
 
-        while frontier:
-            _, (row, col) = heapq.heappop(frontier)
-            if row == target_row:
+        buckets: List[List[int]] = [[] for _ in range(self.board_size)]
+        current_heuristic = heuristics[start_index]
+        buckets[current_heuristic].append(start_index)
+        pending = 1
+        visited_mask = 1 << start_index
+        adjacency = graph.adjacency
+        max_heuristic = self.board_size - 1
+
+        while pending:
+            while not buckets[current_heuristic]:
+                current_heuristic += 1
+                if current_heuristic > max_heuristic:
+                    current_heuristic = 0
+            cell_index = buckets[current_heuristic].pop()
+            pending -= 1
+            if goal_mask & (1 << cell_index):
                 self._path_cache[key] = 1
                 return True
 
-            for row_delta, col_delta in DIRECTIONS:
-                next_row = row + row_delta
-                next_col = col + col_delta
-                next_cell = (next_row, next_col)
-                if (
-                    0 <= next_row < BOARD_SIZE
-                    and 0 <= next_col < BOARD_SIZE
-                    and next_cell not in visited
-                    and not self.is_blocked(row, col, next_row, next_col)
-                ):
-                    visited.add(next_cell)
-                    heapq.heappush(
-                        frontier,
-                        (self._path_heuristic(next_cell, target_row), next_cell),
-                    )
+            for next_index, edge_mask in adjacency[cell_index]:
+                next_bit = 1 << next_index
+                if visited_mask & next_bit:
+                    continue
+                if blocked_edge_mask & edge_mask:
+                    continue
+                visited_mask |= next_bit
+                next_heuristic = heuristics[next_index]
+                buckets[next_heuristic].append(next_index)
+                pending += 1
+                if next_heuristic < current_heuristic:
+                    current_heuristic = next_heuristic
 
         self._path_cache[key] = 0
         return False
 
-    def greedy_path_length(self, player: Player | str | int) -> Optional[int]:
+    def shortest_path_length(self, player: Player | str | int) -> Optional[int]:
         player = coerce_player(player)
-        key = ("greedy_distance", player, self.pawns[player], frozenset(self.walls))
+        blocked_edge_mask = self._current_blocked_edge_mask()
+        key = ("shortest_distance_edges", player, self.pawns[player], blocked_edge_mask)
         if key in self._path_cache:
             return self._path_cache[key]
 
         start = self.pawns[player]
-        target_row = BOARD_SIZE - 1 if player == Player.RED else 0
-        frontier = [(self._path_heuristic(start, target_row), 0, start)]
-        visited = {start}
+        start_index = start[0] * self.board_size + start[1]
+        graph = self._path_graph
+        goal_mask = graph.red_goal_mask if player == Player.RED else graph.blue_goal_mask
+        queue = [(start_index, 0)]
+        visited_mask = 1 << start_index
+        index = 0
+        adjacency = graph.adjacency
 
-        while frontier:
-            _, distance, (row, col) = heapq.heappop(frontier)
-            if row == target_row:
+        while index < len(queue):
+            cell_index, distance = queue[index]
+            index += 1
+            if goal_mask & (1 << cell_index):
                 self._path_cache[key] = distance
                 return distance
 
-            for row_delta, col_delta in DIRECTIONS:
-                next_row = row + row_delta
-                next_col = col + col_delta
-                next_cell = (next_row, next_col)
-                if 0 <= next_row < BOARD_SIZE and 0 <= next_col < BOARD_SIZE:
-                    if next_cell not in visited and not self.is_blocked(
-                        row, col, next_row, next_col
-                    ):
-                        visited.add(next_cell)
-                        heapq.heappush(
-                            frontier,
-                            (
-                                self._path_heuristic(next_cell, target_row),
-                                distance + 1,
-                                next_cell,
-                            ),
-                        )
+            for next_index, edge_mask in adjacency[cell_index]:
+                next_bit = 1 << next_index
+                if visited_mask & next_bit:
+                    continue
+                if blocked_edge_mask & edge_mask:
+                    continue
+                visited_mask |= next_bit
+                queue.append((next_index, distance + 1))
 
         self._path_cache[key] = None
         return None
+
+    def greedy_path_length(self, player: Player | str | int) -> Optional[int]:
+        return self.shortest_path_length(player)
 
     def greedy_path_cells(
         self, player: Player | str | int
     ) -> Optional[Tuple[Tuple[int, int], ...]]:
         player = coerce_player(player)
-        key = ("greedy_route", player, self.pawns[player], frozenset(self.walls))
+        blocked_edge_mask = self._current_blocked_edge_mask()
+        key = ("greedy_route_edges", player, self.pawns[player], blocked_edge_mask)
         if key in self._route_cache:
             return self._route_cache[key]
 
         start = self.pawns[player]
-        target_row = BOARD_SIZE - 1 if player == Player.RED else 0
-        frontier = [(self._path_heuristic(start, target_row), 0, start)]
-        parent = {start: None}
+        start_index = start[0] * self.board_size + start[1]
+        graph = self._path_graph
+        if player == Player.RED:
+            goal_mask = graph.red_goal_mask
+            heuristics = graph.red_heuristics
+        else:
+            goal_mask = graph.blue_goal_mask
+            heuristics = graph.blue_heuristics
+
+        frontier = [(heuristics[start_index], 0, start_index)]
+        parent = [-1] * (self.board_size * self.board_size)
+        parent[start_index] = start_index
+        adjacency = graph.adjacency
 
         while frontier:
-            _, distance, (row, col) = heapq.heappop(frontier)
-            if row == target_row:
-                path = []
-                node: Optional[Tuple[int, int]] = (row, col)
-                while node is not None:
-                    path.append(node)
+            _, distance, cell_index = heapq.heappop(frontier)
+            if goal_mask & (1 << cell_index):
+                path: List[Tuple[int, int]] = []
+                node = cell_index
+                while True:
+                    path.append(graph.index_to_cell[node])
+                    if node == parent[node]:
+                        break
                     node = parent[node]
                 result = tuple(reversed(path))
                 self._route_cache[key] = result
                 return result
 
-            for row_delta, col_delta in DIRECTIONS:
-                next_row = row + row_delta
-                next_col = col + col_delta
-                next_cell = (next_row, next_col)
-                if (
-                    0 <= next_row < BOARD_SIZE
-                    and 0 <= next_col < BOARD_SIZE
-                    and next_cell not in parent
-                    and not self.is_blocked(row, col, next_row, next_col)
-                ):
-                    parent[next_cell] = (row, col)
-                    heapq.heappush(
-                        frontier,
-                        (
-                            self._path_heuristic(next_cell, target_row),
-                            distance + 1,
-                            next_cell,
-                        ),
-                    )
+            for next_index, edge_mask in adjacency[cell_index]:
+                if parent[next_index] != -1:
+                    continue
+                if blocked_edge_mask & edge_mask:
+                    continue
+                parent[next_index] = cell_index
+                heapq.heappush(
+                    frontier,
+                    (
+                        heuristics[next_index],
+                        distance + 1,
+                        next_index,
+                    ),
+                )
 
         self._route_cache[key] = None
         return None
@@ -476,6 +897,65 @@ class BarricadeState:
     @staticmethod
     def _path_heuristic(cell: Tuple[int, int], target_row: int) -> int:
         return abs(cell[0] - target_row)
+
+    def _current_blocked_edge_mask(self) -> int:
+        walls_key = frozenset(self.walls)
+        if self._wall_cache_key == walls_key:
+            return self._blocked_edge_mask
+
+        blocked_edge_mask = 0
+        for orientation, row, col in walls_key:
+            blocked_edge_mask |= self._wall_edge_mask(orientation, row, col)
+        self._wall_cache_key = walls_key
+        self._blocked_edge_mask = blocked_edge_mask
+        return blocked_edge_mask
+
+    def _wall_edge_mask(
+        self,
+        orientation: WallOrientation,
+        row: int,
+        col: int,
+    ) -> int:
+        index = int(row) * self.wall_board_size + int(col)
+        if orientation == WallOrientation.HORIZONTAL:
+            return self._path_graph.horizontal_wall_masks[index]
+        return self._path_graph.vertical_wall_masks[index]
+
+    @staticmethod
+    def _wall_lookup(
+        walls: Iterable[WallPlacement],
+    ) -> Tuple[Set[Tuple[int, int]], Set[Tuple[int, int]]]:
+        horizontal_walls: Set[Tuple[int, int]] = set()
+        vertical_walls: Set[Tuple[int, int]] = set()
+        for orientation, row, col in walls:
+            if orientation == WallOrientation.HORIZONTAL:
+                horizontal_walls.add((row, col))
+            else:
+                vertical_walls.add((row, col))
+        return horizontal_walls, vertical_walls
+
+    @staticmethod
+    def _is_blocked_by_lookup(
+        row1: int,
+        col1: int,
+        row2: int,
+        col2: int,
+        horizontal_walls: Set[Tuple[int, int]],
+        vertical_walls: Set[Tuple[int, int]],
+    ) -> bool:
+        if row1 == row2:
+            col_min = col1 if col1 < col2 else col2
+            return (row1, col_min) in vertical_walls or (
+                row1 - 1,
+                col_min,
+            ) in vertical_walls
+        if col1 == col2:
+            row_min = row1 if row1 < row2 else row2
+            return (row_min, col1) in horizontal_walls or (
+                row_min,
+                col1 - 1,
+            ) in horizontal_walls
+        return False
 
     def apply_move(self, move: Move) -> "BarricadeState":
         new_state = self.copy()
@@ -489,20 +969,92 @@ class BarricadeState:
             row = current_row + row_delta
             col = current_col + col_delta
             new_state.pawns[new_state.current_player] = (row, col)
-            if row == BOARD_SIZE - 1 and new_state.current_player == Player.RED:
+            if row == new_state.board_size - 1 and new_state.current_player == Player.RED:
                 new_state.winner = Player.RED
             elif row == 0 and new_state.current_player == Player.BLUE:
                 new_state.winner = Player.BLUE
         elif move_type == "wall":
             _, orientation, row, col = move
             orientation = coerce_orientation(orientation)
-            new_state.walls.add((orientation, int(row), int(col)))
+            row = int(row)
+            col = int(col)
+            new_state.walls.add((orientation, row, col))
+            new_state._blocked_edge_mask |= new_state._wall_edge_mask(
+                orientation,
+                row,
+                col,
+            )
+            new_state._wall_cache_key = frozenset(new_state.walls)
             new_state.walls_left[new_state.current_player] -= 1
         else:
             raise ValueError(f"Unknown move type: {move_type!r}")
 
         new_state.current_player = new_state.current_player.opposite()
         return new_state
+
+    def apply_action(self, action: int, *, validate: bool = True) -> "BarricadeState":
+        action = int(action)
+        if validate and action not in set(self.legal_actions()):
+            raise ValueError(f"Illegal action {action} for current state.")
+        return self.apply_move(self.decode_action(action))
+
+    def encode_move(self, move: Move) -> int:
+        move_type = move[0]
+        if move_type == "move":
+            if len(move) != 2:
+                raise ValueError("Move actions must be ('move', direction).")
+            _, direction = move
+            if isinstance(direction, MoveDirection):
+                return direction.value
+            return coerce_move_direction(direction).value
+
+        if move_type == "wall":
+            _, orientation, row, col = move
+            if not isinstance(orientation, WallOrientation):
+                orientation = coerce_orientation(orientation)
+            row = int(row)
+            col = int(col)
+            if not (0 <= row < self.wall_board_size and 0 <= col < self.wall_board_size):
+                raise ValueError(f"Wall anchor out of bounds: {(row, col)}")
+            offset = (
+                HORIZONTAL_WALL_OFFSET
+                if orientation == WallOrientation.HORIZONTAL
+                else HORIZONTAL_WALL_OFFSET + self.wall_board_size * self.wall_board_size
+            )
+            return offset + row * self.wall_board_size + col
+
+        raise ValueError(f"Unknown move type: {move_type!r}")
+
+    def decode_action(self, action: int) -> Move:
+        return decode_action_for_board_size(action, self.board_size)
+
+
+def apply_selected_action(
+    state: BarricadeState,
+    action: int,
+    legal_actions: Sequence[int],
+) -> BarricadeState:
+    if int(action) not in set(int(value) for value in legal_actions):
+        raise RuntimeError(
+            f"Policy selected illegal action {action}; legal actions were {list(legal_actions)}"
+        )
+    return state.apply_action(int(action), validate=False)
+
+
+def state_lead_for_player(state: BarricadeState, player: Player | str | int) -> float:
+    player = coerce_player(player)
+    own_distance = state.shortest_path_length(player)
+    opponent_distance = state.shortest_path_length(player.opposite())
+    if own_distance is None or opponent_distance is None:
+        return 0.0
+    return float(opponent_distance - own_distance)
+
+
+def path_score_for_player(state: BarricadeState, player: Player | str | int) -> float:
+    distance = state.shortest_path_length(player)
+    if distance is None:
+        return float(state.board_size * state.board_size)
+    return float(distance)
 
 
 class SimpleDiscrete:
@@ -582,6 +1134,7 @@ class BarricadeEnv(BaseEnv):
             self.blue_start,
             self.red_walls,
             self.blue_walls,
+            self.starting_player,
         )
         self.steps = 0
         self.pawn_moves = {Player.RED: 0, Player.BLUE: 0}
@@ -628,8 +1181,13 @@ class BarricadeEnv(BaseEnv):
         blue_walls = coerce_wall_count(options.get("blue_walls", self.blue_walls), "blue_walls")
         self._validate_initial_config(red_start, blue_start, red_walls, blue_walls)
 
-        self.state = self._new_state(red_start, blue_start, red_walls, blue_walls)
-        self.state.current_player = starting_player
+        self.state = self._new_state(
+            red_start,
+            blue_start,
+            red_walls,
+            blue_walls,
+            starting_player,
+        )
         self.steps = 0
         self.pawn_moves = {Player.RED: 0, Player.BLUE: 0}
         self.terminated = False
@@ -686,10 +1244,10 @@ class BarricadeEnv(BaseEnv):
         return self._get_observation(), reward, self.terminated, self.truncated, info
 
     def legal_moves(self) -> List[Move]:
-        return self.state.get_valid_moves()
+        return self.state.legal_moves()
 
     def legal_actions(self) -> List[int]:
-        return [encode_move(move) for move in self.state.get_valid_moves()]
+        return self.state.legal_actions()
 
     def legal_action_mask(self) -> Any:
         mask = [0] * ACTION_SIZE
@@ -721,12 +1279,14 @@ class BarricadeEnv(BaseEnv):
         blue_start: Tuple[int, int],
         red_walls: int,
         blue_walls: int,
+        starting_player: Player,
     ) -> BarricadeState:
         return BarricadeState(
             red_start=red_start,
             blue_start=blue_start,
             red_walls=red_walls,
             blue_walls=blue_walls,
+            starting_player=starting_player,
         )
 
     @staticmethod

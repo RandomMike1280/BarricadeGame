@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(find \"C:/Users/angel/AppData/Local/Temp/claude\" -name \"bzq4unkww.output\" 2>/dev/null | head; echo \"===\"; ls -la \"C:/Users/angel/AppData/Local/Temp/claude/C--Users-angel-Desktop-BarricadeGame/aeea4ecc-397d-441c-8bd5-eb9c811f/tasks/\" 2>/dev/null | head)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('train_7x7_tabula_rasa.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python train_7x7_tabula_rasa.py --episodes 30 --base-simulations 8 --eval-simulations 8 --eval-games 20 --update-every 5 --log-every 10 --show-games 1 --max-moves-to-print 10 --no-save --hidden-channels 32 --residual-blocks 3 --device cpu)",
+      "Bash(python train_7x7_tabula_rasa.py --episodes 40 --base-simulations 16 --eval-simulations 8 --eval-games 24 --show-games 0 --update-every 10 --log-every 10 --samples-per-update 2048 --device cpu --no-save)",
+      "Bash(python _cell2.py --episodes 40 --base-simulations 16 --eval-simulations 8 --eval-games 30 --show-games 0 --update-every 10 --log-every 10 --samples-per-update 2048 --device cpu --no-save)",
+      "Bash(python _cell2.py --episodes 40 --base-simulations 16 --eval-simulations 8 --eval-games 30 --show-games 1 --max-moves-to-print 30 --update-every 10 --log-every 10 --samples-per-update 2048 --device cpu --no-save)",
+      "Bash(python _cell2.py --episodes 40 --base-simulations 16 --eval-simulations 8 --eval-games 12 --show-games 0 --update-every 10 --log-every 10 --samples-per-update 2048 --device cpu --no-save)",
+      "Bash(python -c \"import torch; print\\('cuda', torch.cuda.is_available\\(\\), torch.cuda.get_device_name\\(0\\) if torch.cuda.is_available\\(\\) else ''\\)\")",
+      "Bash(nohup python _cell2.py --episodes 1000 --walls 2 --base-simulations 32 --eval-simulations 16 --eval-games 80 --show-games 3 --update-every 10 --log-every 50 --device cpu --checkpoint-out checkpoints/5x5_mcts_aux_fixed.pt)",
+      "Bash(echo \"launched PID $!\")",
+      "Bash(tasklist)",
+      "Bash(python -u _cell2.py --episodes 1000 --walls 2 --base-simulations 32 --eval-simulations 16 --eval-games 80 --show-games 3 --update-every 10 --log-every 50 --device cpu --checkpoint-out checkpoints/5x5_mcts_aux_fixed.pt)"
+    ]
+  }
+}

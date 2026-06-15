@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 import random
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor
@@ -32,6 +32,7 @@ class MCTSConfig:
     root_dirichlet_alpha: float = 0.3
     root_exploration_fraction: float = 0.25
     action_temperature: float = 1.0
+    policy_target_temperature: Optional[float] = None
     history_length: int = 0
     device: Optional[str] = None
     add_root_noise: bool = True
@@ -119,12 +120,31 @@ class MCTSResult:
 
 
 class MCTS:
-    def __init__(self, model, config: Optional[MCTSConfig] = None) -> None:
+    def __init__(
+        self,
+        model,
+        config: Optional[MCTSConfig] = None,
+        *,
+        device: Optional[str | torch.device] = None,
+        rng: Optional[random.Random] = None,
+        state_encoder: Optional[
+            Callable[[BarricadeState, Sequence[BarricadeState], int], Tensor]
+        ] = None,
+        action_size: Optional[int] = None,
+        encode_move_fn: Optional[Callable[[Move], int]] = None,
+        policy_action_transform: Optional[Callable[[int, BarricadeState], int]] = None,
+        lead_transform: Optional[Callable[[float, BarricadeState], float]] = None,
+    ) -> None:
         self.model = model
         self.config = config or MCTSConfig()
-        self.device = self._resolve_device(self.config.device)
+        self.device = self._resolve_device(device or self.config.device)
         self.model.to(self.device)
-        self.rng = random.Random()
+        self.rng = rng or random.Random()
+        self.state_encoder = state_encoder or self._default_state_encoder
+        self.action_size = int(action_size or ACTION_SIZE)
+        self.encode_move_fn = encode_move_fn
+        self.policy_action_transform = policy_action_transform
+        self.lead_transform = lead_transform
 
     def search(
         self,
@@ -134,7 +154,7 @@ class MCTS:
     ) -> MCTSResult:
         root = self._prepare_root(state, history, root)
 
-        if self._terminal_evaluation(root) is None and not root.is_expanded:
+        if self._winner_evaluation(root) is None and not root.is_expanded:
             self._evaluate_and_expand([root])
 
         if (
@@ -197,8 +217,14 @@ class MCTS:
                 completed += len(pending)
 
         self._clear_virtual_visits(root)
-        policy_target = self._policy_target(root, self.config.action_temperature)
-        action = self._sample_policy(policy_target)
+        policy_target_temperature = (
+            self.config.action_temperature
+            if self.config.policy_target_temperature is None
+            else self.config.policy_target_temperature
+        )
+        policy_target = self._policy_target(root, policy_target_temperature)
+        action_policy = self._policy_target(root, self.config.action_temperature)
+        action = self._sample_policy(action_policy)
         stats = self._action_stats(root, policy_target)
         return MCTSResult(
             action=action,
@@ -219,7 +245,11 @@ class MCTS:
         if temperature is None:
             return result.action
 
-        policy = self._policy_from_stats(result.stats, temperature)
+        policy = self._policy_from_stats(
+            result.stats,
+            temperature,
+            len(result.policy_target),
+        )
         return self._sample_policy(policy)
 
     def advance_root(self, root: SearchNode, action: int) -> Optional[SearchNode]:
@@ -247,9 +277,9 @@ class MCTS:
         path: List[SearchEdge] = []
 
         while True:
-            terminal_evaluation = self._terminal_evaluation(node)
-            if terminal_evaluation is not None:
-                return "terminal", node, path, terminal_evaluation
+            winner_evaluation = self._winner_evaluation(node)
+            if winner_evaluation is not None:
+                return "terminal", node, path, winner_evaluation
 
             if not node.is_expanded:
                 if node.in_flight > 0:
@@ -274,29 +304,51 @@ class MCTS:
             node = edge.child
 
     def _select_edge(self, node: SearchNode) -> SearchEdge:
-        parent_effective_visits = max(1, node.effective_visits)
+        real_visits = 0
+        parent_value_sum = 0.0
+        parent_lead_sum = 0.0
+        parent_effective_visits = 0
+        explored_prior = 0.0
+        for edge in node.edges.values():
+            visits = edge.visits
+            effective_visits = visits + edge.virtual_visits
+            real_visits += visits
+            parent_effective_visits += effective_visits
+            parent_value_sum += edge.value_sum
+            parent_lead_sum += edge.lead_sum
+            if effective_visits > 0:
+                explored_prior += edge.prior
+
+        parent_effective_visits = max(1, parent_effective_visits)
         cpuct = self._cpuct(parent_effective_visits)
-        parent_q = self._parent_q(node)
-        parent_lead_q = self._parent_lead_q(node)
-        explored_prior = sum(
-            edge.prior for edge in node.edges.values() if edge.effective_visits > 0
-        )
+        parent_q = parent_value_sum / real_visits if real_visits else 0.0
+        parent_lead_q = parent_lead_sum / real_visits if real_visits else 0.0
         fpu_q = parent_q - self.config.fpu_reduction * math.sqrt(
             max(0.0, explored_prior)
         )
+        sqrt_parent_visits = math.sqrt(parent_effective_visits)
+        lead_weight = self.config.lead_weight
+        lead_scale = max(float(self.config.lead_scale), 1e-6)
 
         best_score = -math.inf
         best_edge = None
         for edge in node.edges.values():
-            q_value = edge.q if edge.visits > 0 else fpu_q
-            lead_value = edge.lead_q if edge.visits > 0 else parent_lead_q
+            visits = edge.visits
+            effective_visits = visits + edge.virtual_visits
+            q_value = edge.value_sum / visits if visits > 0 else fpu_q
+            lead_value = edge.lead_sum / visits if visits > 0 else parent_lead_q
             u_value = (
                 cpuct
                 * edge.prior
-                * math.sqrt(parent_effective_visits)
-                / (1 + edge.effective_visits)
+                * sqrt_parent_visits
+                / (1 + effective_visits)
             )
-            score = q_value + u_value + self._lead_bonus(lead_value)
+            lead_bonus = (
+                lead_weight * math.tanh(float(lead_value) / lead_scale)
+                if lead_weight > 0
+                else 0.0
+            )
+            score = q_value + u_value + lead_bonus
             if score > best_score:
                 best_score = score
                 best_edge = edge
@@ -309,21 +361,42 @@ class MCTS:
         if not nodes:
             return []
 
+        evaluations: List[Optional[SearchEvaluation]] = [None] * len(nodes)
+        expandable: List[Tuple[int, SearchNode, List[Tuple[int, Move]]]] = []
+        for index, node in enumerate(nodes):
+            legal_action_moves = self._legal_action_moves(node.state)
+            if legal_action_moves:
+                expandable.append((index, node, legal_action_moves))
+                continue
+
+            evaluation = SearchEvaluation(
+                value=-1.0,
+                lead=self._state_lead(node.state),
+            )
+            node.edges = {}
+            node.value_estimate = evaluation.value
+            node.lead_estimate = evaluation.lead
+            node.is_expanded = True
+            evaluations[index] = evaluation
+
+        if not expandable:
+            return [evaluation for evaluation in evaluations if evaluation is not None]
+
         batch = torch.stack(
             [
-                encode_state_stack(
+                self.state_encoder(
                     node.state,
                     node.history,
-                    history_length=self.config.history_length,
+                    self.config.history_length,
                 )
-                for node in nodes
+                for _, node, _ in expandable
             ],
             dim=0,
         ).to(self.device)
 
         was_training = self.model.training
         self.model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             logits, values, leads = self._model_inference(batch)
         if was_training:
             self.model.train()
@@ -332,26 +405,31 @@ class MCTS:
         values = values.detach().cpu().view(-1)
         leads = leads.detach().cpu().view(-1)
 
-        evaluations = []
-        for node, node_logits, node_value, node_lead in zip(nodes, logits, values, leads):
+        for (
+            index,
+            node,
+            legal_action_moves,
+        ), node_logits, node_value, node_lead in zip(expandable, logits, values, leads):
             value = float(node_value.item())
-            lead = self._lead_for_player(float(node_lead.item()), node.state.current_player)
+            lead = self._model_lead(float(node_lead.item()), node.state)
             evaluation = SearchEvaluation(value=value, lead=lead)
-            self._expand_node(node, node_logits, evaluation)
-            evaluations.append(evaluation)
-        return evaluations
+            self._expand_node(node, node_logits, evaluation, legal_action_moves)
+            evaluations[index] = evaluation
+        return [evaluation for evaluation in evaluations if evaluation is not None]
 
     def _expand_node(
         self,
         node: SearchNode,
         logits: Tensor,
         evaluation: SearchEvaluation,
+        legal_action_moves: Optional[Sequence[Tuple[int, Move]]] = None,
     ) -> None:
-        legal_moves = node.state.get_valid_moves()
-        legal_actions = [encode_move(move) for move in legal_moves]
-        priors = self._masked_priors(logits, legal_actions)
+        if legal_action_moves is None:
+            legal_action_moves = self._legal_action_moves(node.state)
+        legal_actions = [action for action, _ in legal_action_moves]
+        priors = self._masked_priors(logits, legal_actions, node.state)
         edges = {}
-        for move, action in zip(legal_moves, legal_actions):
+        for action, move in legal_action_moves:
             edges[action] = SearchEdge(
                 action=action,
                 move=move,
@@ -362,12 +440,21 @@ class MCTS:
         node.lead_estimate = evaluation.lead
         node.is_expanded = True
 
-    def _masked_priors(self, logits: Tensor, legal_actions: Sequence[int]) -> Dict[int, float]:
+    def _masked_priors(
+        self,
+        logits: Tensor,
+        legal_actions: Sequence[int],
+        state: BarricadeState,
+    ) -> Dict[int, float]:
         legal_actions = list(legal_actions)
         if not legal_actions:
             return {}
 
-        legal_logits = logits[legal_actions].float()
+        network_actions = [
+            self._network_action(action, state)
+            for action in legal_actions
+        ]
+        legal_logits = logits[network_actions].float()
         legal_logits = torch.nan_to_num(legal_logits, nan=0.0, posinf=80.0, neginf=-80.0)
 
         temperature = self.config.policy_temperature
@@ -382,7 +469,7 @@ class MCTS:
         else:
             probs = probs / probs.sum()
 
-        return {action: float(prob) for action, prob in zip(legal_actions, probs)}
+        return {action: prob for action, prob in zip(legal_actions, probs.tolist())}
 
     def _add_root_dirichlet_noise(self, root: SearchNode) -> None:
         if not root.edges:
@@ -437,11 +524,21 @@ class MCTS:
             self._clear_virtual_visits(edge.child)
 
     def _terminal_evaluation(self, node: SearchNode) -> Optional[SearchEvaluation]:
+        winner_evaluation = self._winner_evaluation(node)
+        if winner_evaluation is not None:
+            return winner_evaluation
+        if node.is_expanded:
+            if not node.edges:
+                return SearchEvaluation(value=-1.0, lead=self._state_lead(node.state))
+            return None
+        if not node.state.legal_moves():
+            return SearchEvaluation(value=-1.0, lead=self._state_lead(node.state))
+        return None
+
+    def _winner_evaluation(self, node: SearchNode) -> Optional[SearchEvaluation]:
         if node.state.winner is not None:
             value = 1.0 if node.state.winner == node.state.current_player else -1.0
             return SearchEvaluation(value=value, lead=self._state_lead(node.state))
-        if not node.state.get_valid_moves():
-            return SearchEvaluation(value=-1.0, lead=self._state_lead(node.state))
         return None
 
     def _child_history(self, node: SearchNode) -> Tuple[BarricadeState, ...]:
@@ -488,7 +585,7 @@ class MCTS:
             for action, edge in root.edges.items()
             if edge.visits > 0
         ]
-        policy = [0.0] * ACTION_SIZE
+        policy = [0.0] * self.action_size
         if not stats:
             legal_actions = list(root.edges.keys())
             if not legal_actions:
@@ -530,8 +627,12 @@ class MCTS:
         return self.rng.choices(range(len(policy)), weights=policy, k=1)[0]
 
     @staticmethod
-    def _policy_from_stats(stats: Sequence[ActionStats], temperature: float) -> List[float]:
-        policy = [0.0] * ACTION_SIZE
+    def _policy_from_stats(
+        stats: Sequence[ActionStats],
+        temperature: float,
+        action_size: int,
+    ) -> List[float]:
+        policy = [0.0] * int(action_size)
         if not stats:
             return policy
 
@@ -590,6 +691,47 @@ class MCTS:
             return terminal_evaluation.lead
         return float(root.lead_estimate or 0.0)
 
+    @staticmethod
+    def _default_state_encoder(
+        state: BarricadeState,
+        history: Sequence[BarricadeState],
+        history_length: int,
+    ) -> Tensor:
+        return encode_state_stack(
+            state,
+            history,
+            history_length=history_length,
+        )
+
+    def _encode_move(self, move: Move, state: BarricadeState) -> int:
+        if self.encode_move_fn is not None:
+            return int(self.encode_move_fn(move))
+        if hasattr(state, "encode_move"):
+            return int(state.encode_move(move))
+        return int(encode_move(move))
+
+    def _legal_action_moves(self, state: BarricadeState) -> List[Tuple[int, Move]]:
+        if hasattr(state, "legal_action_moves"):
+            return [
+                (int(action), move)
+                for action, move in state.legal_action_moves()
+            ]
+        legal_moves = state.legal_moves()
+        return [
+            (self._encode_move(move, state), move)
+            for move in legal_moves
+        ]
+
+    def _network_action(self, action: int, state: BarricadeState) -> int:
+        if self.policy_action_transform is None:
+            return int(action)
+        return int(self.policy_action_transform(int(action), state))
+
+    def _model_lead(self, lead: float, state: BarricadeState) -> float:
+        if self.lead_transform is not None:
+            return float(self.lead_transform(float(lead), state))
+        return self._lead_for_player(float(lead), state.current_player)
+
     def _model_inference(self, batch: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         if hasattr(self.model, "inference"):
             return self.model.inference(batch)
@@ -604,8 +746,8 @@ class MCTS:
         return logits, values, leads
 
     def _state_lead(self, state: BarricadeState) -> float:
-        red_distance = state.greedy_path_length(Player.RED)
-        blue_distance = state.greedy_path_length(Player.BLUE)
+        red_distance = state.shortest_path_length(Player.RED)
+        blue_distance = state.shortest_path_length(Player.BLUE)
         if red_distance is None or blue_distance is None:
             return 0.0
         raw_lead = float(red_distance - blue_distance)
@@ -615,7 +757,10 @@ class MCTS:
     def _lead_for_player(raw_lead: float, player: Player) -> float:
         return float(raw_lead) if player == Player.BLUE else -float(raw_lead)
 
-    def _resolve_device(self, configured_device: Optional[str]) -> torch.device:
+    def _resolve_device(
+        self,
+        configured_device: Optional[str | torch.device],
+    ) -> torch.device:
         if configured_device is not None:
             return torch.device(configured_device)
         try:
