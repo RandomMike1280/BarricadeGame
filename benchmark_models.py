@@ -47,6 +47,7 @@ class GameResult:
     index: int
     a_player: Player
     starting_player: Player
+    start_col: int
     winner: Optional[Player]
     truncated: bool
     steps: int
@@ -249,7 +250,12 @@ def play_game(
         a_player: model_a,
         a_player.opposite(): model_b,
     }
-    state = standard_state(walls=walls, starting_player=starting_player)
+    start_col = rng.randrange(BOARD_SIZE)
+    state = standard_state(
+        walls=walls,
+        starting_player=starting_player,
+        start_col=start_col,
+    )
     steps = 0
     truncated = False
 
@@ -285,17 +291,17 @@ def play_game(
         index=game_index,
         a_player=a_player,
         starting_player=starting_player,
+        start_col=start_col,
         winner=state.winner,
         truncated=truncated,
         steps=steps,
     )
 
 
-def standard_state(*, walls: int, starting_player: Player) -> GameState:
-    center = BOARD_SIZE // 2
+def standard_state(*, walls: int, starting_player: Player, start_col: int) -> GameState:
     return GameState(
-        red_start=(0, center),
-        blue_start=(BOARD_SIZE - 1, center),
+        red_start=(0, int(start_col)),
+        blue_start=(BOARD_SIZE - 1, int(start_col)),
         red_walls=walls,
         blue_walls=walls,
         starting_player=starting_player,
@@ -348,7 +354,7 @@ def format_game_result(result: GameResult, name_a: str, name_b: str) -> str:
 
     return (
         f"game={result.index + 1} red={red_name} blue={blue_name} "
-        f"start={result.starting_player.name} winner={winner} "
+        f"start={result.starting_player.name} col={result.start_col} winner={winner} "
         f"steps={result.steps} truncated={result.truncated}"
     )
 

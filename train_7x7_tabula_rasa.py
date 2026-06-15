@@ -1006,7 +1006,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a 7x7 Barricade AlphaZero-style policy from self-play MCTS."
     )
-    parser.add_argument("--episodes", type=int, default=2000)
+    parser.add_argument("--episodes", type=int, default=1000)
     parser.add_argument("--walls", type=int, default=DEFAULT_WALLS_PER_PLAYER)
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--base-simulations", type=int, default=512)
@@ -1084,7 +1084,7 @@ def main() -> None:
         residual_blocks=args.residual_blocks,
     ).to(device)
     # load model
-    state_dict = torch.load("checkpoint_copies/7x7_mcts_2000it.pt", map_location=device)
+    state_dict = torch.load("checkpoint_copies/best_1506.pt", map_location=device)
     model.load_state_dict(state_dict["model_state"])
     optimizer = torch.optim.AdamW(
         model.parameters(),

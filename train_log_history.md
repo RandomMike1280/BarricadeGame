@@ -16,3 +16,12 @@ post_training_vs_random: games=80 wins=77 losses=2 draws=1 win_rate=0.963 red=1.
 
 ### 15-06-2026
 post_training_vs_random: games=80 wins=77 losses=2 draws=1 win_rate=0.963 red=1.000 blue=0.925 avg_steps=28.5
+ * Benchmark against previous checkpoint
+```
+device=cpu games=256 simulations=128 batch_size=16 walls=5 max_steps=96
+model_a=best_1506 path=checkpoint_copies/best_1506.pt hidden=64 residual_blocks=4
+model_b=7x7_mcts_2000it path=checkpoint_copies/7x7_mcts_2000it.pt hidden=64 residual_blocks=4
+score best_1506=256 7x7_mcts_2000it=0 draws=0 best_1506_win_rate=1.000
+best_1506_as_red=128/128 best_1506_as_blue=128/128 first_player_wins=128/256
+avg_steps=27.5 elapsed=1674.474s games_per_second=0.15
+```
