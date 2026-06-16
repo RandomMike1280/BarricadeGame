@@ -1098,7 +1098,7 @@ def main() -> None:
         residual_blocks=args.residual_blocks,
     ).to(device)
     # load model
-    state_dict = torch.load("checkpoint_copies/best_1506.pt", map_location=device)
+    state_dict = torch.load("checkpoint_copies/best_1506.pt", map_location=device, weights_only=False)
     model.load_state_dict(state_dict["model_state"])
     optimizer = torch.optim.AdamW(
         model.parameters(),

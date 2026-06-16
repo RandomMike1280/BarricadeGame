@@ -43,3 +43,18 @@ score best_1506=130 best_1506=126 draws=0 best_1506_win_rate=0.508
 best_1506_as_red=65/128 best_1506_as_blue=65/128 first_player_wins=158/256
 avg_steps=38.3 elapsed=2801.567s games_per_second=0.09
 ```
+
+### 16-06-2026
+ - 1000 games
+ - 5000 cumulative games
+ - continued from 15-06 checkpoint
+
+ * Benchmark against previous checkpoint
+```
+device=cpu games=256 simulations=128 batch_size=16 walls=5 max_steps=96
+model_a=model_1606 path=checkpoint_copies/model_1606.pt hidden=64 residual_blocks=4
+model_b=best_1506 path=checkpoint_copies/best_1506.pt hidden=64 residual_blocks=4
+score model_1606=182 best_1506=74 draws=0 model_1606_win_rate=0.711
+model_1606_as_red=90/128 model_1606_as_blue=92/128 first_player_wins=180/256
+avg_steps=41.0 elapsed=2432.830s games_per_second=0.11
+```

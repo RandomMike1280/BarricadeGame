@@ -48,48 +48,55 @@ def _safe_ratio(numerator: int, denominator: int) -> float:
 
 def encode_state_planes(state, *, dtype=torch.float32) -> Tensor:
     """
-    Encode one BarricadeState into base 9x9 planes.
+    Encode one BarricadeState into base planes in a canonical frame.
+
+    The board is presented as if the side-to-move always advances toward the
+    last row. For BLUE this flips the board about the horizontal axis (rows
+    r -> BOARD_SIZE-1-r on the cell grid, r -> WALL_BOARD_SIZE-1-r on the wall
+    grid). This makes mirrored RED/BLUE positions encode identically.
 
     Plane layout:
-        0: side to move, all 1 for red and all 0 for blue
-        1: red pawn one-hot
-        2: blue pawn one-hot
+        0: all 1s (constant, no absolute-color signal)
+        1: own pawn one-hot
+        2: opponent pawn one-hot
         3: horizontal wall anchors
         4: vertical wall anchors
-        5: red remaining walls, broadcast as a scalar ratio
-        6: blue remaining walls, broadcast as a scalar ratio
-        7: red goal row
-        8: blue goal row
+        5: own remaining walls ratio
+        6: opponent remaining walls ratio
+        7: own goal row (always BOARD_SIZE - 1)
+        8: opponent goal row (always 0)
     """
 
     planes = torch.zeros((BASE_PLANES_PER_POSITION, BOARD_SIZE, BOARD_SIZE), dtype=dtype)
+    current = state.current_player
+    opponent = current.opposite()
+    flip = current == Player.BLUE
 
-    if state.current_player == Player.RED:
-        planes[0].fill_(1.0)
+    def cell_row(row: int) -> int:
+        return BOARD_SIZE - 1 - row if flip else row
 
-    red_row, red_col = state.pawns[Player.RED]
-    blue_row, blue_col = state.pawns[Player.BLUE]
-    planes[1, red_row, red_col] = 1.0
-    planes[2, blue_row, blue_col] = 1.0
+    def wall_row(row: int) -> int:
+        return (BOARD_SIZE - 1) - 1 - row if flip else row
+
+    planes[0].fill_(1.0)
+
+    own_row, own_col = state.pawns[current]
+    opp_row, opp_col = state.pawns[opponent]
+    planes[1, cell_row(own_row), own_col] = 1.0
+    planes[2, cell_row(opp_row), opp_col] = 1.0
 
     for orientation, row, col in state.walls:
-        if orientation == WallOrientation.HORIZONTAL:
-            planes[3, row, col] = 1.0
-            if col + 1 < BOARD_SIZE:
-                planes[3, row, col + 1] = 1.0
-        else:
-            planes[4, row, col] = 1.0
-            if row + 1 < BOARD_SIZE:
-                planes[4, row + 1, col] = 1.0
+        plane = 3 if orientation == WallOrientation.HORIZONTAL else 4
+        planes[plane, wall_row(row), col] = 1.0
 
-    planes[5].fill_(
-        _safe_ratio(state.walls_left[Player.RED], state.initial_walls[Player.RED])
-    )
-    planes[6].fill_(
-        _safe_ratio(state.walls_left[Player.BLUE], state.initial_walls[Player.BLUE])
-    )
+    own_initial = max(1, state.initial_walls[current])
+    opp_initial = max(1, state.initial_walls[opponent])
+    planes[5].fill_(state.walls_left[current] / own_initial)
+    planes[6].fill_(state.walls_left[opponent] / opp_initial)
+
     planes[7, BOARD_SIZE - 1, :] = 1.0
     planes[8, 0, :] = 1.0
+
     return planes
 
 

@@ -22,6 +22,8 @@ from barricade_env import BarricadeEnv, BarricadeState
 from mcts import MCTS, MCTSConfig
 from network import build_network
 
+print(torch.get_num_threads())
+print(torch.get_num_interop_threads())
 
 NETWORK_DEFAULTS = {
     "history_length": 0,
@@ -65,12 +67,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--positions", type=int, default=256)
+    parser.add_argument("--positions", type=int, default=64)
     parser.add_argument("--searches-per-position", type=int, default=1)
     parser.add_argument("--warmup-plies", type=int, default=12)
     parser.add_argument("--warmup-searches", type=int, default=1)
-    parser.add_argument("--simulations", type=int, default=512)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--simulations", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--action-temperature", type=float, default=0.0)
     parser.add_argument("--policy-target-temperature", type=float, default=None)
     parser.add_argument("--add-root-noise", action="store_true")
@@ -94,7 +96,7 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[nn.Modul
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else None
 
     if checkpoint_path is not None:
-        payload = torch.load(checkpoint_path, map_location=device)
+        payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
         raw_config = payload.get("network_config", {}) if isinstance(payload, dict) else {}
         if isinstance(raw_config, dict):
             checkpoint_config = raw_config

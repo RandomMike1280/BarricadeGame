@@ -20,7 +20,8 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from barricade_env import ACTION_SIZE, BOARD_SIZE, BarricadeEnv, Player
+from barricade_env import ACTION_SIZE, BOARD_SIZE, DEFAULT_WALLS_PER_PLAYER, BarricadeEnv, BarricadeState, Player
+from canonical import canonical_action, canonicalize_action_vector
 from mcts import MCTS, MCTSConfig
 from network import EncoderConfig, build_network, encode_state_stack
 
@@ -50,6 +51,7 @@ class SelfPlayConfig:
     temperature_drop_ply: int = 20
     seed: int = 1
     output_dir: str = str(SELFPLAY_DIR)
+    base_walls: int = DEFAULT_WALLS_PER_PLAYER
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,7 @@ class EvalConfig:
     batch_size: int = 16
     max_steps: int = 500
     seed: int = 1
+    base_walls: int = DEFAULT_WALLS_PER_PLAYER
 
 
 @dataclass(frozen=True)
@@ -92,7 +95,7 @@ class ReplayDataset(Dataset):
         self.replay_dir = Path(replay_dir)
         self.samples: List[Dict[str, Any]] = []
         for path in sorted(self.replay_dir.glob("*.pt")):
-            payload = torch.load(path, map_location="cpu")
+            payload = torch.load(path, map_location="cpu", weights_only=False)
             self.samples.extend(payload.get("samples", []))
         if limit is not None and limit > 0 and len(self.samples) > limit:
             self.samples = self.samples[-limit:]
@@ -105,9 +108,13 @@ class ReplayDataset(Dataset):
     def __getitem__(
         self,
         index: int,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         sample = self.samples[index]
         state_planes = sample["state_planes"].float()
+        
+        # Mask defaults to all ones for older replays
+        mask = torch.as_tensor(sample.get("mask", torch.ones(ACTION_SIZE)), dtype=torch.bool)
+        
         policy_target = sample["policy_target"].float()
         value_target = torch.as_tensor(sample["value_target"], dtype=torch.float32)
         lead_target = torch.as_tensor(
@@ -134,6 +141,7 @@ class ReplayDataset(Dataset):
         score_mask = torch.as_tensor(sample.get("score_mask", 0.0), dtype=torch.float32)
         return (
             state_planes,
+            mask,
             policy_target,
             value_target,
             lead_target,
@@ -147,64 +155,78 @@ class ReplayDataset(Dataset):
 
 def sample_playout_cap(base_simulations: int, rng: random.Random) -> int:
     roll = rng.random()
-    if roll < 0.70:
-        cap = base_simulations
-    elif roll < 0.90:
-        cap = base_simulations // 2
+    if roll < 0.60:
+        cap = base_simulations          # 60% — full
+    elif roll < 0.80:
+        cap = max(1, base_simulations // 2)   # 20% — half
+    elif roll < 0.93:
+        cap = max(1, base_simulations // 4)   # 13% — quarter
     else:
-        cap = base_simulations * 2
+        cap = base_simulations * 2      # 7%  — double
     return max(1, int(cap))
 
 
-def sample_handicap(rng: random.Random) -> Dict[str, Any]:
-    roll = rng.random()
-    config: Dict[str, Any]
-    mode: str
+def sample_handicap(base_walls: int, rng: random.Random) -> Dict[str, Any]:
+    center = BOARD_SIZE // 2
+    starting_player = (
+        Player.RED if rng.random() < 0.5 else Player.BLUE
+    )
 
-    if roll < 0.70:
-        mode = "standard"
-        config = {
-            "red_start": (0, 4),
-            "blue_start": (8, 4),
-            "red_walls": 10,
-            "blue_walls": 10,
-        }
-    elif roll < 0.90:
-        mode = "same_row_shifted"
-        config = {
-            "red_start": (0, rng.randint(2, 6)),
-            "blue_start": (8, rng.randint(2, 6)),
-            "red_walls": 10,
-            "blue_walls": 10,
-        }
-    elif roll < 0.97:
-        mode = "row_ahead"
-        config = {
-            "red_start": (rng.randint(0, 2), rng.randint(2, 6)),
-            "blue_start": (rng.randint(6, 8), rng.randint(2, 6)),
-            "red_walls": 10,
-            "blue_walls": 10,
-        }
-    else:
-        mode = "wall_handicap"
-        config = {
-            "red_start": (0, 4),
-            "blue_start": (8, 4),
-            "red_walls": rng.randint(7, 13),
-            "blue_walls": rng.randint(7, 13),
-        }
+    # Default (standard)
+    red_row = 0
+    blue_row = BOARD_SIZE - 1
+    red_col = center
+    blue_col = center
+    red_walls = base_walls
+    blue_walls = base_walls
 
-    if mode != "standard" and mode != "wall_handicap" and rng.random() < 0.5:
-        config["red_walls"] = rng.randint(7, 13)
-        config["blue_walls"] = rng.randint(7, 13)
+    active_modes = []
 
-    config["handicap_mode"] = mode
-    return config
+    # Majority of games use shifted columns
+    if rng.random() < 0.70:
+        red_col = rng.randint(1, BOARD_SIZE - 2)
+        blue_col = rng.randint(1, BOARD_SIZE - 2)
+        active_modes.append("column_shift")
+
+    # Sometimes start one row inward
+    if rng.random() < 0.20:
+        red_row = rng.randint(0, 1)
+        blue_row = rng.randint(
+            BOARD_SIZE - 2,
+            BOARD_SIZE - 1
+        )
+        active_modes.append("row_ahead")
+
+    # Occasionally modify wall counts
+    if rng.random() < 0.10:
+        red_walls = max(
+            0,
+            base_walls + rng.randint(-2, 2)
+        )
+        blue_walls = max(
+            0,
+            base_walls + rng.randint(-2, 2)
+        )
+        active_modes.append("wall_handicap")
+
+    # Nothing happened
+    if not active_modes:
+        active_modes.append("standard")
+
+    return {
+        "mode": "+".join(active_modes),
+        "modes": active_modes,
+        "red_start": (red_row, red_col),
+        "blue_start": (blue_row, blue_col),
+        "red_walls": red_walls,
+        "blue_walls": blue_walls,
+        "starting_player": starting_player,
+    }
 
 
-def sample_valid_handicap(rng: random.Random, max_attempts: int = 100) -> Dict[str, Any]:
+def sample_valid_handicap(base_walls: int, rng: random.Random, max_attempts: int = 100) -> Dict[str, Any]:
     for _ in range(max_attempts):
-        config = sample_handicap(rng)
+        config = sample_handicap(base_walls, rng)
         env = BarricadeEnv(max_steps=1)
         try:
             env.reset(options=_env_options(config))
@@ -212,6 +234,17 @@ def sample_valid_handicap(rng: random.Random, max_attempts: int = 100) -> Dict[s
         except ValueError:
             continue
     raise RuntimeError("Failed to sample a valid handicap configuration.")
+
+
+def masked_logits(logits: Tensor, mask: Tensor) -> Tensor:
+    logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
+    logits = logits.clamp(-30.0, 30.0)
+    mask = mask.to(device=logits.device, dtype=torch.bool)
+    return logits.masked_fill(~mask, -1.0e9)
+
+
+def policy_action_for_mcts(action: int, state: BarricadeState) -> int:
+    return canonical_action(action, state.current_player)
 
 
 def run_self_play(
@@ -232,7 +265,7 @@ def run_self_play(
 
     for game_index in range(config.games):
         game_id = f"iter_{config.iteration:06d}_game_{game_index:06d}"
-        handicap = sample_valid_handicap(rng)
+        handicap = sample_valid_handicap(config.base_walls, rng)
         env = BarricadeEnv(max_steps=config.max_steps)
         _, info = env.reset(options=_env_options(handicap))
         history = []
@@ -262,7 +295,11 @@ def run_self_play(
                 add_root_noise=True,
                 action_temperature=1.0 if ply < config.temperature_drop_ply else 0.0,
             )
-            mcts = MCTS(model, mcts_config)
+            mcts = MCTS(
+                model, 
+                mcts_config,
+                policy_action_transform=policy_action_for_mcts,
+            )
             result = mcts.search(state_before, history=history_before, root=root)
             action = mcts.select_action(
                 result,
@@ -272,8 +309,13 @@ def run_self_play(
             pending.append(
                 {
                     "state_planes": state_planes,
-                    "policy_target": torch.as_tensor(
-                        result.policy_target, dtype=torch.float32
+                    "mask": canonicalize_action_vector(
+                        torch.as_tensor(state_before.action_mask(), dtype=torch.bool),
+                        player_to_move,
+                    ),
+                    "policy_target": canonicalize_action_vector(
+                        torch.as_tensor(result.policy_target, dtype=torch.float32),
+                        player_to_move,
                     ),
                     "value_target": 0.0,
                     "legal_actions": list(info["legal_actions"]),
@@ -392,6 +434,7 @@ def train_from_replay(
 
         for (
             state_planes,
+            mask,
             policy_target,
             value_target,
             lead_target,
@@ -402,6 +445,7 @@ def train_from_replay(
             score_mask,
         ) in loader:
             state_planes = state_planes.to(resolved_device)
+            mask = mask.to(resolved_device)
             policy_target = policy_target.to(resolved_device)
             value_target = value_target.to(resolved_device)
             lead_target = lead_target.to(resolved_device)
@@ -412,6 +456,7 @@ def train_from_replay(
             score_mask = score_mask.to(resolved_device)
 
             logits, value, lead, future_logits, score = model(state_planes)
+            logits = masked_logits(logits, mask)
             policy_loss = soft_target_cross_entropy(logits, policy_target)
             value_loss = F.mse_loss(value.squeeze(-1), value_target)
             lead_loss = masked_mse_loss(lead.squeeze(-1), lead_target, lead_mask)
@@ -507,7 +552,7 @@ def evaluate_models(
     for game_index in range(config.games):
         candidate_player = Player.RED if game_index % 2 == 0 else Player.BLUE
         env = BarricadeEnv(max_steps=config.max_steps)
-        handicap = sample_valid_handicap(rng)
+        handicap = sample_valid_handicap(config.base_walls, rng)
         _, info = env.reset(options=_env_options(handicap))
         history = []
         roots = {Player.RED: None, Player.BLUE: None}
@@ -648,7 +693,7 @@ def build_model(config: NetworkConfig) -> nn.Module:
 
 
 def load_model_from_checkpoint(path: str | Path, device: Optional[str] = None) -> Tuple[nn.Module, NetworkConfig]:
-    payload = torch.load(path, map_location=device or "cpu")
+    payload = torch.load(path, map_location=device or "cpu", weights_only=False)
     network_config = NetworkConfig(**payload.get("network_config", {}))
     model = build_model(network_config)
     _load_model_state(model, payload["model_state"])
@@ -664,7 +709,7 @@ def _load_checkpoint_into(
     optimizer: Optional[torch.optim.Optimizer] = None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, Any]:
-    payload = torch.load(path, map_location=device or "cpu")
+    payload = torch.load(path, map_location=device or "cpu", weights_only=False)
     _load_model_state(model, payload["model_state"])
     if optimizer is not None and "optimizer_state" in payload:
         try:
@@ -764,6 +809,7 @@ def _env_options(handicap: Dict[str, Any]) -> Dict[str, Any]:
         "blue_start": handicap["blue_start"],
         "red_walls": handicap["red_walls"],
         "blue_walls": handicap["blue_walls"],
+        "starting_player": handicap["starting_player"],
     }
 
 
@@ -797,7 +843,7 @@ def parse_args() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_network_args(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--history-length", type=int, default=0)
+        p.add_argument("--history-length", type=int, default=4)
         p.add_argument("--conv-channels", type=int, default=128)
         p.add_argument("--residual-channels", type=int, default=None)
         p.add_argument("--num-conv-layers", type=int, default=1)
@@ -817,6 +863,7 @@ def parse_args() -> argparse.Namespace:
     self_play.add_argument("--temperature-drop-ply", type=int, default=20)
     self_play.add_argument("--seed", type=int, default=1)
     self_play.add_argument("--output-dir", type=str, default=str(SELFPLAY_DIR))
+    self_play.add_argument("--walls", type=int, default=DEFAULT_WALLS_PER_PLAYER)
 
     train = subparsers.add_parser("train")
     add_network_args(train)
@@ -843,6 +890,7 @@ def parse_args() -> argparse.Namespace:
     eval_parser.add_argument("--mcts-batch-size", type=int, default=16)
     eval_parser.add_argument("--max-steps", type=int, default=500)
     eval_parser.add_argument("--seed", type=int, default=1)
+    eval_parser.add_argument("--walls", type=int, default=DEFAULT_WALLS_PER_PLAYER)
 
     loop = subparsers.add_parser("loop")
     add_network_args(loop)
@@ -868,6 +916,7 @@ def parse_args() -> argparse.Namespace:
     loop.add_argument("--eval-games", type=int, default=10)
     loop.add_argument("--eval-simulations", type=int, default=64)
     loop.add_argument("--seed", type=int, default=1)
+    loop.add_argument("--walls", type=int, default=DEFAULT_WALLS_PER_PLAYER)
 
     return parser.parse_args()
 
@@ -902,6 +951,7 @@ def main() -> None:
             temperature_drop_ply=args.temperature_drop_ply,
             seed=args.seed,
             output_dir=args.output_dir,
+            base_walls=args.walls,
         )
         run_self_play(model, network_config, config, device=args.device)
 
@@ -942,6 +992,7 @@ def main() -> None:
             batch_size=args.mcts_batch_size,
             max_steps=args.max_steps,
             seed=args.seed,
+            base_walls=args.walls,
         )
         metrics = evaluate_models(candidate, baseline, candidate_config, config, device=args.device)
         print(metrics)
@@ -959,6 +1010,7 @@ def main() -> None:
             temperature_drop_ply=args.temperature_drop_ply,
             seed=args.seed,
             output_dir=args.replay_dir,
+            base_walls=args.walls,
         )
         train_config = TrainConfig(
             replay_dir=args.replay_dir,
@@ -981,6 +1033,7 @@ def main() -> None:
             batch_size=args.mcts_batch_size,
             max_steps=args.max_steps,
             seed=args.seed,
+            base_walls=args.walls,
         )
         run_loop(
             model,

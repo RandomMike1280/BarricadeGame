@@ -165,7 +165,7 @@ def load_model(
     fallback_hidden_channels: Optional[int],
     fallback_residual_blocks: Optional[int],
 ) -> LoadedModel:
-    payload = torch.load(path, map_location=device)
+    payload = torch.load(path, map_location=device, weights_only=False)
     state_dict = _state_dict_from_payload(payload)
     hidden_channels, residual_blocks = _infer_model_config(
         payload,
