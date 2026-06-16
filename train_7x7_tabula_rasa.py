@@ -339,46 +339,60 @@ def sample_playout_cap(base_simulations: int, rng: random.Random) -> int:
 
 def sample_handicap(base_walls: int, rng: random.Random) -> Dict[str, object]:
     center = BOARD_SIZE // 2
-    roll = rng.random()
-    starting_player = Player.RED if rng.random() < 0.5 else Player.BLUE
-    if roll < 0.60:
-        config = {
-            "mode": "standard",
-            "red_start": (0, center),
-            "blue_start": (BOARD_SIZE - 1, center),
-            "red_walls": base_walls,
-            "blue_walls": base_walls,
-            "starting_player": starting_player,
-        }
-    elif roll < 0.80:
-        config = {
-            "mode": "column_shift",
-            "red_start": (0, rng.randint(1, BOARD_SIZE - 2)),
-            "blue_start": (BOARD_SIZE - 1, rng.randint(1, BOARD_SIZE - 2)),
-            "red_walls": base_walls,
-            "blue_walls": base_walls,
-            "starting_player": starting_player,
-        }
-    elif roll < 0.93:
-        config = {
-            "mode": "row_ahead",
-            "red_start": (rng.randint(0, 1), rng.randint(1, BOARD_SIZE - 2)),
-            "blue_start": (rng.randint(BOARD_SIZE - 2, BOARD_SIZE - 1), rng.randint(1, BOARD_SIZE - 2)),
-            "red_walls": base_walls,
-            "blue_walls": base_walls,
-            "starting_player": starting_player,
-        }
-    else:
-        config = {
-            "mode": "wall_handicap",
-            "red_start": (0, center),
-            "blue_start": (BOARD_SIZE - 1, center),
-            "red_walls": max(0, base_walls + rng.randint(-2, 2)),
-            "blue_walls": max(0, base_walls + rng.randint(-2, 2)),
-            "starting_player": starting_player,
-        }
-    return config
+    starting_player = (
+        Player.RED if rng.random() < 0.5 else Player.BLUE
+    )
 
+    # Default (standard)
+    red_row = 0
+    blue_row = BOARD_SIZE - 1
+    red_col = center
+    blue_col = center
+    red_walls = base_walls
+    blue_walls = base_walls
+
+    active_modes = []
+
+    # Majority of games use shifted columns
+    if rng.random() < 0.70:
+        red_col = rng.randint(1, BOARD_SIZE - 2)
+        blue_col = rng.randint(1, BOARD_SIZE - 2)
+        active_modes.append("column_shift")
+
+    # Sometimes start one row inward
+    if rng.random() < 0.20:
+        red_row = rng.randint(0, 1)
+        blue_row = rng.randint(
+            BOARD_SIZE - 2,
+            BOARD_SIZE - 1
+        )
+        active_modes.append("row_ahead")
+
+    # Occasionally modify wall counts
+    if rng.random() < 0.10:
+        red_walls = max(
+            0,
+            base_walls + rng.randint(-2, 2)
+        )
+        blue_walls = max(
+            0,
+            base_walls + rng.randint(-2, 2)
+        )
+        active_modes.append("wall_handicap")
+
+    # Nothing happened
+    if not active_modes:
+        active_modes.append("standard")
+
+    return {
+        "mode": "+".join(active_modes),
+        "modes": active_modes,
+        "red_start": (red_row, red_col),
+        "blue_start": (blue_row, blue_col),
+        "red_walls": red_walls,
+        "blue_walls": blue_walls,
+        "starting_player": starting_player,
+    }
 
 def make_state_from_handicap(handicap: Dict[str, object]) -> GameState:
     return GameState(
