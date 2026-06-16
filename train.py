@@ -467,7 +467,7 @@ def train_from_replay(
             )
             score_loss = masked_smooth_l1_loss(
                 score.squeeze(-1),
-                score_target,
+                symlog(score_target),
                 score_mask,
             )
             loss = (
@@ -666,6 +666,8 @@ def masked_smooth_l1_loss(prediction: Tensor, target: Tensor, mask: Tensor) -> T
     per_sample = F.smooth_l1_loss(prediction, target, reduction="none")
     return _masked_mean(per_sample, mask, prediction)
 
+def symlog(x: Tensor) -> Tensor:
+    return torch.sign(x) * torch.log1p(torch.abs(x))
 
 def masked_binary_cross_entropy(logits: Tensor, target: Tensor, mask: Tensor) -> Tensor:
     per_cell = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
@@ -844,11 +846,11 @@ def parse_args() -> argparse.Namespace:
 
     def add_network_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("--history-length", type=int, default=4)
-        p.add_argument("--conv-channels", type=int, default=128)
+        p.add_argument("--conv-channels", type=int, default=64)
         p.add_argument("--residual-channels", type=int, default=None)
         p.add_argument("--num-conv-layers", type=int, default=1)
-        p.add_argument("--num-residual-layers", type=int, default=10)
-        p.add_argument("--value-hidden-size", type=int, default=256)
+        p.add_argument("--num-residual-layers", type=int, default=6)
+        p.add_argument("--value-hidden-size", type=int, default=128)
         p.add_argument("--checkpoint", type=str, default=None)
         p.add_argument("--device", type=str, default=None)
 
@@ -915,7 +917,7 @@ def parse_args() -> argparse.Namespace:
     loop.add_argument("--weight-decay", type=float, default=1e-4)
     loop.add_argument("--eval-games", type=int, default=10)
     loop.add_argument("--eval-simulations", type=int, default=64)
-    loop.add_argument("--seed", type=int, default=1)
+    loop.add_argument("--seed", type=int, default=3407) # Torch.manual_seed(3407) is all you need.
     loop.add_argument("--walls", type=int, default=DEFAULT_WALLS_PER_PLAYER)
 
     return parser.parse_args()
