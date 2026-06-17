@@ -46,6 +46,14 @@ def _safe_ratio(numerator: int, denominator: int) -> float:
     return float(numerator) / float(denominator)
 
 
+def symlog(x: Tensor) -> Tensor:
+    return torch.sign(x) * torch.log1p(torch.abs(x))
+
+
+def symexp(x: Tensor) -> Tensor:
+    return torch.sign(x) * (torch.expm1(torch.abs(x)))
+
+
 def encode_state_planes(state, *, dtype=torch.float32) -> Tensor:
     """
     Encode one BarricadeState into base planes in a canonical frame.
@@ -315,7 +323,7 @@ class AlphaZeroNetwork(nn.Module):
         """Return only the heads needed by MCTS/inference."""
 
         out = self._features(x)
-        return self.policy_head(out), self.value_head(out), self.lead_head(out)
+        return self.policy_head(out), self.value_head(out), symexp(self.lead_head(out))
 
     @torch.inference_mode()
     def predict(
@@ -334,7 +342,7 @@ class AlphaZeroNetwork(nn.Module):
         if action_mask is not None:
             action_mask = action_mask.to(device=logits.device, dtype=torch.bool)
             logits = logits.masked_fill(~action_mask, torch.finfo(logits.dtype).min)
-        return torch.softmax(logits, dim=1), value, lead
+        return torch.softmax(logits, dim=1), value, symexp(lead)
 
 
 def build_network(

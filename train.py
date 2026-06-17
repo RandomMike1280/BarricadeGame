@@ -459,7 +459,7 @@ def train_from_replay(
             logits = masked_logits(logits, mask)
             policy_loss = soft_target_cross_entropy(logits, policy_target)
             value_loss = F.mse_loss(value.squeeze(-1), value_target)
-            lead_loss = masked_mse_loss(lead.squeeze(-1), lead_target, lead_mask)
+            lead_loss = symlog_squared_error(lead.squeeze(-1), lead_target, lead_mask)
             future_loss = masked_binary_cross_entropy(
                 future_logits,
                 future_map_target,
@@ -657,17 +657,23 @@ def soft_target_cross_entropy(logits: Tensor, target: Tensor) -> Tensor:
     return -(target * log_probs).sum(dim=1).mean()
 
 
+def symlog(x: Tensor) -> Tensor:
+    return torch.sign(x) * torch.log1p(torch.abs(x))
+
+
 def masked_mse_loss(prediction: Tensor, target: Tensor, mask: Tensor) -> Tensor:
     per_sample = F.mse_loss(prediction, target, reduction="none")
+    return _masked_mean(per_sample, mask, prediction)
+
+
+def symlog_squared_error(prediction: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+    per_sample = F.mse_loss(prediction, symlog(target), reduction="none")
     return _masked_mean(per_sample, mask, prediction)
 
 
 def masked_smooth_l1_loss(prediction: Tensor, target: Tensor, mask: Tensor) -> Tensor:
     per_sample = F.smooth_l1_loss(prediction, target, reduction="none")
     return _masked_mean(per_sample, mask, prediction)
-
-def symlog(x: Tensor) -> Tensor:
-    return torch.sign(x) * torch.log1p(torch.abs(x))
 
 def masked_binary_cross_entropy(logits: Tensor, target: Tensor, mask: Tensor) -> Tensor:
     per_cell = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
