@@ -20,7 +20,7 @@ from barricade_env import ACTION_SIZE, BarricadeState, Move, Player, encode_move
 from network import encode_state_stack
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MCTSConfig:
     num_simulations: int = 800
     batch_size: int = 32
@@ -40,13 +40,13 @@ class MCTSConfig:
     lead_scale: float = 10.0
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SearchEvaluation:
     value: float
     lead: float
 
 
-@dataclass
+@dataclass(slots=True)
 class SearchEdge:
     action: int
     move: Move
@@ -74,7 +74,7 @@ class SearchEdge:
         return self.lead_sum / self.visits
 
 
-@dataclass
+@dataclass(slots=True)
 class SearchNode:
     state: BarricadeState
     history: Tuple[BarricadeState, ...] = ()
@@ -84,6 +84,9 @@ class SearchNode:
     value_estimate: Optional[float] = None
     lead_estimate: Optional[float] = None
     root_noise_applied: bool = False
+    # Cached terminal evaluation: None = not terminal or not yet checked,
+    # SearchEvaluation = terminal value/lead for this node's perspective.
+    terminal_eval: Optional[SearchEvaluation] = None
 
     @property
     def effective_visits(self) -> int:
@@ -94,7 +97,7 @@ class SearchNode:
         return sum(edge.visits for edge in self.edges.values())
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ActionStats:
     action: int
     move: Move
@@ -108,7 +111,7 @@ class ActionStats:
     policy: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MCTSResult:
     action: int
     policy_target: List[float]
@@ -120,6 +123,18 @@ class MCTSResult:
 
 
 class MCTS:
+    """AlphaZero-style MCTS with batched neural-network evaluation.
+
+    Optimizations over the baseline:
+    - ``slots=True`` dataclasses for faster attribute access and lower memory.
+    - Cached terminal evaluations on nodes to avoid repeated winner checks.
+    - Single GPU synchronization point per batch via ``.tolist()``.
+    - Pure-Python prior (softmax) and Dirichlet-noise computation.
+    - Tight inner loops in ``_select_edge`` and ``_backpropagate`` with
+      local-variable binding and pre-computed constants.
+    - Iterative (non-recursive) virtual-visit clearing.
+    """
+
     def __init__(
         self,
         model,
@@ -146,6 +161,27 @@ class MCTS:
         self.policy_action_transform = policy_action_transform
         self.lead_transform = lead_transform
 
+        # Pre-compute frequently used config values to avoid attribute lookups
+        cfg = self.config
+        self._history_length = cfg.history_length
+        self._use_history = cfg.history_length > 0
+        self._lead_weight = cfg.lead_weight
+        self._use_lead_bonus = cfg.lead_weight > 0
+        self._lead_scale = max(float(cfg.lead_scale), 1e-6)
+        self._inv_lead_scale = 1.0 / self._lead_scale
+        self._fpu_reduction = cfg.fpu_reduction
+        self._cpuct_init = cfg.cpuct_init
+        self._cpuct_base = max(cfg.cpuct_base, 1e-6)
+        self._cpuct_factor = cfg.cpuct_factor
+        self._policy_temperature = cfg.policy_temperature
+        self._add_root_noise = cfg.add_root_noise
+        self._root_dirichlet_alpha = cfg.root_dirichlet_alpha
+        self._root_exploration_fraction = cfg.root_exploration_fraction
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def search(
         self,
         state: BarricadeState,
@@ -154,11 +190,11 @@ class MCTS:
     ) -> MCTSResult:
         root = self._prepare_root(state, history, root)
 
-        if self._winner_evaluation(root) is None and not root.is_expanded:
+        if root.terminal_eval is None and not root.is_expanded:
             self._evaluate_and_expand([root])
 
         if (
-            self.config.add_root_noise
+            self._add_root_noise
             and root.is_expanded
             and not root.root_noise_applied
         ):
@@ -169,23 +205,23 @@ class MCTS:
         collisions = 0
         neural_batches = 0
         evaluated_leaves = 0
-        while completed < self.config.num_simulations:
+        num_simulations = self.config.num_simulations
+        batch_size = self.config.batch_size
+
+        while completed < num_simulations:
             pending: List[Tuple[SearchNode, List[SearchEdge]]] = []
             terminal_paths: List[Tuple[List[SearchEdge], SearchEvaluation]] = []
-            target_batch = min(
-                max(1, self.config.batch_size),
-                self.config.num_simulations - completed,
-            )
+            target_batch = min(max(1, batch_size), num_simulations - completed)
+            collision_limit = max(16, target_batch * 4)
 
             while len(pending) + len(terminal_paths) < target_batch:
-                selection = self._select_leaf(root)
-                kind, leaf, path, evaluation = selection
+                kind, leaf, path, evaluation = self._select_leaf(root)
 
                 if kind == "collision":
                     self._release_virtual_visits(path)
                     collision_streak += 1
                     collisions += 1
-                    if collision_streak > max(16, target_batch * 4):
+                    if collision_streak > collision_limit:
                         break
                     continue
 
@@ -194,15 +230,15 @@ class MCTS:
                     terminal_paths.append((path, evaluation))
                 elif kind == "leaf":
                     pending.append((leaf, path))
-                else:
-                    raise RuntimeError(f"Unknown selection kind: {kind}")
 
-                if completed + len(pending) + len(terminal_paths) >= self.config.num_simulations:
+                if completed + len(pending) + len(terminal_paths) >= num_simulations:
                     break
 
             if not pending and not terminal_paths:
                 break
 
+            # Backpropagate terminal paths first so their statistics are
+            # available for the next batch's selection.
             for path, evaluation in terminal_paths:
                 self._backpropagate(path, evaluation)
             completed += len(terminal_paths)
@@ -210,13 +246,16 @@ class MCTS:
             if pending:
                 neural_batches += 1
                 evaluated_leaves += len(pending)
-                evaluations = self._evaluate_and_expand([leaf for leaf, _ in pending])
+                leaves = [leaf for leaf, _ in pending]
+                evaluations = self._evaluate_and_expand(leaves)
                 for (leaf, path), evaluation in zip(pending, evaluations):
-                    leaf.in_flight = max(0, leaf.in_flight - 1)
+                    if leaf.in_flight > 0:
+                        leaf.in_flight -= 1
                     self._backpropagate(path, evaluation)
                 completed += len(pending)
 
         self._clear_virtual_visits(root)
+
         policy_target_temperature = (
             self.config.action_temperature
             if self.config.policy_target_temperature is None
@@ -244,7 +283,6 @@ class MCTS:
     def select_action(self, result: MCTSResult, temperature: Optional[float] = None) -> int:
         if temperature is None:
             return result.action
-
         policy = self._policy_from_stats(
             result.stats,
             temperature,
@@ -258,6 +296,10 @@ class MCTS:
             return None
         return edge.child
 
+    # ------------------------------------------------------------------
+    # Root preparation
+    # ------------------------------------------------------------------
+
     def _prepare_root(
         self,
         state: BarricadeState,
@@ -268,87 +310,136 @@ class MCTS:
         if root is not None and root.state.state_cache_key() == state.state_cache_key():
             root.history = trimmed_history
             return root
-        return SearchNode(state.copy(), trimmed_history)
+        new_root = SearchNode(state.copy(), trimmed_history)
+        # Pre-check terminal status so _select_leaf can use the cache.
+        winner_eval = self._winner_evaluation(new_root)
+        if winner_eval is not None:
+            new_root.terminal_eval = winner_eval
+        return new_root
+
+    # ------------------------------------------------------------------
+    # Selection (hot path)
+    # ------------------------------------------------------------------
 
     def _select_leaf(
         self, root: SearchNode
     ) -> Tuple[str, Optional[SearchNode], List[SearchEdge], Optional[SearchEvaluation]]:
         node = root
         path: List[SearchEdge] = []
+        use_history = self._use_history
+        trim_history = self._trim_history
 
         while True:
-            winner_evaluation = self._winner_evaluation(node)
-            if winner_evaluation is not None:
-                return "terminal", node, path, winner_evaluation
+            # Fast path: cached terminal check
+            te = node.terminal_eval
+            if te is not None:
+                return "terminal", node, path, te
 
             if not node.is_expanded:
                 if node.in_flight > 0:
                     return "collision", node, path, None
-                node.in_flight += 1
+                node.in_flight = 1
                 return "leaf", node, path, None
 
-            if not node.edges:
-                return "terminal", node, path, SearchEvaluation(
+            edges = node.edges
+            if not edges:
+                # Expanded with no legal moves — terminal (stalemate).
+                eval_ = SearchEvaluation(
                     value=-1.0,
                     lead=self._state_lead(node.state),
                 )
+                node.terminal_eval = eval_
+                return "terminal", node, path, eval_
 
-            edge = self._select_edge(node)
+            edge = self._select_edge(node, edges)
             edge.virtual_visits += 1
             path.append(edge)
-            if edge.child is None:
-                edge.child = SearchNode(
-                    state=node.state.apply_move(edge.move),
-                    history=self._child_history(node),
-                )
-            node = edge.child
 
-    def _select_edge(self, node: SearchNode) -> SearchEdge:
+            child = edge.child
+            if child is None:
+                new_state = node.state.apply_move(edge.move)
+                if use_history:
+                    history = trim_history((*node.history, node.state))
+                else:
+                    history = ()
+                child = SearchNode(state=new_state, history=history)
+                # Pre-check terminal status for the new child.
+                child_eval = self._winner_evaluation(child)
+                if child_eval is not None:
+                    child.terminal_eval = child_eval
+                edge.child = child
+            node = child
+
+    def _select_edge(self, node: SearchNode, edges: Dict[int, SearchEdge]) -> SearchEdge:
+        """Select the best edge using PUCT with FPU reduction and optional lead bonus.
+
+        Two-pass algorithm:
+        1. Aggregate parent statistics (total visits, value sums, explored prior).
+        2. Score each edge and pick the maximum.
+        """
+        # ---- Pass 1: aggregate parent statistics ----
         real_visits = 0
+        parent_effective_visits = 0
         parent_value_sum = 0.0
         parent_lead_sum = 0.0
-        parent_effective_visits = 0
         explored_prior = 0.0
-        for edge in node.edges.values():
-            visits = edge.visits
-            effective_visits = visits + edge.virtual_visits
-            real_visits += visits
-            parent_effective_visits += effective_visits
+
+        for edge in edges.values():
+            v = edge.visits
+            ev = v + edge.virtual_visits
+            real_visits += v
+            parent_effective_visits += ev
             parent_value_sum += edge.value_sum
             parent_lead_sum += edge.lead_sum
-            if effective_visits > 0:
+            if ev > 0:
                 explored_prior += edge.prior
 
-        parent_effective_visits = max(1, parent_effective_visits)
-        cpuct = self._cpuct(parent_effective_visits)
-        parent_q = parent_value_sum / real_visits if real_visits else 0.0
-        parent_lead_q = parent_lead_sum / real_visits if real_visits else 0.0
-        fpu_q = parent_q - self.config.fpu_reduction * math.sqrt(
-            max(0.0, explored_prior)
-        )
-        sqrt_parent_visits = math.sqrt(parent_effective_visits)
-        lead_weight = self.config.lead_weight
-        lead_scale = max(float(self.config.lead_scale), 1e-6)
+        # ---- Compute selection constants ----
+        pev = parent_effective_visits if parent_effective_visits > 0 else 1
+        cpuct = self._cpuct_fast(pev)
 
+        if real_visits > 0:
+            parent_q = parent_value_sum / real_visits
+            parent_lead_q = parent_lead_sum / real_visits
+        else:
+            parent_q = 0.0
+            parent_lead_q = 0.0
+
+        fpu_q = parent_q - self._fpu_reduction * math.sqrt(
+            explored_prior if explored_prior > 0.0 else 0.0
+        )
+        sqrt_parent = math.sqrt(pev)
+
+        use_lead = self._use_lead_bonus
+        if use_lead:
+            lead_weight = self._lead_weight
+            inv_lead_scale = self._inv_lead_scale
+
+        # ---- Pass 2: select best edge ----
         best_score = -math.inf
-        best_edge = None
-        for edge in node.edges.values():
-            visits = edge.visits
-            effective_visits = visits + edge.virtual_visits
-            q_value = edge.value_sum / visits if visits > 0 else fpu_q
-            lead_value = edge.lead_sum / visits if visits > 0 else parent_lead_q
-            u_value = (
-                cpuct
-                * edge.prior
-                * sqrt_parent_visits
-                / (1 + effective_visits)
-            )
-            lead_bonus = (
-                lead_weight * math.tanh(float(lead_value) / lead_scale)
-                if lead_weight > 0
-                else 0.0
-            )
-            score = q_value + u_value + lead_bonus
+        best_edge: Optional[SearchEdge] = None
+
+        for edge in edges.values():
+            v = edge.visits
+            ev = v + edge.virtual_visits
+
+            # Q value: use actual if visited, otherwise FPU default
+            if v > 0:
+                q = edge.value_sum / v
+                if use_lead:
+                    lead_val = edge.lead_sum / v
+            else:
+                q = fpu_q
+                if use_lead:
+                    lead_val = parent_lead_q
+
+            # PUCT exploration
+            u = cpuct * edge.prior * sqrt_parent / (1.0 + ev)
+
+            score = q + u
+            if use_lead:
+                score += lead_weight * math.tanh(lead_val * inv_lead_scale)
+
             if score > best_score:
                 best_score = score
                 best_edge = edge
@@ -357,37 +448,46 @@ class MCTS:
             raise RuntimeError("Cannot select from a node with no edges.")
         return best_edge
 
+    # ------------------------------------------------------------------
+    # Evaluation & expansion (batched neural network)
+    # ------------------------------------------------------------------
+
     def _evaluate_and_expand(self, nodes: Sequence[SearchNode]) -> List[SearchEvaluation]:
         if not nodes:
             return []
 
-        evaluations: List[Optional[SearchEvaluation]] = [None] * len(nodes)
+        n = len(nodes)
+        evaluations: List[Optional[SearchEvaluation]] = [None] * n
         expandable: List[Tuple[int, SearchNode, List[Tuple[int, Move]]]] = []
-        for index, node in enumerate(nodes):
+
+        for index in range(n):
+            node = nodes[index]
             legal_action_moves = self._legal_action_moves(node.state)
             if legal_action_moves:
                 expandable.append((index, node, legal_action_moves))
-                continue
-
-            evaluation = SearchEvaluation(
-                value=-1.0,
-                lead=self._state_lead(node.state),
-            )
-            node.edges = {}
-            node.value_estimate = evaluation.value
-            node.lead_estimate = evaluation.lead
-            node.is_expanded = True
-            evaluations[index] = evaluation
+            else:
+                # No legal moves — terminal
+                eval_ = SearchEvaluation(
+                    value=-1.0,
+                    lead=self._state_lead(node.state),
+                )
+                node.edges = {}
+                node.value_estimate = eval_.value
+                node.lead_estimate = eval_.lead
+                node.is_expanded = True
+                node.terminal_eval = eval_
+                evaluations[index] = eval_
 
         if not expandable:
-            return [evaluation for evaluation in evaluations if evaluation is not None]
+            return [e for e in evaluations if e is not None]
 
+        # Build batch tensor
         batch = torch.stack(
             [
                 self.state_encoder(
                     node.state,
                     node.history,
-                    self.config.history_length,
+                    self._history_length,
                 )
                 for _, node, _ in expandable
             ],
@@ -396,45 +496,61 @@ class MCTS:
 
         was_training = self.model.training
         self.model.eval()
+
+        # Single GPU sync point: convert all outputs to Python lists at once
         with torch.inference_mode():
-            logits, values, leads = self._model_inference(batch)
+            logits_t, values_t, leads_t = self._model_inference(batch)
+            # .tolist() triggers a single synchronization and gives us plain
+            # Python floats/lists — no further GPU sync needed downstream.
+            logits_list = logits_t.tolist()
+            values_list = values_t.view(-1).tolist()
+            leads_list = leads_t.view(-1).tolist()
+
         if was_training:
             self.model.train()
 
-        logits = logits.detach().cpu()
-        values = values.detach().cpu().view(-1)
-        leads = leads.detach().cpu().view(-1)
+        policy_temperature = self._policy_temperature
 
-        for (
-            index,
-            node,
-            legal_action_moves,
-        ), node_logits, node_value, node_lead in zip(expandable, logits, values, leads):
-            value = float(node_value.item())
-            lead = self._model_lead(float(node_lead.item()), node.state)
-            evaluation = SearchEvaluation(value=value, lead=lead)
-            self._expand_node(node, node_logits, evaluation, legal_action_moves)
-            evaluations[index] = evaluation
-        return [evaluation for evaluation in evaluations if evaluation is not None]
+        for idx in range(len(expandable)):
+            index, node, legal_action_moves = expandable[idx]
+            value = values_list[idx]
+            lead = self._model_lead(leads_list[idx], node.state)
+            eval_ = SearchEvaluation(value=value, lead=lead)
+            self._expand_node(
+                node,
+                logits_list[idx],
+                eval_,
+                legal_action_moves,
+                policy_temperature,
+            )
+            evaluations[index] = eval_
+
+        return [e for e in evaluations if e is not None]
 
     def _expand_node(
         self,
         node: SearchNode,
-        logits: Tensor,
+        logits,
         evaluation: SearchEvaluation,
         legal_action_moves: Optional[Sequence[Tuple[int, Move]]] = None,
+        policy_temperature: Optional[float] = None,
     ) -> None:
         if legal_action_moves is None:
             legal_action_moves = self._legal_action_moves(node.state)
+        if policy_temperature is None:
+            policy_temperature = self._policy_temperature
+
         legal_actions = [action for action, _ in legal_action_moves]
-        priors = self._masked_priors(logits, legal_actions, node.state)
-        edges = {}
-        for action, move in legal_action_moves:
-            edges[action] = SearchEdge(
+        priors = self._masked_priors(logits, legal_actions, node.state, policy_temperature)
+
+        edges = {
+            action: SearchEdge(
                 action=action,
                 move=move,
                 prior=priors.get(action, 0.0),
             )
+            for action, move in legal_action_moves
+        }
         node.edges = dict(sorted(edges.items()))
         node.value_estimate = evaluation.value
         node.lead_estimate = evaluation.lead
@@ -442,91 +558,194 @@ class MCTS:
 
     def _masked_priors(
         self,
-        logits: Tensor,
+        logits,
         legal_actions: Sequence[int],
         state: BarricadeState,
+        temperature: Optional[float] = None,
     ) -> Dict[int, float]:
-        legal_actions = list(legal_actions)
+        """Compute masked softmax priors in pure Python.
+
+        ``logits`` may be a 1-D ``Tensor`` or a plain ``list`` of floats.
+        Working in Python avoids per-element tensor indexing and ``.item()``
+        calls, which are far slower for the small action counts typical of
+        board games.
+        """
         if not legal_actions:
             return {}
+
+        if temperature is None:
+            temperature = self._policy_temperature
+
+        # Convert tensor to list if needed (single sync if still on GPU)
+        if isinstance(logits, Tensor):
+            logits = logits.tolist()
 
         network_actions = [
             self._network_action(action, state)
             for action in legal_actions
         ]
-        legal_logits = logits[network_actions].float()
-        legal_logits = torch.nan_to_num(legal_logits, nan=0.0, posinf=80.0, neginf=-80.0)
 
-        temperature = self.config.policy_temperature
+        # Extract legal logits with NaN/Inf clamping
+        n = len(network_actions)
+        legal_logits = [0.0] * n
+        for i in range(n):
+            val = logits[network_actions[i]]
+            if val != val:  # NaN
+                legal_logits[i] = 0.0
+            elif val == float('inf'):
+                legal_logits[i] = 80.0
+            elif val == float('-inf'):
+                legal_logits[i] = -80.0
+            else:
+                legal_logits[i] = val
+
         if temperature <= 0:
-            probs = torch.zeros_like(legal_logits)
-            probs[int(torch.argmax(legal_logits).item())] = 1.0
-        else:
-            probs = torch.softmax(legal_logits / max(temperature, 1e-6), dim=0)
+            # Greedy: pick argmax
+            best_idx = 0
+            best_val = legal_logits[0]
+            for i in range(1, n):
+                if legal_logits[i] > best_val:
+                    best_val = legal_logits[i]
+                    best_idx = i
+            return {
+                legal_actions[i]: (1.0 if i == best_idx else 0.0)
+                for i in range(n)
+            }
 
-        if not torch.isfinite(probs).all() or float(probs.sum().item()) <= 0:
-            probs = torch.full_like(legal_logits, 1.0 / len(legal_actions))
-        else:
-            probs = probs / probs.sum()
+        temp = temperature if temperature > 1e-6 else 1e-6
+        max_logit = max(legal_logits)
 
-        return {action: prob for action, prob in zip(legal_actions, probs.tolist())}
+        # Numerically stable softmax in pure Python
+        exp_values = [0.0] * n
+        total = 0.0
+        all_finite = True
+        for i in range(n):
+            e = math.exp((legal_logits[i] - max_logit) / temp)
+            if not math.isfinite(e):
+                all_finite = False
+                break
+            exp_values[i] = e
+            total += e
+
+        if total <= 0 or not all_finite:
+            uniform = 1.0 / n
+            return {action: uniform for action in legal_actions}
+
+        inv_total = 1.0 / total
+        return {
+            legal_actions[i]: exp_values[i] * inv_total
+            for i in range(n)
+        }
+
+    # ------------------------------------------------------------------
+    # Root Dirichlet noise (pure Python — avoids torch overhead)
+    # ------------------------------------------------------------------
 
     def _add_root_dirichlet_noise(self, root: SearchNode) -> None:
         if not root.edges:
             return
 
-        alpha = self.config.root_dirichlet_alpha
-        fraction = self.config.root_exploration_fraction
+        alpha = self._root_dirichlet_alpha
+        fraction = self._root_exploration_fraction
         if alpha <= 0 or fraction <= 0:
             root.root_noise_applied = True
             return
 
         actions = list(root.edges.keys())
-        concentration = torch.full((len(actions),), float(alpha), dtype=torch.float32)
-        noise = torch.distributions.Dirichlet(concentration).sample().tolist()
-        for action, noise_value in zip(actions, noise):
-            edge = root.edges[action]
-            edge.prior = (1.0 - fraction) * edge.prior + fraction * float(noise_value)
+        n = len(actions)
 
-        total_prior = sum(edge.prior for edge in root.edges.values())
+        # Sample from Dirichlet via gamma variates — no torch needed
+        gammavariate = self.rng.gammavariate
+        noise = [gammavariate(alpha, 1.0) for _ in range(n)]
+        total_noise = sum(noise)
+        if total_noise > 0:
+            inv_total_noise = 1.0 / total_noise
+            noise = [x * inv_total_noise for x in noise]
+        else:
+            uniform = 1.0 / n
+            noise = [uniform] * n
+
+        one_minus_frac = 1.0 - fraction
+        edges = root.edges
+
+        for i in range(n):
+            edge = edges[actions[i]]
+            edge.prior = one_minus_frac * edge.prior + fraction * noise[i]
+
+        # Renormalize
+        total_prior = 0.0
+        for edge in edges.values():
+            total_prior += edge.prior
         if total_prior > 0:
-            for edge in root.edges.values():
-                edge.prior /= total_prior
+            inv_total_prior = 1.0 / total_prior
+            for edge in edges.values():
+                edge.prior *= inv_total_prior
         root.root_noise_applied = True
+
+    # ------------------------------------------------------------------
+    # Backpropagation (hot path)
+    # ------------------------------------------------------------------
 
     def _backpropagate(
         self,
         path: Sequence[SearchEdge],
         leaf_evaluation: SearchEvaluation,
     ) -> None:
-        node_value = float(leaf_evaluation.value)
-        node_lead = float(leaf_evaluation.lead)
-        for edge in reversed(path):
-            edge.virtual_visits = max(0, edge.virtual_visits - 1)
-            parent_value = -node_value
-            parent_lead = -node_lead
-            edge.value_sum += parent_value
-            edge.lead_sum += parent_lead
+        value = leaf_evaluation.value
+        lead = leaf_evaluation.lead
+        # Walk from leaf to root, negating perspective at each ply.
+        for i in range(len(path) - 1, -1, -1):
+            edge = path[i]
+            if edge.virtual_visits > 0:
+                edge.virtual_visits -= 1
+            value = -value
+            lead = -lead
+            edge.value_sum += value
+            edge.lead_sum += lead
             edge.visits += 1
-            node_value = parent_value
-            node_lead = parent_lead
 
     def _release_virtual_visits(self, path: Sequence[SearchEdge]) -> None:
-        for edge in path:
-            edge.virtual_visits = max(0, edge.virtual_visits - 1)
+        for i in range(len(path)):
+            edge = path[i]
+            if edge.virtual_visits > 0:
+                edge.virtual_visits -= 1
 
-    def _clear_virtual_visits(self, node: Optional[SearchNode]) -> None:
-        if node is None:
+    def _clear_virtual_visits(self, root: Optional[SearchNode]) -> None:
+        """Iteratively reset virtual visits and in-flight counters.
+
+        Uses an explicit stack to avoid Python recursion overhead and
+        potential stack limits on large trees.
+        """
+        if root is None:
             return
-        node.in_flight = 0
-        for edge in node.edges.values():
-            edge.virtual_visits = 0
-            self._clear_virtual_visits(edge.child)
+        stack: List[SearchNode] = [root]
+        while stack:
+            node = stack.pop()
+            node.in_flight = 0
+            for edge in node.edges.values():
+                if edge.virtual_visits:
+                    edge.virtual_visits = 0
+                child = edge.child
+                if child is not None:
+                    stack.append(child)
+
+    # ------------------------------------------------------------------
+    # Terminal evaluation
+    # ------------------------------------------------------------------
+
+    def _winner_evaluation(self, node: SearchNode) -> Optional[SearchEvaluation]:
+        winner = node.state.winner
+        if winner is not None:
+            value = 1.0 if winner == node.state.current_player else -1.0
+            return SearchEvaluation(value=value, lead=self._state_lead(node.state))
+        return None
 
     def _terminal_evaluation(self, node: SearchNode) -> Optional[SearchEvaluation]:
-        winner_evaluation = self._winner_evaluation(node)
-        if winner_evaluation is not None:
-            return winner_evaluation
+        if node.terminal_eval is not None:
+            return node.terminal_eval
+        winner_eval = self._winner_evaluation(node)
+        if winner_eval is not None:
+            return winner_eval
         if node.is_expanded:
             if not node.edges:
                 return SearchEvaluation(value=-1.0, lead=self._state_lead(node.state))
@@ -535,29 +754,38 @@ class MCTS:
             return SearchEvaluation(value=-1.0, lead=self._state_lead(node.state))
         return None
 
-    def _winner_evaluation(self, node: SearchNode) -> Optional[SearchEvaluation]:
-        if node.state.winner is not None:
-            value = 1.0 if node.state.winner == node.state.current_player else -1.0
-            return SearchEvaluation(value=value, lead=self._state_lead(node.state))
-        return None
+    # ------------------------------------------------------------------
+    # History helpers
+    # ------------------------------------------------------------------
 
     def _child_history(self, node: SearchNode) -> Tuple[BarricadeState, ...]:
-        if self.config.history_length <= 0:
+        if not self._use_history:
             return ()
         return self._trim_history((*node.history, node.state))
 
     def _trim_history(
         self, history: Sequence[BarricadeState]
     ) -> Tuple[BarricadeState, ...]:
-        if self.config.history_length <= 0:
+        if not self._use_history:
             return ()
-        return tuple(history[-self.config.history_length :])
+        return tuple(history[-self._history_length:])
+
+    # ------------------------------------------------------------------
+    # CPUCT
+    # ------------------------------------------------------------------
 
     def _cpuct(self, parent_effective_visits: int) -> float:
-        base = max(self.config.cpuct_base, 1e-6)
-        return self.config.cpuct_init + math.log(
+        return self._cpuct_fast(parent_effective_visits)
+
+    def _cpuct_fast(self, parent_effective_visits: int) -> float:
+        base = self._cpuct_base
+        return self._cpuct_init + math.log(
             (parent_effective_visits + base + 1.0) / base
-        ) * self.config.cpuct_factor
+        ) * self._cpuct_factor
+
+    # ------------------------------------------------------------------
+    # Policy extraction
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _parent_q(node: SearchNode) -> float:
@@ -574,10 +802,9 @@ class MCTS:
         return sum(edge.lead_sum for edge in node.edges.values()) / visits
 
     def _lead_bonus(self, lead: float) -> float:
-        if self.config.lead_weight <= 0:
+        if not self._use_lead_bonus:
             return 0.0
-        scale = max(float(self.config.lead_scale), 1e-6)
-        return self.config.lead_weight * math.tanh(float(lead) / scale)
+        return self._lead_weight * math.tanh(float(lead) * self._inv_lead_scale)
 
     def _policy_target(self, root: SearchNode, temperature: float) -> List[float]:
         stats = [
@@ -590,34 +817,38 @@ class MCTS:
             legal_actions = list(root.edges.keys())
             if not legal_actions:
                 return policy
+            uniform = 1.0 / len(legal_actions)
             for action in legal_actions:
-                policy[action] = 1.0 / len(legal_actions)
+                policy[action] = uniform
             return policy
 
         if temperature <= 0:
-            best_action, _ = max(
+            best_action = max(
                 stats,
                 key=lambda item: (
                     item[1],
                     root.edges[item[0]].q,
                     root.edges[item[0]].lead_q,
                 ),
-            )
+            )[0]
             policy[best_action] = 1.0
             return policy
 
+        inv_temp = 1.0 / max(temperature, 1e-6)
         weights = [
-            (action, float(visits) ** (1.0 / max(temperature, 1e-6)))
+            (action, float(visits) ** inv_temp)
             for action, visits in stats
         ]
-        total = sum(weight for _, weight in weights)
+        total = sum(w for _, w in weights)
         if total <= 0:
+            uniform = 1.0 / len(stats)
             for action, _ in stats:
-                policy[action] = 1.0 / len(stats)
+                policy[action] = uniform
             return policy
 
+        inv_total = 1.0 / total
         for action, weight in weights:
-            policy[action] = weight / total
+            policy[action] = weight * inv_total
         return policy
 
     def _sample_policy(self, policy: Sequence[float]) -> int:
@@ -641,19 +872,22 @@ class MCTS:
             policy[best.action] = 1.0
             return policy
 
+        inv_temp = 1.0 / max(temperature, 1e-6)
         weights = [
-            (stat.action, float(stat.visits) ** (1.0 / max(temperature, 1e-6)))
+            (stat.action, float(stat.visits) ** inv_temp)
             for stat in stats
             if stat.visits > 0
         ]
         if not weights:
+            uniform = 1.0 / len(stats)
             for stat in stats:
-                policy[stat.action] = 1.0 / len(stats)
+                policy[stat.action] = uniform
             return policy
 
-        total = sum(weight for _, weight in weights)
+        total = sum(w for _, w in weights)
+        inv_total = 1.0 / total
         for action, weight in weights:
-            policy[action] = weight / total
+            policy[action] = weight * inv_total
         return policy
 
     def _action_stats(self, root: SearchNode, policy_target: Sequence[float]) -> List[ActionStats]:
@@ -690,6 +924,10 @@ class MCTS:
         if terminal_evaluation is not None:
             return terminal_evaluation.lead
         return float(root.lead_estimate or 0.0)
+
+    # ------------------------------------------------------------------
+    # Encoding / move helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _default_state_encoder(
