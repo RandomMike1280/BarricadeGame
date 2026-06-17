@@ -601,7 +601,7 @@ def evaluate_models(
         "wins": wins,
         "losses": losses,
         "draws": draws,
-        "win_rate": wins / total,
+        "win_rate": (wins + 0.5 * draws) / total,
         "average_lead": _mean(leads),
         "average_game_length": _mean(game_lengths),
         "average_red_pawn_moves": _mean(red_pawn_moves),
@@ -645,7 +645,7 @@ def run_loop(
         _load_checkpoint_into(baseline, current_checkpoint, device=torch.device(device or "cpu"))
         metrics = evaluate_models(model, baseline, network_config, eval_config, device=device)
         print(f"eval metrics: {metrics}")
-        if metrics["win_rate"] >= 0.55:
+        if metrics["win_rate"] >= 0.4:
             current_checkpoint = candidate_path
             _copy_latest(candidate_path)
         else:

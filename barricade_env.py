@@ -133,6 +133,7 @@ def cell_adjacency_for_board_size(board_size: int) -> Tuple[Tuple[Any, ...], ...
     adjacency = []
     for row in range(board_size):
         for col in range(board_size):
+            cell_index = row * board_size + col
             neighbors = []
             for row_delta, col_delta in DIRECTIONS:
                 next_row = row + row_delta
@@ -314,7 +315,7 @@ def encode_move_for_board_size(move: Move, board_size: int) -> int:
     move_type = move[0]
     if move_type == "move":
         if len(move) != 2:
-            raise ValueError("Move actions must be ('move', direction).")
+            raise ValueError("Move actions must be (\"move\", direction).")
         _, direction = move
         return coerce_move_direction(direction).value
 
@@ -402,7 +403,11 @@ class BarricadeState:
         self._cell_adjacency = cell_adjacency_for_board_size(board_size)
         self._path_graph = path_graph_for_board_size(board_size)
         self._blocked_edge_mask = 0
-        self._wall_cache_key: Optional[frozenset[WallPlacement]] = frozenset()
+        self._walls_frozenset: frozenset[WallPlacement] = frozenset()
+        self._blocked_edge_mask_cache: int = 0
+        self._walls_frozenset_cache_key: frozenset[WallPlacement] = frozenset()
+        self._horizontal_walls_cache: Set[Tuple[int, int]] = set()
+        self._vertical_walls_cache: Set[Tuple[int, int]] = set()
         self.pawns = {Player.RED: red_start, Player.BLUE: blue_start}
         self.walls: Set[WallPlacement] = set()
         self.current_player = starting_player
@@ -425,7 +430,11 @@ class BarricadeState:
         new_state._cell_adjacency = self._cell_adjacency
         new_state._path_graph = self._path_graph
         new_state._blocked_edge_mask = self._blocked_edge_mask
-        new_state._wall_cache_key = self._wall_cache_key
+        new_state._walls_frozenset = self._walls_frozenset
+        new_state._blocked_edge_mask_cache = self._blocked_edge_mask_cache
+        new_state._walls_frozenset_cache_key = self._walls_frozenset_cache_key
+        new_state._horizontal_walls_cache = set(self._horizontal_walls_cache)
+        new_state._vertical_walls_cache = set(self._vertical_walls_cache)
         new_state.pawns = dict(self.pawns)
         new_state.walls = set(self.walls)
         new_state.current_player = self.current_player
@@ -448,7 +457,7 @@ class BarricadeState:
             self.winner,
             self.walls_left[Player.RED],
             self.walls_left[Player.BLUE],
-            frozenset(self.walls),
+            self._walls_frozenset,
         )
 
     def get_valid_moves(self) -> List[Move]:
@@ -894,20 +903,18 @@ class BarricadeState:
         self._route_cache[key] = None
         return None
 
-    @staticmethod
     def _path_heuristic(cell: Tuple[int, int], target_row: int) -> int:
         return abs(cell[0] - target_row)
 
     def _current_blocked_edge_mask(self) -> int:
-        walls_key = frozenset(self.walls)
-        if self._wall_cache_key == walls_key:
-            return self._blocked_edge_mask
+        if self._walls_frozenset_cache_key == self._walls_frozenset:
+            return self._blocked_edge_mask_cache
 
         blocked_edge_mask = 0
-        for orientation, row, col in walls_key:
+        for orientation, row, col in self._walls_frozenset:
             blocked_edge_mask |= self._wall_edge_mask(orientation, row, col)
-        self._wall_cache_key = walls_key
-        self._blocked_edge_mask = blocked_edge_mask
+        self._walls_frozenset_cache_key = self._walls_frozenset
+        self._blocked_edge_mask_cache = blocked_edge_mask
         return blocked_edge_mask
 
     def _wall_edge_mask(
@@ -921,17 +928,24 @@ class BarricadeState:
             return self._path_graph.horizontal_wall_masks[index]
         return self._path_graph.vertical_wall_masks[index]
 
-    @staticmethod
     def _wall_lookup(
+        self,
         walls: Iterable[WallPlacement],
     ) -> Tuple[Set[Tuple[int, int]], Set[Tuple[int, int]]]:
+        walls_frozenset = frozenset(walls)
+        if self._walls_frozenset_cache_key == walls_frozenset:
+            return self._horizontal_walls_cache, self._vertical_walls_cache
+
         horizontal_walls: Set[Tuple[int, int]] = set()
         vertical_walls: Set[Tuple[int, int]] = set()
-        for orientation, row, col in walls:
+        for orientation, row, col in walls_frozenset:
             if orientation == WallOrientation.HORIZONTAL:
                 horizontal_walls.add((row, col))
             else:
                 vertical_walls.add((row, col))
+        self._walls_frozenset_cache_key = walls_frozenset
+        self._horizontal_walls_cache = horizontal_walls
+        self._vertical_walls_cache = vertical_walls
         return horizontal_walls, vertical_walls
 
     @staticmethod
@@ -979,12 +993,9 @@ class BarricadeState:
             row = int(row)
             col = int(col)
             new_state.walls.add((orientation, row, col))
-            new_state._blocked_edge_mask |= new_state._wall_edge_mask(
-                orientation,
-                row,
-                col,
-            )
-            new_state._wall_cache_key = frozenset(new_state.walls)
+            new_state._walls_frozenset = frozenset(new_state.walls)
+            new_state._blocked_edge_mask_cache = 0 # Invalidate blocked edge mask cache
+            new_state._walls_frozenset_cache_key = frozenset() # Invalidate walls frozenset cache key
             new_state.walls_left[new_state.current_player] -= 1
         else:
             raise ValueError(f"Unknown move type: {move_type!r}")
@@ -996,13 +1007,13 @@ class BarricadeState:
         action = int(action)
         if validate and action not in set(self.legal_actions()):
             raise ValueError(f"Illegal action {action} for current state.")
-        return self.apply_move(self.decode_action(action))
+        return self.apply_move(decode_action_for_board_size(action, self.board_size))
 
     def encode_move(self, move: Move) -> int:
         move_type = move[0]
         if move_type == "move":
             if len(move) != 2:
-                raise ValueError("Move actions must be ('move', direction).")
+                raise ValueError("Move actions must be (\"move\", direction).")
             _, direction = move
             if isinstance(direction, MoveDirection):
                 return direction.value
@@ -1104,9 +1115,9 @@ class BarricadeEnv(BaseEnv):
         invalid_action_penalty: float = -1.0,
     ) -> None:
         if invalid_action_mode not in {"terminate", "raise"}:
-            raise ValueError("invalid_action_mode must be 'terminate' or 'raise'.")
+            raise ValueError("invalid_action_mode must be \"terminate\" or \"raise\".")
         if render_mode not in {None, "ansi", "human"}:
-            raise ValueError("render_mode must be None, 'ansi', or 'human'.")
+            raise ValueError("render_mode must be None, \"ansi\", or \"human\".")
 
         self.starting_player = coerce_player(starting_player)
         self.red_start = coerce_position(red_start, "red_start")
@@ -1396,110 +1407,44 @@ class BarricadeEnv(BaseEnv):
             "lead": lead,
             "red_position": self.state.pawns[Player.RED],
             "blue_position": self.state.pawns[Player.BLUE],
-            "red_pawn_moves": self.pawn_moves[Player.RED],
-            "blue_pawn_moves": self.pawn_moves[Player.BLUE],
-            "red_moves_to_win": red_distance,
-            "blue_moves_to_win": blue_distance,
-            "n_moves": {
-                "RED": self.pawn_moves[Player.RED],
-                "BLUE": self.pawn_moves[Player.BLUE],
-            },
-            "N_moves": {
-                "RED": self.pawn_moves[Player.RED],
-                "BLUE": self.pawn_moves[Player.BLUE],
-            },
-            "moves_to_win": {
-                "RED": red_distance,
-                "BLUE": blue_distance,
-            },
             "red_walls_left": self.state.walls_left[Player.RED],
             "blue_walls_left": self.state.walls_left[Player.BLUE],
-            "red_initial_walls": self.state.initial_walls[Player.RED],
-            "blue_initial_walls": self.state.initial_walls[Player.BLUE],
-            "red_greedy_path_length": red_distance,
-            "blue_greedy_path_length": blue_distance,
-            "legal_actions": self.legal_actions(),
-            "action_mask": self.legal_action_mask(),
+            "red_path_length": red_distance,
+            "blue_path_length": blue_distance,
         }
 
-    def _render_ansi(self) -> str:
-        lines = [
-            f"Current: {self.state.current_player.name}",
-            f"Walls: RED={self.state.walls_left[Player.RED]} BLUE={self.state.walls_left[Player.BLUE]}",
-        ]
-        if self.state.winner:
-            lines.append(f"Winner: {self.state.winner.name}")
-
-        for row in range(BOARD_SIZE):
-            cells = []
-            for col in range(BOARD_SIZE):
-                cell = "."
-                if self.state.pawns[Player.RED] == (row, col):
-                    cell = "R"
-                elif self.state.pawns[Player.BLUE] == (row, col):
-                    cell = "B"
-                cells.append(cell)
-                if col < BOARD_SIZE - 1:
-                    cells.append("|" if self.state.is_blocked(row, col, row, col + 1) else " ")
-            lines.append(" ".join(cells))
-
-            if row < BOARD_SIZE - 1:
-                gaps = []
-                for col in range(BOARD_SIZE):
-                    gaps.append("-" if self.state.is_blocked(row, col, row + 1, col) else " ")
-                    if col < BOARD_SIZE - 1:
-                        gaps.append("+")
-                lines.append(" ".join(gaps))
-
-        return "\n".join(lines)
-
-    @staticmethod
-    def _normalize_distance(distance: Optional[int]) -> float:
-        if distance is None:
-            return 1.0
-        return min(float(distance) / float(BOARD_SIZE * BOARD_SIZE), 1.0)
-
-    def _normalize_wall_count(self, player: Player) -> float:
-        initial_count = self.state.initial_walls[player]
-        if initial_count <= 0:
-            return 0.0
-        return self.state.walls_left[player] / initial_count
-
-    def _terminal_lead(
-        self,
-        red_moves_to_win: Optional[int],
-        blue_moves_to_win: Optional[int],
-    ) -> Optional[int]:
-        if self.state.winner is None:
-            return None
-        if red_moves_to_win is None or blue_moves_to_win is None:
-            return None
-        return red_moves_to_win - blue_moves_to_win
-
-    @staticmethod
-    def _zeros(shape: Tuple[int, int, int]) -> Any:
+    def _zeros(self, shape: Tuple[int, ...]) -> Any:
         if np is not None:
             return np.zeros(shape, dtype=np.float32)
 
-        planes, rows, cols = shape
-        return [
-            [[0.0 for _ in range(cols)] for _ in range(rows)]
-            for _ in range(planes)
-        ]
+        # Fallback for when numpy is not installed.
+        if len(shape) == 3:
+            return [
+                [[0.0 for _ in range(shape[2])] for _ in range(shape[1])]
+                for _ in range(shape[0])
+            ]
+        if len(shape) == 2:
+            return [[0.0 for _ in range(shape[1])] for _ in range(shape[0])]
+        if len(shape) == 1:
+            return [0.0 for _ in range(shape[0])]
+        raise ValueError(f"Unsupported shape: {shape}")
 
+    def _normalize_wall_count(self, player: Player) -> float:
+        initial = self.state.initial_walls[player]
+        if initial == 0:
+            return 0.0
+        return self.state.walls_left[player] / initial
 
-def _demo() -> None:
-    env = BarricadeEnv(render_mode="ansi")
-    _, info = env.reset(seed=1)
-    action = env.sample_legal_action()
-    if action is not None:
-        _, reward, terminated, truncated, info = env.step(action)
-        print(
-            f"action={action} reward={reward} terminated={terminated} "
-            f"truncated={truncated} next_player={info['current_player']}"
-        )
-    print(env.render())
+    def _normalize_distance(self, distance: Optional[int]) -> float:
+        if distance is None:
+            return 1.0
+        return distance / (self.state.board_size - 1)
 
-
-if __name__ == "__main__":
-    _demo()
+    def _terminal_lead(self, red_distance: Optional[int], blue_distance: Optional[int]) -> float:
+        if red_distance is None and blue_distance is None:
+            return 0.0
+        if red_distance is None:
+            return -1.0
+        if blue_distance is None:
+            return 1.0
+        return (blue_distance - red_distance) / (self.state.board_size - 1)
