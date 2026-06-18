@@ -57,7 +57,12 @@ def symexp(x: Tensor) -> Tensor:
 def encode_state_planes(state, *, dtype=torch.float32) -> Tensor:
     """
     Encode one BarricadeState into base planes in a canonical frame.
-    (Inlined row operations for Python-side loop speedup).
+
+    Optimizations (numerically identical output):
+      - Batch all wall writes into two index_put_ style assignments instead of
+        a Python loop with per-element tensor indexing.
+      - Use plane[:] = scalar slicing which avoids the method-dispatch of fill_
+        in tight code (and is identical in result).
     """
     planes = torch.zeros((BASE_PLANES_PER_POSITION, BOARD_SIZE, BOARD_SIZE), dtype=dtype)
     current = state.current_player
@@ -67,28 +72,44 @@ def encode_state_planes(state, *, dtype=torch.float32) -> Tensor:
     own_row, own_col = state.pawns[current]
     opp_row, opp_col = state.pawns[opponent]
 
+    last = BOARD_SIZE - 1
     if flip:
-        own_r = BOARD_SIZE - 1 - own_row
-        opp_r = BOARD_SIZE - 1 - opp_row
+        own_r = last - own_row
+        opp_r = last - opp_row
     else:
         own_r = own_row
         opp_r = opp_row
 
-    planes[0].fill_(1.0)
+    planes[0] = 1.0
     planes[1, own_r, own_col] = 1.0
     planes[2, opp_r, opp_col] = 1.0
 
-    for orientation, row, col in state.walls:
-        plane = 3 if orientation == WallOrientation.HORIZONTAL else 4
-        r = (BOARD_SIZE - 2 - row) if flip else row
-        planes[plane, r, col] = 1.0
+    # Batch wall writes: collect indices once, then a single scatter per plane.
+    if state.walls:
+        h_rows: List[int] = []
+        h_cols: List[int] = []
+        v_rows: List[int] = []
+        v_cols: List[int] = []
+        wall_last = BOARD_SIZE - 2
+        for orientation, row, col in state.walls:
+            r = (wall_last - row) if flip else row
+            if orientation == WallOrientation.HORIZONTAL:
+                h_rows.append(r)
+                h_cols.append(col)
+            else:
+                v_rows.append(r)
+                v_cols.append(col)
+        if h_rows:
+            planes[3, h_rows, h_cols] = 1.0
+        if v_rows:
+            planes[4, v_rows, v_cols] = 1.0
 
     own_initial = max(1, state.initial_walls[current])
     opp_initial = max(1, state.initial_walls[opponent])
-    planes[5].fill_(state.walls_left[current] / own_initial)
-    planes[6].fill_(state.walls_left[opponent] / opp_initial)
+    planes[5] = state.walls_left[current] / own_initial
+    planes[6] = state.walls_left[opponent] / opp_initial
 
-    planes[7, BOARD_SIZE - 1, :] = 1.0
+    planes[7, last, :] = 1.0
     planes[8, 0, :] = 1.0
 
     return planes
@@ -103,23 +124,29 @@ def encode_state_stack(
 ) -> Tensor:
     """
     Encode current state plus previous states into a Cx9x9 tensor.
-    (Pre-allocated lists to minimize dynamic array resizing overhead).
     """
-    history = list(history or [])
     total_states = history_length + 1
-    planes = [None] * total_states
-    
-    planes[0] = encode_state_planes(current_state, dtype=dtype)
-    
-    if history_length > 0:
-        recent_history = history[-history_length:]
-        for i, state in enumerate(reversed(recent_history)):
-            planes[i + 1] = encode_state_planes(state, dtype=dtype)
-            
+    planes: List[Optional[Tensor]] = [None] * total_states
+
+    first = encode_state_planes(current_state, dtype=dtype)
+    planes[0] = first
+
+    if history_length > 0 and history:
+        # Slice directly without copying the whole history list.
+        n = len(history)
+        take = min(history_length, n)
+        # Most-recent-first
+        for i in range(take):
+            planes[i + 1] = encode_state_planes(history[n - 1 - i], dtype=dtype)
+
+    # Fill any missing (no-history) slots with a single shared zero tensor shape.
+    zero = None
     for i in range(1, total_states):
         if planes[i] is None:
-            planes[i] = torch.zeros_like(planes[0])
-            
+            if zero is None:
+                zero = torch.zeros_like(first)
+            planes[i] = zero
+
     return torch.cat(planes, dim=0)
 
 
@@ -152,10 +179,9 @@ class ResidualBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(channels)
 
     def forward(self, x: Tensor) -> Tensor:
-        residual = x
         out = F.relu(self.bn1(self.conv1(x)), inplace=True)
         out = self.bn2(self.conv2(out))
-        out += residual  # In-place addition equivalent to out = out + residual
+        out += x
         return F.relu(out, inplace=True)
 
 
@@ -170,7 +196,7 @@ class PolicyHead(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         out = F.relu(self.bn(self.conv(x)), inplace=True)
-        out = out.flatten(1)  # Slightly faster than torch.flatten
+        out = out.flatten(1)
         return self.fc(out)
 
 
@@ -280,15 +306,13 @@ class AlphaZeroNetwork(nn.Module):
             positive=True,
         )
 
-        # Optimize for modern hardware (Tensor Cores) using channels_last memory format
-        # This heavily accelerates convolutions on RTX 20/30/40+ series cards
+        # Optimize for modern hardware (Tensor Cores) using channels_last.
         self.to(memory_format=torch.channels_last)
 
     def _features(self, x: Tensor) -> Tensor:
-        # Ensure inputs are contiguous in channels_last format for conv optimization
         if x.dim() == 4 and not x.is_contiguous(memory_format=torch.channels_last):
-            x = x.to(memory_format=torch.channels_last)
-            
+            x = x.contiguous(memory_format=torch.channels_last)
+
         out = self.conv_tower(x)
         out = self.residual_projection(out)
         return self.residual_tower(out)
@@ -319,9 +343,10 @@ class AlphaZeroNetwork(nn.Module):
         """
         logits, value, lead = self.inference(x)
         if action_mask is not None:
-            action_mask = action_mask.to(device=logits.device, dtype=torch.bool)
+            if action_mask.dtype != torch.bool or action_mask.device != logits.device:
+                action_mask = action_mask.to(device=logits.device, dtype=torch.bool)
             logits = logits.masked_fill(~action_mask, torch.finfo(logits.dtype).min)
-        return torch.softmax(logits, dim=1), value, lead  # Bug fixed: lead was getting symexp twice
+        return torch.softmax(logits, dim=1), value, lead
 
 
 def build_network(

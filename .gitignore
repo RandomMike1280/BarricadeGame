@@ -3,3 +3,8 @@ __pycache__
 data/
 checkpoints/
 checkpoint_copies/
+*.log
+*.fls
+*.fdb_latexmk
+*.aux
+*.txt

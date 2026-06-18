@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 import random
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor
@@ -84,8 +84,6 @@ class SearchNode:
     value_estimate: Optional[float] = None
     lead_estimate: Optional[float] = None
     root_noise_applied: bool = False
-    # Cached terminal evaluation: None = not terminal or not yet checked,
-    # SearchEvaluation = terminal value/lead for this node's perspective.
     terminal_eval: Optional[SearchEvaluation] = None
 
     @property
@@ -125,14 +123,9 @@ class MCTSResult:
 class MCTS:
     """AlphaZero-style MCTS with batched neural-network evaluation.
 
-    Optimizations over the baseline:
-    - ``slots=True`` dataclasses for faster attribute access and lower memory.
-    - Cached terminal evaluations on nodes to avoid repeated winner checks.
-    - Single GPU synchronization point per batch via ``.tolist()``.
-    - Pure-Python prior (softmax) and Dirichlet-noise computation.
-    - Tight inner loops in ``_select_edge`` and ``_backpropagate`` with
-      local-variable binding and pre-computed constants.
-    - Iterative (non-recursive) virtual-visit clearing.
+    When ``inference_server`` is provided, all neural-network evaluations are
+    delegated to the server, which batches requests across multiple parallel
+    game workers for dramatically improved GPU utilization.
     """
 
     def __init__(
@@ -149,11 +142,16 @@ class MCTS:
         encode_move_fn: Optional[Callable[[Move], int]] = None,
         policy_action_transform: Optional[Callable[[int, BarricadeState], int]] = None,
         lead_transform: Optional[Callable[[float, BarricadeState], float]] = None,
+        inference_server: Optional[Any] = None,
     ) -> None:
         self.model = model
         self.config = config or MCTSConfig()
+        self._inference_server = inference_server
         self.device = self._resolve_device(device or self.config.device)
-        self.model.to(self.device)
+        # Only move model to device when NOT using an external server,
+        # since the server manages the model's device.
+        if inference_server is None:
+            self.model.to(self.device)
         self.rng = rng or random.Random()
         self.state_encoder = state_encoder or self._default_state_encoder
         self.action_size = int(action_size or ACTION_SIZE)
@@ -161,7 +159,7 @@ class MCTS:
         self.policy_action_transform = policy_action_transform
         self.lead_transform = lead_transform
 
-        # Pre-compute frequently used config values to avoid attribute lookups
+        # Pre-compute frequently used config values
         cfg = self.config
         self._history_length = cfg.history_length
         self._use_history = cfg.history_length > 0
@@ -237,8 +235,6 @@ class MCTS:
             if not pending and not terminal_paths:
                 break
 
-            # Backpropagate terminal paths first so their statistics are
-            # available for the next batch's selection.
             for path, evaluation in terminal_paths:
                 self._backpropagate(path, evaluation)
             completed += len(terminal_paths)
@@ -311,7 +307,6 @@ class MCTS:
             root.history = trimmed_history
             return root
         new_root = SearchNode(state.copy(), trimmed_history)
-        # Pre-check terminal status so _select_leaf can use the cache.
         winner_eval = self._winner_evaluation(new_root)
         if winner_eval is not None:
             new_root.terminal_eval = winner_eval
@@ -330,7 +325,6 @@ class MCTS:
         trim_history = self._trim_history
 
         while True:
-            # Fast path: cached terminal check
             te = node.terminal_eval
             if te is not None:
                 return "terminal", node, path, te
@@ -343,7 +337,6 @@ class MCTS:
 
             edges = node.edges
             if not edges:
-                # Expanded with no legal moves — terminal (stalemate).
                 eval_ = SearchEvaluation(
                     value=-1.0,
                     lead=self._state_lead(node.state),
@@ -363,7 +356,6 @@ class MCTS:
                 else:
                     history = ()
                 child = SearchNode(state=new_state, history=history)
-                # Pre-check terminal status for the new child.
                 child_eval = self._winner_evaluation(child)
                 if child_eval is not None:
                     child.terminal_eval = child_eval
@@ -371,13 +363,6 @@ class MCTS:
             node = child
 
     def _select_edge(self, node: SearchNode, edges: Dict[int, SearchEdge]) -> SearchEdge:
-        """Select the best edge using PUCT with FPU reduction and optional lead bonus.
-
-        Two-pass algorithm:
-        1. Aggregate parent statistics (total visits, value sums, explored prior).
-        2. Score each edge and pick the maximum.
-        """
-        # ---- Pass 1: aggregate parent statistics ----
         real_visits = 0
         parent_effective_visits = 0
         parent_value_sum = 0.0
@@ -394,7 +379,6 @@ class MCTS:
             if ev > 0:
                 explored_prior += edge.prior
 
-        # ---- Compute selection constants ----
         pev = parent_effective_visits if parent_effective_visits > 0 else 1
         cpuct = self._cpuct_fast(pev)
 
@@ -415,7 +399,6 @@ class MCTS:
             lead_weight = self._lead_weight
             inv_lead_scale = self._inv_lead_scale
 
-        # ---- Pass 2: select best edge ----
         best_score = -math.inf
         best_edge: Optional[SearchEdge] = None
 
@@ -423,7 +406,6 @@ class MCTS:
             v = edge.visits
             ev = v + edge.virtual_visits
 
-            # Q value: use actual if visited, otherwise FPU default
             if v > 0:
                 q = edge.value_sum / v
                 if use_lead:
@@ -433,7 +415,6 @@ class MCTS:
                 if use_lead:
                     lead_val = parent_lead_q
 
-            # PUCT exploration
             u = cpuct * edge.prior * sqrt_parent / (1.0 + ev)
 
             score = q + u
@@ -466,7 +447,6 @@ class MCTS:
             if legal_action_moves:
                 expandable.append((index, node, legal_action_moves))
             else:
-                # No legal moves — terminal
                 eval_ = SearchEvaluation(
                     value=-1.0,
                     lead=self._state_lead(node.state),
@@ -481,7 +461,7 @@ class MCTS:
         if not expandable:
             return [e for e in evaluations if e is not None]
 
-        # Build batch tensor
+        # Build batch tensor on CPU — the server (or .to(device)) handles GPU transfer
         batch = torch.stack(
             [
                 self.state_encoder(
@@ -492,22 +472,26 @@ class MCTS:
                 for _, node, _ in expandable
             ],
             dim=0,
-        ).to(self.device)
+        )
 
-        was_training = self.model.training
-        self.model.eval()
+        if self._inference_server is not None:
+            # Delegate to the batched inference server for cross-worker batching.
+            # The server collects requests from all parallel game workers and
+            # runs them as a single large batched forward pass.
+            logits_list, values_list, leads_list = self._inference_server.infer(batch)
+        else:
+            batch = batch.to(self.device)
+            was_training = self.model.training
+            self.model.eval()
 
-        # Single GPU sync point: convert all outputs to Python lists at once
-        with torch.inference_mode():
-            logits_t, values_t, leads_t = self._model_inference(batch)
-            # .tolist() triggers a single synchronization and gives us plain
-            # Python floats/lists — no further GPU sync needed downstream.
-            logits_list = logits_t.tolist()
-            values_list = values_t.view(-1).tolist()
-            leads_list = leads_t.view(-1).tolist()
+            with torch.inference_mode():
+                logits_t, values_t, leads_t = self._model_inference(batch)
+                logits_list = logits_t.tolist()
+                values_list = values_t.view(-1).tolist()
+                leads_list = leads_t.view(-1).tolist()
 
-        if was_training:
-            self.model.train()
+            if was_training:
+                self.model.train()
 
         policy_temperature = self._policy_temperature
 
@@ -563,20 +547,12 @@ class MCTS:
         state: BarricadeState,
         temperature: Optional[float] = None,
     ) -> Dict[int, float]:
-        """Compute masked softmax priors in pure Python.
-
-        ``logits`` may be a 1-D ``Tensor`` or a plain ``list`` of floats.
-        Working in Python avoids per-element tensor indexing and ``.item()``
-        calls, which are far slower for the small action counts typical of
-        board games.
-        """
         if not legal_actions:
             return {}
 
         if temperature is None:
             temperature = self._policy_temperature
 
-        # Convert tensor to list if needed (single sync if still on GPU)
         if isinstance(logits, Tensor):
             logits = logits.tolist()
 
@@ -585,7 +561,6 @@ class MCTS:
             for action in legal_actions
         ]
 
-        # Extract legal logits with NaN/Inf clamping
         n = len(network_actions)
         legal_logits = [0.0] * n
         for i in range(n):
@@ -600,7 +575,6 @@ class MCTS:
                 legal_logits[i] = val
 
         if temperature <= 0:
-            # Greedy: pick argmax
             best_idx = 0
             best_val = legal_logits[0]
             for i in range(1, n):
@@ -615,7 +589,6 @@ class MCTS:
         temp = temperature if temperature > 1e-6 else 1e-6
         max_logit = max(legal_logits)
 
-        # Numerically stable softmax in pure Python
         exp_values = [0.0] * n
         total = 0.0
         all_finite = True
@@ -638,7 +611,7 @@ class MCTS:
         }
 
     # ------------------------------------------------------------------
-    # Root Dirichlet noise (pure Python — avoids torch overhead)
+    # Root Dirichlet noise
     # ------------------------------------------------------------------
 
     def _add_root_dirichlet_noise(self, root: SearchNode) -> None:
@@ -654,7 +627,6 @@ class MCTS:
         actions = list(root.edges.keys())
         n = len(actions)
 
-        # Sample from Dirichlet via gamma variates — no torch needed
         gammavariate = self.rng.gammavariate
         noise = [gammavariate(alpha, 1.0) for _ in range(n)]
         total_noise = sum(noise)
@@ -672,7 +644,6 @@ class MCTS:
             edge = edges[actions[i]]
             edge.prior = one_minus_frac * edge.prior + fraction * noise[i]
 
-        # Renormalize
         total_prior = 0.0
         for edge in edges.values():
             total_prior += edge.prior
@@ -693,7 +664,6 @@ class MCTS:
     ) -> None:
         value = leaf_evaluation.value
         lead = leaf_evaluation.lead
-        # Walk from leaf to root, negating perspective at each ply.
         for i in range(len(path) - 1, -1, -1):
             edge = path[i]
             if edge.virtual_visits > 0:
@@ -711,11 +681,6 @@ class MCTS:
                 edge.virtual_visits -= 1
 
     def _clear_virtual_visits(self, root: Optional[SearchNode]) -> None:
-        """Iteratively reset virtual visits and in-flight counters.
-
-        Uses an explicit stack to avoid Python recursion overhead and
-        potential stack limits on large trees.
-        """
         if root is None:
             return
         stack: List[SearchNode] = [root]

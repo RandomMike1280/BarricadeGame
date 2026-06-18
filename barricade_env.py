@@ -260,6 +260,11 @@ def coerce_player(player: Player | str | int) -> Player:
         return player
     if isinstance(player, str):
         return Player[player.upper()]
+    if isinstance(player, int):
+        return Player(player)
+    # Handle cases where it might be a different Player enum from another module
+    if hasattr(player, 'value'):
+        return Player(player.value)
     return Player(player)
 
 
@@ -490,7 +495,7 @@ class BarricadeState:
             key == self._valid_moves_cache_key
             and self._valid_action_moves_cache is not None
         ):
-            return list(self._valid_action_moves_cache)
+            return self._valid_action_moves_cache
 
         action_moves = self._compute_valid_action_moves()
         self._cache_valid_action_moves(key, action_moves)
@@ -513,7 +518,16 @@ class BarricadeState:
     def action_mask(self) -> List[int]:
         """Return a 0/1 legal-action mask as a plain Python list."""
         mask = [0] * self.action_size
-        for action in self.legal_actions():
+        for action, _ in self.legal_action_moves():
+            mask[action] = 1
+        return mask
+
+    def action_mask_numpy(self) -> Any:
+        """Return a 0/1 legal-action mask as a NumPy array."""
+        if np is None:
+            return self.action_mask()
+        mask = np.zeros(self.action_size, dtype=np.int8)
+        for action, _ in self.legal_action_moves():
             mask[action] = 1
         return mask
 
@@ -633,17 +647,25 @@ class BarricadeState:
         vertical_walls: Optional[Set[Tuple[int, int]]] = None,
         base_blocked_edge_mask: Optional[int] = None,
     ) -> bool:
-        orientation = coerce_orientation(orientation)
+        # Avoid calling coerce_orientation if already an enum
+        if not isinstance(orientation, WallOrientation):
+            orientation = coerce_orientation(orientation)
+            
         if horizontal_walls is None or vertical_walls is None:
             horizontal_walls, vertical_walls = self._wall_lookup(self.walls)
-        if not self._is_wall_shape_available_from_sets(
-            orientation,
-            row,
-            col,
-            horizontal_walls,
-            vertical_walls,
-        ):
+        
+        # Inline availability check for speed
+        if row < 0 or row >= self.wall_board_size or col < 0 or col >= self.wall_board_size:
             return False
+
+        if orientation == WallOrientation.HORIZONTAL:
+            if (row, col) in horizontal_walls or (row, col - 1) in horizontal_walls or \
+               (row, col + 1) in horizontal_walls or (row, col) in vertical_walls:
+                return False
+        else:
+            if (row, col) in vertical_walls or (row - 1, col) in vertical_walls or \
+               (row + 1, col) in vertical_walls or (row, col) in horizontal_walls:
+                return False
 
         wall = (orientation, row, col)
         red_needs_search = red_route_blockers is None or wall in red_route_blockers
@@ -653,32 +675,25 @@ class BarricadeState:
 
         if base_blocked_edge_mask is None:
             base_blocked_edge_mask = self._current_blocked_edge_mask()
-        blocked_edge_mask = base_blocked_edge_mask | self._wall_edge_mask(
-            orientation,
-            row,
-            col,
-        )
-        can_reach_red = (
-            self._has_path_with_mask(
-                Player.RED,
-                blocked_edge_mask,
-            )
-            if red_needs_search
-            else True
-        )
-        can_reach_blue = (
-            can_reach_red
-            and (
-                self._has_path_with_mask(
-                    Player.BLUE,
-                    blocked_edge_mask,
-                )
-                if blue_needs_search
-                else True
-            )
-        )
+            
+        # Inline _wall_edge_mask
+        index = int(row) * self.wall_board_size + int(col)
+        if orientation == WallOrientation.HORIZONTAL:
+            w_mask = self._path_graph.horizontal_wall_masks[index]
+        else:
+            w_mask = self._path_graph.vertical_wall_masks[index]
+            
+        blocked_edge_mask = base_blocked_edge_mask | w_mask
+        
+        if red_needs_search:
+            if not self._has_path_with_mask(Player.RED, blocked_edge_mask):
+                return False
+        
+        if blue_needs_search:
+            if not self._has_path_with_mask(Player.BLUE, blocked_edge_mask):
+                return False
 
-        return can_reach_red and can_reach_blue
+        return True
 
     def is_wall_shape_available(
         self, orientation: WallOrientation | str | int, row: int, col: int
@@ -767,44 +782,26 @@ class BarricadeState:
         start = self.pawns[player]
         start_index = start[0] * self.board_size + start[1]
         graph = self._path_graph
-        if player == Player.RED:
-            goal_mask = graph.red_goal_mask
-            heuristics = graph.red_heuristics
-        else:
-            goal_mask = graph.blue_goal_mask
-            heuristics = graph.blue_heuristics
-
-        buckets: List[List[int]] = [[] for _ in range(self.board_size)]
-        current_heuristic = heuristics[start_index]
-        buckets[current_heuristic].append(start_index)
-        pending = 1
+        goal_mask = graph.red_goal_mask if player == Player.RED else graph.blue_goal_mask
+        
+        # Fast BFS for reachability
+        queue = [start_index]
         visited_mask = 1 << start_index
+        idx = 0
         adjacency = graph.adjacency
-        max_heuristic = self.board_size - 1
 
-        while pending:
-            while not buckets[current_heuristic]:
-                current_heuristic += 1
-                if current_heuristic > max_heuristic:
-                    current_heuristic = 0
-            cell_index = buckets[current_heuristic].pop()
-            pending -= 1
+        while idx < len(queue):
+            cell_index = queue[idx]
+            idx += 1
             if goal_mask & (1 << cell_index):
                 self._path_cache[key] = 1
                 return True
 
             for next_index, edge_mask in adjacency[cell_index]:
                 next_bit = 1 << next_index
-                if visited_mask & next_bit:
-                    continue
-                if blocked_edge_mask & edge_mask:
-                    continue
-                visited_mask |= next_bit
-                next_heuristic = heuristics[next_index]
-                buckets[next_heuristic].append(next_index)
-                pending += 1
-                if next_heuristic < current_heuristic:
-                    current_heuristic = next_heuristic
+                if not (visited_mask & next_bit) and not (blocked_edge_mask & edge_mask):
+                    visited_mask |= next_bit
+                    queue.append(next_index)
 
         self._path_cache[key] = 0
         return False
@@ -820,26 +817,27 @@ class BarricadeState:
         start_index = start[0] * self.board_size + start[1]
         graph = self._path_graph
         goal_mask = graph.red_goal_mask if player == Player.RED else graph.blue_goal_mask
-        queue = [(start_index, 0)]
+        
+        # Optimized BFS with two-list queue for distance tracking
+        current_level = [start_index]
         visited_mask = 1 << start_index
-        index = 0
+        distance = 0
         adjacency = graph.adjacency
 
-        while index < len(queue):
-            cell_index, distance = queue[index]
-            index += 1
-            if goal_mask & (1 << cell_index):
-                self._path_cache[key] = distance
-                return distance
+        while current_level:
+            next_level = []
+            for cell_index in current_level:
+                if goal_mask & (1 << cell_index):
+                    self._path_cache[key] = distance
+                    return distance
 
-            for next_index, edge_mask in adjacency[cell_index]:
-                next_bit = 1 << next_index
-                if visited_mask & next_bit:
-                    continue
-                if blocked_edge_mask & edge_mask:
-                    continue
-                visited_mask |= next_bit
-                queue.append((next_index, distance + 1))
+                for next_index, edge_mask in adjacency[cell_index]:
+                    next_bit = 1 << next_index
+                    if not (visited_mask & next_bit) and not (blocked_edge_mask & edge_mask):
+                        visited_mask |= next_bit
+                        next_level.append(next_index)
+            current_level = next_level
+            distance += 1
 
         self._path_cache[key] = None
         return None
@@ -886,19 +884,16 @@ class BarricadeState:
                 return result
 
             for next_index, edge_mask in adjacency[cell_index]:
-                if parent[next_index] != -1:
-                    continue
-                if blocked_edge_mask & edge_mask:
-                    continue
-                parent[next_index] = cell_index
-                heapq.heappush(
-                    frontier,
-                    (
-                        heuristics[next_index],
-                        distance + 1,
-                        next_index,
-                    ),
-                )
+                if parent[next_index] == -1 and not (blocked_edge_mask & edge_mask):
+                    parent[next_index] = cell_index
+                    heapq.heappush(
+                        frontier,
+                        (
+                            heuristics[next_index],
+                            distance + 1,
+                            next_index,
+                        ),
+                    )
 
         self._route_cache[key] = None
         return None
@@ -1005,8 +1000,10 @@ class BarricadeState:
 
     def apply_action(self, action: int, *, validate: bool = True) -> "BarricadeState":
         action = int(action)
-        if validate and action not in set(self.legal_actions()):
-            raise ValueError(f"Illegal action {action} for current state.")
+        if validate:
+            legal_actions = self.legal_actions()
+            if action not in legal_actions:
+                raise ValueError(f"Illegal action {action} for current state.")
         return self.apply_move(decode_action_for_board_size(action, self.board_size))
 
     def encode_move(self, move: Move) -> int:
@@ -1045,11 +1042,18 @@ def apply_selected_action(
     action: int,
     legal_actions: Sequence[int],
 ) -> BarricadeState:
-    if int(action) not in set(int(value) for value in legal_actions):
+    # Optimized check
+    is_legal = False
+    action_int = int(action)
+    for la in legal_actions:
+        if int(la) == action_int:
+            is_legal = True
+            break
+    if not is_legal:
         raise RuntimeError(
             f"Policy selected illegal action {action}; legal actions were {list(legal_actions)}"
         )
-    return state.apply_action(int(action), validate=False)
+    return state.apply_action(action_int, validate=False)
 
 
 def state_lead_for_player(state: BarricadeState, player: Player | str | int) -> float:
@@ -1204,24 +1208,34 @@ class BarricadeEnv(BaseEnv):
         self.terminated = False
         self.truncated = False
 
-        return self._get_observation(), self._get_info()
+        obs = self._get_observation()
+        # Extract distances from obs to avoid re-calculation
+        red_distance = int(obs["features"][3] * (self.state.board_size - 1)) if obs["features"][3] < 1.0 else None
+        blue_distance = int(obs["features"][4] * (self.state.board_size - 1)) if obs["features"][4] < 1.0 else None
+        
+        return obs, self._get_info(red_distance, blue_distance)
 
     def step(self, action: int) -> Tuple[Dict[str, Any], float, bool, bool, Dict[str, Any]]:
         if self.terminated or self.truncated:
             raise RuntimeError("step() called after episode ended. Call reset() first.")
 
         acting_player = self.state.current_player
+        action_int = int(action)
 
-        try:
-            decoded_move = decode_action(int(action))
-        except (TypeError, ValueError) as exc:
-            return self._handle_invalid_action(action, acting_player, str(exc))
-
-        legal_action_set = set(self.legal_actions())
-        if int(action) not in legal_action_set:
+        # Faster legal check
+        legal_actions = self.state.legal_actions()
+        if action_int not in legal_actions:
+            # Re-check with full validation if it might be a decoding error
+            try:
+                decode_action_for_board_size(action_int, self.state.board_size)
+            except (TypeError, ValueError) as exc:
+                return self._handle_invalid_action(action_int, acting_player, str(exc))
+            
             return self._handle_invalid_action(
-                action, acting_player, f"Illegal action for current state: {action}"
+                action_int, acting_player, f"Illegal action for current state: {action_int}"
             )
+        
+        decoded_move = decode_action_for_board_size(action_int, self.state.board_size)
 
         self.state = self.state.apply_move(decoded_move)
         if decoded_move[0] == "move":
@@ -1243,16 +1257,21 @@ class BarricadeEnv(BaseEnv):
         elif self.steps >= self.max_steps:
             self.truncated = True
 
-        info = self._get_info()
+        obs = self._get_observation()
+        # Extract distances from obs to avoid re-calculation
+        red_distance = int(obs["features"][3] * (self.state.board_size - 1)) if obs["features"][3] < 1.0 else None
+        blue_distance = int(obs["features"][4] * (self.state.board_size - 1)) if obs["features"][4] < 1.0 else None
+
+        info = self._get_info(red_distance, blue_distance)
         info.update(
             {
                 "acting_player": acting_player.name,
-                "last_action": int(action),
+                "last_action": action_int,
                 "last_move": self.move_to_dict(decoded_move),
                 "invalid_action": False,
             }
         )
-        return self._get_observation(), reward, self.terminated, self.truncated, info
+        return obs, reward, self.terminated, self.truncated, info
 
     def legal_moves(self) -> List[Move]:
         return self.state.legal_moves()
@@ -1364,7 +1383,10 @@ class BarricadeEnv(BaseEnv):
         return self._get_observation(), self.invalid_action_penalty, True, False, info
 
     def _get_observation(self) -> Dict[str, Any]:
-        board = self._zeros((4, BOARD_SIZE, BOARD_SIZE))
+        if np is not None:
+            board = np.zeros((4, BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+        else:
+            board = self._zeros((4, BOARD_SIZE, BOARD_SIZE))
 
         red_row, red_col = self.state.pawns[Player.RED]
         blue_row, blue_col = self.state.pawns[Player.BLUE]
@@ -1375,8 +1397,10 @@ class BarricadeEnv(BaseEnv):
             plane = 2 if orientation == WallOrientation.HORIZONTAL else 3
             board[plane][row][col] = 1.0
 
-        red_distance = self.state.greedy_path_length(Player.RED)
-        blue_distance = self.state.greedy_path_length(Player.BLUE)
+        # Greedy distances are often requested together
+        red_distance = self.state.shortest_path_length(Player.RED)
+        blue_distance = self.state.shortest_path_length(Player.BLUE)
+        
         features_data = [
             float(self.state.current_player.value),
             self._normalize_wall_count(Player.RED),
@@ -1387,18 +1411,22 @@ class BarricadeEnv(BaseEnv):
 
         if np is not None:
             features = np.array(features_data, dtype=np.float32)
+            mask = self.state.action_mask_numpy()
         else:
             features = features_data
+            mask = self.state.action_mask()
 
         return {
             "board": board,
             "features": features,
-            "action_mask": self.legal_action_mask(),
+            "action_mask": mask,
         }
 
-    def _get_info(self) -> Dict[str, Any]:
-        red_distance = self.state.greedy_path_length(Player.RED)
-        blue_distance = self.state.greedy_path_length(Player.BLUE)
+    def _get_info(self, red_distance=None, blue_distance=None) -> Dict[str, Any]:
+        if red_distance is None:
+            red_distance = self.state.greedy_path_length(Player.RED)
+        if blue_distance is None:
+            blue_distance = self.state.greedy_path_length(Player.BLUE)
         lead = self._terminal_lead(red_distance, blue_distance)
         return {
             "current_player": self.state.current_player.name,
@@ -1448,3 +1476,46 @@ class BarricadeEnv(BaseEnv):
         if blue_distance is None:
             return 1.0
         return (blue_distance - red_distance) / (self.state.board_size - 1)
+
+    def _render_ansi(self) -> str:
+        """Render the board as an ANSI string."""
+        board_size = self.board_size
+        wall_board_size = self.wall_board_size
+        horizontal_walls, vertical_walls = self.state._wall_lookup(self.state.walls)
+        
+        red_pos = self.state.pawns[Player.RED]
+        blue_pos = self.state.pawns[Player.BLUE]
+        
+        lines = []
+        for r in range(board_size):
+            # Pawn row
+            row_str = ""
+            for c in range(board_size):
+                if (r, c) == red_pos:
+                    row_str += "R"
+                elif (r, c) == blue_pos:
+                    row_str += "B"
+                else:
+                    row_str += "."
+                
+                if c < wall_board_size:
+                    if (r, c) in vertical_walls or (r-1, c) in vertical_walls:
+                        row_str += "|"
+                    else:
+                        row_str += " "
+            lines.append(row_str)
+            
+            # Wall row
+            if r < wall_board_size:
+                wall_row_str = ""
+                for c in range(board_size):
+                    if (r, c) in horizontal_walls or (r, c-1) in horizontal_walls:
+                        wall_row_str += "-"
+                    else:
+                        wall_row_str += " "
+                    
+                    if c < wall_board_size:
+                        wall_row_str += "+"
+                lines.append(wall_row_str)
+        
+        return "\n".join(lines)
