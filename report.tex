@@ -3,8 +3,7 @@
 \usepackage[a4paper,margin=2.5cm]{geometry}
 \usepackage{graphicx}
 \usepackage{fontspec}
-\newfontfamily\titlefont{Papyrus}
-\setmainfont{Papyrus}
+\newfontfamily\titlefont{Lora}
 \usepackage{amsmath, amssymb}
 \usepackage{xcolor}
 \usepackage{hyperref}
@@ -18,18 +17,23 @@
 \begin{document}
 
 \maketitle
+\begin{abstract}
+This technical report describes Wium, a system trained to play Quoridor from scratch with no prior human knowledge. AlphaZero-style self-play reinforcement learning had proven success for many board games, and I continue to apply it to the game Quoridor. Here, I describe a set of techniques I applied to improve the training process and the final performance of the model along with the training methodology and the experimental results.
+\end{abstract}
 
 \newpage
 \tableofcontents
 \newpage
 
-\begin{abstract}
-This technical report describes Wium, a system trained to play Quoridor from scratch with no prior human knowledge. AlphaZero-style self-play reinforcement learning had proven success for many board games, and I continue to apply it to the game Quoridor. Here, I describes a set of techniques I applied to improve the training process and the final performance of the model
-\end{abstract}
-
 \section{Introduction}
-...
+Wium (stands for 'what is your move') is a system trained to play Quoridor, a two-player board game, from scratch with no prior human knowledge.
 
+\subsection{Existing Work}
+AlphaZero \cite{silver2017mastering} is a reinforcement learning algorithm that achieved superhuman performance across multiple board games, including chess, shogi, and Go. It combines deep neural networks with Monte Carlo Tree Search (MCTS) to learn optimal strategies through self-play. The success of AlphaZero has inspired researchers to apply similar techniques to other games, including Quoridor.
+
+Leela Chess Zero \cite{leela} continues the legacy of AlphaZero by focusing on chess. It is an open-source project that uses a similar self-play reinforcement learning approach to train a neural network to play chess at a high level. Leela Chess Zero has achieved impressive results, demonstrating the effectiveness of the AlphaZero approach in the domain of chess. Lc0 had improved over the years upon existing methods inhereited from AlphaZero, such as using a more efficient neural network architecture, optimizing the MCTS algorithm, and incorporating various training techniques to enhance performance.
+
+KataGo \cite{kata} is another project that applies the AlphaZero approach to the game of Go. It has achieved superhuman performance in the game of Go using far less computational resources than AlphaZero and AlphaGo Zero. KataGo incorporates various techniques to improve training efficiency and performance, mainly richer gradients, more efficient neural networks and better training techniques.
 \section{Method}
 ...
 
