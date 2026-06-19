@@ -1140,7 +1140,7 @@ def run_loop(
             flush=True,
         )
 
-        if metrics["win_rate"] >= 0.4:
+        if metrics["win_rate"] >= 0.5:
             current_checkpoint = candidate_path
             _copy_latest(candidate_path)
             print(

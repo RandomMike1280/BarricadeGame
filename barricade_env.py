@@ -18,7 +18,7 @@ The action space is fixed at 132 discrete actions:
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import Enum, IntEnum
 import heapq
 import random
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
@@ -63,7 +63,7 @@ def action_size_for_board_size(board_size: int) -> int:
     return MOVE_ACTIONS + wall_board_size * wall_board_size * 2
 
 
-class Player(Enum):
+class Player(IntEnum):
     RED = 0
     BLUE = 1
 
@@ -71,12 +71,12 @@ class Player(Enum):
         return Player.BLUE if self == Player.RED else Player.RED
 
 
-class WallOrientation(Enum):
+class WallOrientation(IntEnum):
     HORIZONTAL = 0
     VERTICAL = 1
 
 
-class MoveDirection(Enum):
+class MoveDirection(IntEnum):
     UP = 0
     DOWN = 1
     LEFT = 2
