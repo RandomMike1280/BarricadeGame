@@ -363,13 +363,16 @@ class MCTS:
             node = child
 
     def _select_edge(self, node: SearchNode, edges: Dict[int, SearchEdge]) -> SearchEdge:
+        # Materialize the edge list once and reuse it for both passes.
+        edge_list = list(edges.values())
+
         real_visits = 0
         parent_effective_visits = 0
         parent_value_sum = 0.0
         parent_lead_sum = 0.0
         explored_prior = 0.0
 
-        for edge in edges.values():
+        for edge in edge_list:
             v = edge.visits
             ev = v + edge.virtual_visits
             real_visits += v
@@ -393,33 +396,37 @@ class MCTS:
             explored_prior if explored_prior > 0.0 else 0.0
         )
         sqrt_parent = math.sqrt(pev)
+        cpuct_sqrt_parent = cpuct * sqrt_parent
 
         use_lead = self._use_lead_bonus
         if use_lead:
             lead_weight = self._lead_weight
             inv_lead_scale = self._inv_lead_scale
+            # Unvisited edges all share parent_lead_q, so their lead bonus is
+            # constant within this call: compute it once.
+            fpu_lead_bonus = lead_weight * math.tanh(parent_lead_q * inv_lead_scale)
+            # Score contribution of the FPU branch (q + lead) is also constant.
+            fpu_q_plus_lead = fpu_q + fpu_lead_bonus
+        else:
+            fpu_q_plus_lead = fpu_q
 
         best_score = -math.inf
         best_edge: Optional[SearchEdge] = None
 
-        for edge in edges.values():
+        for edge in edge_list:
             v = edge.visits
             ev = v + edge.virtual_visits
 
+            u = cpuct_sqrt_parent * edge.prior / (1.0 + ev)
+
             if v > 0:
-                q = edge.value_sum / v
+                score = edge.value_sum / v + u
                 if use_lead:
-                    lead_val = edge.lead_sum / v
+                    score += lead_weight * math.tanh(
+                        (edge.lead_sum / v) * inv_lead_scale
+                    )
             else:
-                q = fpu_q
-                if use_lead:
-                    lead_val = parent_lead_q
-
-            u = cpuct * edge.prior * sqrt_parent / (1.0 + ev)
-
-            score = q + u
-            if use_lead:
-                score += lead_weight * math.tanh(lead_val * inv_lead_scale)
+                score = fpu_q_plus_lead + u
 
             if score > best_score:
                 best_score = score
@@ -527,15 +534,13 @@ class MCTS:
         legal_actions = [action for action, _ in legal_action_moves]
         priors = self._masked_priors(logits, legal_actions, node.state, policy_temperature)
 
-        edges = {
-            action: SearchEdge(
-                action=action,
-                move=move,
-                prior=priors.get(action, 0.0),
-            )
-            for action, move in legal_action_moves
+        # legal_action_moves is already in ascending action order (pawn actions
+        # 0-3, then walls at strictly increasing offsets), so build the edge
+        # dict directly in that order without re-sorting.
+        node.edges = {
+            action: SearchEdge(action=action, move=move, prior=prior)
+            for (action, move), prior in zip(legal_action_moves, priors)
         }
-        node.edges = dict(sorted(edges.items()))
         node.value_estimate = evaluation.value
         node.lead_estimate = evaluation.lead
         node.is_expanded = True
@@ -546,9 +551,10 @@ class MCTS:
         legal_actions: Sequence[int],
         state: BarricadeState,
         temperature: Optional[float] = None,
-    ) -> Dict[int, float]:
+    ) -> List[float]:
+        """Return masked priors as a list aligned to ``legal_actions`` order."""
         if not legal_actions:
-            return {}
+            return []
 
         if temperature is None:
             temperature = self._policy_temperature
@@ -556,10 +562,15 @@ class MCTS:
         if isinstance(logits, Tensor):
             logits = logits.tolist()
 
-        network_actions = [
-            self._network_action(action, state)
-            for action in legal_actions
-        ]
+        # Map legal actions to network indices. Skip the per-action function
+        # call entirely when there is no transform (the common case).
+        transform = self.policy_action_transform
+        if transform is None:
+            network_actions = legal_actions
+        else:
+            network_actions = [
+                int(transform(int(action), state)) for action in legal_actions
+            ]
 
         n = len(network_actions)
         legal_logits = [0.0] * n
@@ -581,10 +592,9 @@ class MCTS:
                 if legal_logits[i] > best_val:
                     best_val = legal_logits[i]
                     best_idx = i
-            return {
-                legal_actions[i]: (1.0 if i == best_idx else 0.0)
-                for i in range(n)
-            }
+            priors = [0.0] * n
+            priors[best_idx] = 1.0
+            return priors
 
         temp = temperature if temperature > 1e-6 else 1e-6
         max_logit = max(legal_logits)
@@ -602,13 +612,10 @@ class MCTS:
 
         if total <= 0 or not all_finite:
             uniform = 1.0 / n
-            return {action: uniform for action in legal_actions}
+            return [uniform] * n
 
         inv_total = 1.0 / total
-        return {
-            legal_actions[i]: exp_values[i] * inv_total
-            for i in range(n)
-        }
+        return [e * inv_total for e in exp_values]
 
     # ------------------------------------------------------------------
     # Root Dirichlet noise
@@ -913,12 +920,15 @@ class MCTS:
             return int(state.encode_move(move))
         return int(encode_move(move))
 
-    def _legal_action_moves(self, state: BarricadeState) -> List[Tuple[int, Move]]:
-        if hasattr(state, "legal_action_moves"):
-            return [
-                (int(action), move)
-                for action, move in state.legal_action_moves()
-            ]
+    def _legal_action_moves(
+        self, state: BarricadeState
+    ) -> Sequence[Tuple[int, Move]]:
+        legal_action_moves = getattr(state, "legal_action_moves", None)
+        if legal_action_moves is not None:
+            # The env already returns a cached, ascending-order tuple of
+            # (int_action, move) pairs. It is consumed read-only downstream, so
+            # reuse it directly instead of rebuilding the list every call.
+            return legal_action_moves()
         legal_moves = state.legal_moves()
         return [
             (self._encode_move(move, state), move)

@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field, replace
 import queue
 from pathlib import Path
 import random
+import re
 import shutil
 import sys
 import threading
@@ -77,6 +78,10 @@ class TrainConfig:
     replay_dir: str = str(SELFPLAY_DIR)
     checkpoint_dir: str = str(CHECKPOINT_DIR)
     replay_limit: Optional[int] = None
+    replay_max_iteration: Optional[int] = None
+    # Sliding replay window: train only on the last N iterations of self-play
+    # data. Default 1 == on-policy (current iteration only). 0/None == unbounded.
+    replay_window_size: Optional[int] = 1
     epochs: int = 1
     batch_size: int = 256
     learning_rate: float = 1e-3
@@ -328,17 +333,120 @@ class BatchInferenceServer:
 # Replay dataset
 # ======================================================================
 
+def _is_decisive_game(winner: Any, truncated: bool) -> bool:
+    return winner is not None and not truncated
+
+
+def _is_decisive_replay_sample(sample: Dict[str, Any]) -> bool:
+    return _is_decisive_game(
+        sample.get("winner"),
+        bool(sample.get("truncated", False)),
+    )
+
+
+_REPLAY_ITERATION_RE = re.compile(r"^iter_(\d+)_chunk_\d+\.pt$")
+
+
+def _replay_iteration_from_path(path: Path) -> Optional[int]:
+    match = _REPLAY_ITERATION_RE.match(path.name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _policy_target_is_legal(sample: Dict[str, Any]) -> bool:
+    target = sample.get("policy_target")
+    if target is None:
+        return False
+    policy_target = torch.as_tensor(target, dtype=torch.float32)
+    mask = torch.as_tensor(
+        sample.get("mask", torch.ones_like(policy_target)),
+        dtype=torch.bool,
+    )
+    if policy_target.numel() != mask.numel():
+        return False
+    total_mass = float(policy_target.sum().item())
+    if not torch.isfinite(policy_target).all() or total_mass <= 1.0e-8:
+        return False
+    illegal_mass = float(policy_target[~mask].abs().sum().item())
+    return illegal_mass <= 1.0e-5
+
+
+def _renormalize_policy_target(policy_target: Tensor, mask: Tensor) -> Tensor:
+    mask = mask.to(device=policy_target.device, dtype=torch.bool)
+    legal_target = policy_target.masked_fill(~mask, 0.0)
+    row_sum = legal_target.sum(dim=1, keepdim=True)
+    legal_count = mask.sum(dim=1, keepdim=True)
+    uniform = mask.to(dtype=policy_target.dtype) / legal_count.clamp_min(1)
+    normalized = legal_target / row_sum.clamp_min(1.0e-8)
+    return torch.where(row_sum > 1.0e-8, normalized, uniform)
+
+
 class ReplayDataset(Dataset):
-    def __init__(self, replay_dir: str | Path, limit: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        replay_dir: str | Path,
+        limit: Optional[int] = None,
+        *,
+        max_iteration: Optional[int] = None,
+        min_iteration: Optional[int] = None,
+    ) -> None:
         self.replay_dir = Path(replay_dir)
-        self.samples: List[Dict[str, Any]] = []
+        samples: List[Dict[str, Any]] = []
+        self.skipped_future_chunks = 0
+        self.skipped_old_chunks = 0
         for path in sorted(self.replay_dir.glob("*.pt")):
+            replay_iteration = _replay_iteration_from_path(path)
+            if (
+                max_iteration is not None
+                and replay_iteration is not None
+                and replay_iteration > max_iteration
+            ):
+                self.skipped_future_chunks += 1
+                continue
+            if (
+                min_iteration is not None
+                and replay_iteration is not None
+                and replay_iteration < min_iteration
+            ):
+                self.skipped_old_chunks += 1
+                continue
             payload = torch.load(path, map_location="cpu", weights_only=False)
-            self.samples.extend(payload.get("samples", []))
+            samples.extend(payload.get("samples", []))
+
+        self.total_samples_loaded = len(samples)
+        decisive_samples = [
+            sample for sample in samples if _is_decisive_replay_sample(sample)
+        ]
+        bad_policy_games = set()
+        bad_policy_ungrouped = set()
+        for index, sample in enumerate(decisive_samples):
+            if _policy_target_is_legal(sample):
+                continue
+            game_id = sample.get("game_id")
+            if game_id is None:
+                bad_policy_ungrouped.add(index)
+            else:
+                bad_policy_games.add(game_id)
+
+        self.samples = [
+            sample
+            for index, sample in enumerate(decisive_samples)
+            if sample.get("game_id") not in bad_policy_games
+            and index not in bad_policy_ungrouped
+        ]
+        self.filtered_samples = self.total_samples_loaded - len(decisive_samples)
+        self.filtered_policy_samples = len(decisive_samples) - len(self.samples)
+        self.filtered_policy_games = len(bad_policy_games)
+        self.replay_max_iteration = max_iteration
+        self.replay_min_iteration = min_iteration
+
         if limit is not None and limit > 0 and len(self.samples) > limit:
             self.samples = self.samples[-limit:]
         if not self.samples:
-            raise ValueError(f"No replay samples found in {self.replay_dir}")
+            raise ValueError(
+                f"No non-truncated, non-draw replay samples found in {self.replay_dir}"
+            )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -352,6 +460,10 @@ class ReplayDataset(Dataset):
             sample.get("mask", torch.ones(ACTION_SIZE)), dtype=torch.bool
         )
         policy_target = sample["policy_target"].float()
+        policy_target = _renormalize_policy_target(
+            policy_target.unsqueeze(0),
+            mask.unsqueeze(0),
+        ).squeeze(0)
         value_target = torch.as_tensor(sample["value_target"], dtype=torch.float32)
         lead_target = torch.as_tensor(
             sample.get("lead_target", sample.get("lead", 0.0)) or 0.0,
@@ -495,7 +607,7 @@ def _run_single_game_worker(
     game_start = time.time()
 
     handicap = sample_valid_handicap(config.base_walls, rng)
-    env = BarricadeEnv(max_steps=config.max_steps)
+    env = BarricadeEnv(max_steps=config.max_steps, invalid_action_mode="raise")
     _, info = env.reset(options=_env_options(handicap))
     history: List[Any] = []
     pending: List[Dict[str, Any]] = []
@@ -541,6 +653,12 @@ def _run_single_game_worker(
 
         result = mcts.search(state_before, history=history_before, root=root)
         action = mcts.select_action(result, temperature=temp)
+        legal_actions = list(env.legal_actions())
+        if int(action) not in set(legal_actions):
+            raise RuntimeError(
+                f"MCTS selected illegal action {action} at ply {ply} "
+                f"for {player_to_move.name}; legal actions were {legal_actions}"
+            )
 
         pending.append(
             {
@@ -554,7 +672,7 @@ def _run_single_game_worker(
                     player_to_move,
                 ),
                 "value_target": 0.0,
-                "legal_actions": list(env.legal_actions()),
+                "legal_actions": legal_actions,
                 "side_to_move": player_to_move.name,
                 "action": int(action),
                 "game_id": game_id,
@@ -619,6 +737,21 @@ def _run_single_game_worker(
 # Parallel self-play
 # ======================================================================
 
+def _clear_replay_iteration(output_dir: Path, iteration: int) -> int:
+    removed = 0
+    pattern = f"iter_{iteration:06d}_chunk_*.pt"
+    for path in output_dir.glob(pattern):
+        path.unlink()
+        removed += 1
+    if removed:
+        print(
+            f"[{_timestamp()}] [self-play] removed {removed} stale replay chunks "
+            f"for iteration {iteration}",
+            flush=True,
+        )
+    return removed
+
+
 def run_self_play(
     model: nn.Module,
     network_config: NetworkConfig,
@@ -633,6 +766,7 @@ def run_self_play(
     rng = random.Random(config.seed)
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    _clear_replay_iteration(output_dir, config.iteration)
     model.eval()
 
     num_workers = max(1, config.num_workers)
@@ -660,6 +794,8 @@ def run_self_play(
     written_chunks: List[Path] = []
     chunk_index = 0
     completed_games = 0
+    skipped_games = 0
+    total_samples_generated = 0
     total_samples_collected = 0
     start_time = time.time()
 
@@ -691,9 +827,18 @@ def run_self_play(
                     completed_games += 1
                     continue
 
-                all_samples.extend(game_samples)
+                total_samples_generated += len(game_samples)
+                keep_game = _is_decisive_game(
+                    game_info.get("winner"),
+                    bool(game_info.get("truncated", False)),
+                )
+                kept_samples = len(game_samples) if keep_game else 0
+                if keep_game:
+                    all_samples.extend(game_samples)
+                    total_samples_collected += kept_samples
+                else:
+                    skipped_games += 1
                 completed_games += 1
-                total_samples_collected += len(game_samples)
 
                 winner_str = game_info.get("winner") or "draw"
                 steps = game_info.get("steps") or 0
@@ -711,9 +856,10 @@ def run_self_play(
                     f"(idx={game_index}) "
                     f"winner={winner_str} steps={steps} "
                     f"trunc={trunc} mode={handicap_mode} "
-                    f"samples={len(game_samples)} "
+                    f"samples={len(game_samples)} kept={kept_samples} "
                     f"time={_format_duration(game_elapsed)} "
-                    f"| total_samples={total_samples_collected} "
+                    f"| total_kept={total_samples_collected} "
+                    f"skipped_games={skipped_games} "
                     f"games/s={games_per_sec:.2f} "
                     f"samples/s={samples_per_sec:.1f} "
                     f"nn_avg_batch={nn_stats['avg_batch_size']:.1f} "
@@ -757,7 +903,9 @@ def run_self_play(
     print(
         f"[{_timestamp()}] [self-play] DONE iteration {config.iteration}: "
         f"games={completed_games} chunks={len(written_chunks)} "
-        f"total_samples={total_samples_collected} "
+        f"skipped_games={skipped_games} "
+        f"generated_samples={total_samples_generated} "
+        f"kept_samples={total_samples_collected} "
         f"elapsed={_format_duration(elapsed)} "
         f"games/s={completed_games / max(elapsed, 0.001):.2f} "
         f"nn_batches={nn_stats['total_batches']} "
@@ -788,7 +936,28 @@ def train_from_replay(
     )
     model.to(resolved_device)
 
-    dataset = ReplayDataset(config.replay_dir, config.replay_limit)
+    if config.replay_window_size is not None and config.replay_window_size > 0:
+        # Anchor the window at the explicit max iteration if given, otherwise at
+        # the iteration currently being trained. The window is [anchor-N+1, anchor],
+        # so chunks older than the window AND any stray future chunks are skipped.
+        replay_window_anchor = (
+            config.replay_max_iteration
+            if config.replay_max_iteration is not None
+            else config.iteration
+        )
+        replay_min_iteration: Optional[int] = max(
+            1, replay_window_anchor - config.replay_window_size + 1
+        )
+        replay_max_iteration: Optional[int] = replay_window_anchor
+    else:
+        replay_min_iteration = None
+        replay_max_iteration = config.replay_max_iteration
+    dataset = ReplayDataset(
+        config.replay_dir,
+        config.replay_limit,
+        max_iteration=replay_max_iteration,
+        min_iteration=replay_min_iteration,
+    )
     use_pin_memory = resolved_device.type == "cuda"
     loader = DataLoader(
         dataset,
@@ -810,6 +979,13 @@ def train_from_replay(
     print(
         f"[{_timestamp()}] [train] starting iteration {config.iteration}: "
         f"samples={len(dataset)} epochs={config.epochs} "
+        f"filtered_samples={dataset.filtered_samples} "
+        f"filtered_policy_samples={dataset.filtered_policy_samples} "
+        f"filtered_policy_games={dataset.filtered_policy_games} "
+        f"skipped_future_chunks={dataset.skipped_future_chunks} "
+        f"skipped_old_chunks={dataset.skipped_old_chunks} "
+        f"replay_min_iteration={dataset.replay_min_iteration} "
+        f"replay_max_iteration={dataset.replay_max_iteration} "
         f"batch_size={config.batch_size} lr={config.learning_rate} "
         f"device={resolved_device}",
         flush=True,
@@ -972,7 +1148,7 @@ def evaluate_models(
     for game_index in range(config.games):
         game_start = time.time()
         candidate_player = Player.RED if game_index % 2 == 0 else Player.BLUE
-        env = BarricadeEnv(max_steps=config.max_steps)
+        env = BarricadeEnv(max_steps=config.max_steps, invalid_action_mode="raise")
         handicap = sample_valid_handicap(config.base_walls, rng)
         _, info = env.reset(options=_env_options(handicap))
         history = []
@@ -994,7 +1170,11 @@ def evaluate_models(
             model = candidate_model if current == candidate_player else baseline_model
             state_before = env.state.copy()
             history_before = _history_window(history, network_config.history_length)
-            mcts = MCTS(model, mcts_config)
+            mcts = MCTS(
+                model,
+                mcts_config,
+                policy_action_transform=policy_action_for_mcts,
+            )
             result = mcts.search(state_before, history=history_before, root=roots[current])
             action = mcts.select_action(result, temperature=0.0)
             history.append(state_before)
@@ -1095,7 +1275,16 @@ def run_loop(
 
         # --- Training ---
         print(f"[{_timestamp()}] [loop] >>> training phase", flush=True)
-        tr_config = replace(train_config, iteration=iteration)
+        replay_max_iteration = (
+            train_config.replay_max_iteration
+            if train_config.replay_max_iteration is not None
+            else iteration
+        )
+        tr_config = replace(
+            train_config,
+            iteration=iteration,
+            replay_max_iteration=replay_max_iteration,
+        )
         tr_start = time.time()
         candidate_path = train_from_replay(
             model,
@@ -1145,7 +1334,7 @@ def run_loop(
             _copy_latest(candidate_path)
             print(
                 f"[{_timestamp()}] [loop] candidate PROMOTED "
-                f"(win_rate={metrics['win_rate']:.1%} >= 0.4)",
+                f"(win_rate={metrics['win_rate']:.1%} >= 0.5)",
                 flush=True,
             )
         else:
@@ -1154,7 +1343,7 @@ def run_loop(
             )
             print(
                 f"[{_timestamp()}] [loop] candidate REJECTED "
-                f"(win_rate={metrics['win_rate']:.1%} < 0.4), "
+                f"(win_rate={metrics['win_rate']:.1%} < 0.5), "
                 f"reverting to previous checkpoint",
                 flush=True,
             )
@@ -1425,6 +1614,14 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--replay-dir", type=str, default=str(SELFPLAY_DIR))
     train.add_argument("--checkpoint-dir", type=str, default=str(CHECKPOINT_DIR))
     train.add_argument("--replay-limit", type=int, default=None)
+    train.add_argument("--replay-max-iteration", type=int, default=None)
+    train.add_argument(
+        "--replay-window-size",
+        type=int,
+        default=1,
+        help="Train on the last N iterations of self-play data "
+        "(1=on-policy, 0=unbounded).",
+    )
     train.add_argument("--epochs", type=int, default=1)
     train.add_argument("--train-batch-size", type=int, default=256)
     train.add_argument("--learning-rate", type=float, default=1e-3)
@@ -1460,6 +1657,14 @@ def parse_args() -> argparse.Namespace:
     loop.add_argument("--replay-dir", type=str, default=str(SELFPLAY_DIR))
     loop.add_argument("--checkpoint-dir", type=str, default=str(CHECKPOINT_DIR))
     loop.add_argument("--replay-limit", type=int, default=None)
+    loop.add_argument("--replay-max-iteration", type=int, default=None)
+    loop.add_argument(
+        "--replay-window-size",
+        type=int,
+        default=1,
+        help="Train on the last N iterations of self-play data "
+        "(1=on-policy, 0=unbounded).",
+    )
     loop.add_argument("--epochs", type=int, default=1)
     loop.add_argument("--train-batch-size", type=int, default=256)
     loop.add_argument("--learning-rate", type=float, default=1e-3)
@@ -1532,6 +1737,8 @@ def main() -> None:
             replay_dir=args.replay_dir,
             checkpoint_dir=args.checkpoint_dir,
             replay_limit=args.replay_limit,
+            replay_max_iteration=args.replay_max_iteration,
+            replay_window_size=args.replay_window_size,
             epochs=args.epochs,
             batch_size=args.train_batch_size,
             learning_rate=args.learning_rate,
@@ -1595,6 +1802,8 @@ def main() -> None:
             replay_dir=args.replay_dir,
             checkpoint_dir=args.checkpoint_dir,
             replay_limit=args.replay_limit,
+            replay_max_iteration=args.replay_max_iteration,
+            replay_window_size=args.replay_window_size,
             epochs=args.epochs,
             batch_size=args.train_batch_size,
             learning_rate=args.learning_rate,

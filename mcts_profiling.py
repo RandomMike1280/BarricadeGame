@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--profile-out", type=str, default="mcts_profile.prof")
     parser.add_argument("--stats-limit", type=int, default=40)
-    parser.add_argument("--sort", type=str, default="cumulative")
+    parser.add_argument("--sort", type=str, default="cumtime")
     return parser.parse_args()
 
 

@@ -410,7 +410,8 @@ class BarricadeState:
         self._blocked_edge_mask = 0
         self._walls_frozenset: frozenset[WallPlacement] = frozenset()
         self._blocked_edge_mask_cache: int = 0
-        self._walls_frozenset_cache_key: frozenset[WallPlacement] = frozenset()
+        self._blocked_edge_mask_cache_key: frozenset[WallPlacement] = frozenset()
+        self._wall_lookup_cache_key: frozenset[WallPlacement] = frozenset()
         self._horizontal_walls_cache: Set[Tuple[int, int]] = set()
         self._vertical_walls_cache: Set[Tuple[int, int]] = set()
         self.pawns = {Player.RED: red_start, Player.BLUE: blue_start}
@@ -437,7 +438,8 @@ class BarricadeState:
         new_state._blocked_edge_mask = self._blocked_edge_mask
         new_state._walls_frozenset = self._walls_frozenset
         new_state._blocked_edge_mask_cache = self._blocked_edge_mask_cache
-        new_state._walls_frozenset_cache_key = self._walls_frozenset_cache_key
+        new_state._blocked_edge_mask_cache_key = self._blocked_edge_mask_cache_key
+        new_state._wall_lookup_cache_key = self._wall_lookup_cache_key
         new_state._horizontal_walls_cache = set(self._horizontal_walls_cache)
         new_state._vertical_walls_cache = set(self._vertical_walls_cache)
         new_state.pawns = dict(self.pawns)
@@ -583,25 +585,84 @@ class BarricadeState:
         blue_route_blockers = (
             self._path_blocking_walls(blue_route) if blue_route is not None else None
         )
+
+        # Split the enum-keyed blocker sets into orientation-specific (row, col)
+        # sets once, so the per-placement membership test stays int-only.
+        # ``None`` means "every wall needs a path search" (route unavailable).
+        def _split(blockers):
+            if blockers is None:
+                return None, None
+            h: Set[Tuple[int, int]] = set()
+            v: Set[Tuple[int, int]] = set()
+            for b_orientation, b_row, b_col in blockers:
+                if b_orientation == WallOrientation.HORIZONTAL:
+                    h.add((b_row, b_col))
+                else:
+                    v.add((b_row, b_col))
+            return h, v
+
+        red_h_blockers, red_v_blockers = _split(red_route_blockers)
+        blue_h_blockers, blue_v_blockers = _split(blue_route_blockers)
+        red_route_unavailable = red_route_blockers is None
+        blue_route_unavailable = blue_route_blockers is None
+
+        # Hoist frequently used attributes/locals out of the per-placement loop.
+        wall_board_size = self.wall_board_size
+        path_graph = self._path_graph
+        horizontal_masks = path_graph.horizontal_wall_masks
+        vertical_masks = path_graph.vertical_wall_masks
+        has_path = self._has_path_with_mask
+        red = Player.RED
+        blue = Player.BLUE
+        horizontal_enum = WallOrientation.HORIZONTAL
+        vertical_offset = HORIZONTAL_WALL_OFFSET + wall_board_size * wall_board_size
+
         for orientation, row, col in placements:
-            if self._is_valid_wall_placement(
-                orientation,
-                row,
-                col,
-                red_route_blockers,
-                blue_route_blockers,
-                horizontal_walls,
-                vertical_walls,
-                base_blocked_edge_mask,
-            ):
-                offset = (
-                    HORIZONTAL_WALL_OFFSET
-                    if orientation == WallOrientation.HORIZONTAL
-                    else HORIZONTAL_WALL_OFFSET
-                    + self.wall_board_size * self.wall_board_size
-                )
-                action = offset + row * self.wall_board_size + col
-                wall_moves.append((action, ("wall", orientation, row, col)))
+            if row < 0 or row >= wall_board_size or col < 0 or col >= wall_board_size:
+                continue
+
+            is_horizontal = orientation == horizontal_enum
+
+            # Inline the shape-availability test (no overlap with other walls).
+            if is_horizontal:
+                if (
+                    (row, col) in horizontal_walls
+                    or (row, col - 1) in horizontal_walls
+                    or (row, col + 1) in horizontal_walls
+                    or (row, col) in vertical_walls
+                ):
+                    continue
+            else:
+                if (
+                    (row, col) in vertical_walls
+                    or (row - 1, col) in vertical_walls
+                    or (row + 1, col) in vertical_walls
+                    or (row, col) in horizontal_walls
+                ):
+                    continue
+
+            # Only run the (expensive) BFS path check when the candidate wall
+            # lies on a player's current greedy route.
+            cell = (row, col)
+            if is_horizontal:
+                red_needs_search = red_route_unavailable or cell in red_h_blockers
+                blue_needs_search = blue_route_unavailable or cell in blue_h_blockers
+            else:
+                red_needs_search = red_route_unavailable or cell in red_v_blockers
+                blue_needs_search = blue_route_unavailable or cell in blue_v_blockers
+
+            if red_needs_search or blue_needs_search:
+                index = row * wall_board_size + col
+                w_mask = horizontal_masks[index] if is_horizontal else vertical_masks[index]
+                blocked_edge_mask = base_blocked_edge_mask | w_mask
+                if red_needs_search and not has_path(red, blocked_edge_mask):
+                    continue
+                if blue_needs_search and not has_path(blue, blocked_edge_mask):
+                    continue
+
+            offset = HORIZONTAL_WALL_OFFSET if is_horizontal else vertical_offset
+            action = offset + row * wall_board_size + col
+            wall_moves.append((action, ("wall", orientation, row, col)))
 
         return wall_moves
 
@@ -775,35 +836,35 @@ class BarricadeState:
         return self._has_path_with_mask(player, self._current_blocked_edge_mask())
 
     def _has_path_with_mask(self, player: Player, blocked_edge_mask: int) -> bool:
-        key = ("reachable_edges", player, self.pawns[player], blocked_edge_mask)
-        if key in self._path_cache:
-            return bool(self._path_cache[key])
-
         start = self.pawns[player]
-        start_index = start[0] * self.board_size + start[1]
         graph = self._path_graph
         goal_mask = graph.red_goal_mask if player == Player.RED else graph.blue_goal_mask
-        
-        # Fast BFS for reachability
-        queue = [start_index]
-        visited_mask = 1 << start_index
-        idx = 0
+        start_index = start[0] * self.board_size + start[1]
+
+        # Pawn already on its goal row -> trivially reachable.
+        if goal_mask & (1 << start_index):
+            return True
+
+        # No memoisation: each candidate wall produces a unique ``blocked_edge_mask``,
+        # so reachability keys virtually never recur (~1% hit rate measured) and the
+        # tuple-key construction + big-int hashing cost more than the rare recompute.
+        #
+        # Stack-based DFS. Reachability does not need BFS ordering, so popping from
+        # a stack avoids the per-iteration ``len(queue)`` call of an index-cursor
+        # queue. A ``bytearray`` visited-set avoids the big-integer allocation churn
+        # of a bitmask, and we early-exit the instant a goal neighbour is found.
         adjacency = graph.adjacency
-
-        while idx < len(queue):
-            cell_index = queue[idx]
-            idx += 1
-            if goal_mask & (1 << cell_index):
-                self._path_cache[key] = 1
-                return True
-
-            for next_index, edge_mask in adjacency[cell_index]:
-                next_bit = 1 << next_index
-                if not (visited_mask & next_bit) and not (blocked_edge_mask & edge_mask):
-                    visited_mask |= next_bit
-                    queue.append(next_index)
-
-        self._path_cache[key] = 0
+        visited = bytearray(len(adjacency))
+        visited[start_index] = 1
+        stack = [start_index]
+        while stack:
+            for next_index, edge_mask in adjacency[stack.pop()]:
+                if visited[next_index] or (blocked_edge_mask & edge_mask):
+                    continue
+                if goal_mask & (1 << next_index):
+                    return True
+                visited[next_index] = 1
+                stack.append(next_index)
         return False
 
     def shortest_path_length(self, player: Player | str | int) -> Optional[int]:
@@ -902,13 +963,13 @@ class BarricadeState:
         return abs(cell[0] - target_row)
 
     def _current_blocked_edge_mask(self) -> int:
-        if self._walls_frozenset_cache_key == self._walls_frozenset:
+        if self._blocked_edge_mask_cache_key == self._walls_frozenset:
             return self._blocked_edge_mask_cache
 
         blocked_edge_mask = 0
         for orientation, row, col in self._walls_frozenset:
             blocked_edge_mask |= self._wall_edge_mask(orientation, row, col)
-        self._walls_frozenset_cache_key = self._walls_frozenset
+        self._blocked_edge_mask_cache_key = self._walls_frozenset
         self._blocked_edge_mask_cache = blocked_edge_mask
         return blocked_edge_mask
 
@@ -928,7 +989,7 @@ class BarricadeState:
         walls: Iterable[WallPlacement],
     ) -> Tuple[Set[Tuple[int, int]], Set[Tuple[int, int]]]:
         walls_frozenset = frozenset(walls)
-        if self._walls_frozenset_cache_key == walls_frozenset:
+        if self._wall_lookup_cache_key == walls_frozenset:
             return self._horizontal_walls_cache, self._vertical_walls_cache
 
         horizontal_walls: Set[Tuple[int, int]] = set()
@@ -938,7 +999,7 @@ class BarricadeState:
                 horizontal_walls.add((row, col))
             else:
                 vertical_walls.add((row, col))
-        self._walls_frozenset_cache_key = walls_frozenset
+        self._wall_lookup_cache_key = walls_frozenset
         self._horizontal_walls_cache = horizontal_walls
         self._vertical_walls_cache = vertical_walls
         return horizontal_walls, vertical_walls
@@ -989,8 +1050,9 @@ class BarricadeState:
             col = int(col)
             new_state.walls.add((orientation, row, col))
             new_state._walls_frozenset = frozenset(new_state.walls)
-            new_state._blocked_edge_mask_cache = 0 # Invalidate blocked edge mask cache
-            new_state._walls_frozenset_cache_key = frozenset() # Invalidate walls frozenset cache key
+            new_state._blocked_edge_mask_cache = 0
+            new_state._blocked_edge_mask_cache_key = frozenset()
+            new_state._wall_lookup_cache_key = frozenset()
             new_state.walls_left[new_state.current_player] -= 1
         else:
             raise ValueError(f"Unknown move type: {move_type!r}")
@@ -1430,7 +1492,9 @@ class BarricadeEnv(BaseEnv):
         lead = self._terminal_lead(red_distance, blue_distance)
         return {
             "current_player": self.state.current_player.name,
-            "winner": self.state.winner.name if self.state.winner else None,
+            "winner": (
+                self.state.winner.name if self.state.winner is not None else None
+            ),
             "steps": self.steps,
             "lead": lead,
             "red_position": self.state.pawns[Player.RED],
