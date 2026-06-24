@@ -8,14 +8,18 @@ via a background BatchInferenceServer thread.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass, field, replace
+import multiprocessing as mp
+import os
 import queue
 from pathlib import Path
 import random
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, TextIO, Tuple
@@ -63,13 +67,21 @@ class SelfPlayConfig:
     games: int = 16
     base_simulations: int = 128
     batch_size: int = 16
-    max_steps: int = 500
+    max_steps: int = 100
     chunk_size: int = 2048
     temperature_drop_ply: int = 20
     seed: int = 1
     output_dir: str = str(SELFPLAY_DIR)
     base_walls: int = DEFAULT_WALLS_PER_PLAYER
     num_workers: int = 4
+    # Resignation: end clearly-lost games early so they become decisive (kept)
+    # samples instead of burning compute on a long truncated draw (kept=0). A
+    # fraction of games disable resignation to calibrate the false-positive rate.
+    resign_threshold: float = -0.85
+    resign_plies: int = 6
+    resign_disable_fraction: float = 0.1
+    # Force process-based (vs thread+server) self-play; None => auto by device.
+    use_processes: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -130,6 +142,35 @@ def _format_duration(seconds: float) -> str:
 
 def _timestamp() -> str:
     return time.strftime("%H:%M:%S")
+
+
+def _system_mem_stats() -> Tuple[Optional[float], Optional[float]]:
+    """Return ``(mem_available_mb, swap_used_mb)`` from ``/proc/meminfo``.
+
+    Returns ``(None, None)`` when unavailable (non-Linux). Used to make the
+    self-play slowdown observable: the catastrophic per-game blow-up was caused
+    by the host crossing into swap, so logging available RAM + swap-in per game
+    lets us confirm the fix keeps memory flat.
+    """
+    try:
+        fields: Dict[str, int] = {}
+        with open("/proc/meminfo", "r") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) >= 2:
+                    fields[parts[0].rstrip(":")] = int(parts[1])  # kB
+        mem_avail = fields.get("MemAvailable")
+        swap_total = fields.get("SwapTotal")
+        swap_free = fields.get("SwapFree")
+        mem_avail_mb = mem_avail / 1024.0 if mem_avail is not None else None
+        swap_used_mb = (
+            (swap_total - swap_free) / 1024.0
+            if swap_total is not None and swap_free is not None
+            else None
+        )
+        return mem_avail_mb, swap_used_mb
+    except (OSError, ValueError):
+        return None, None
 
 
 class _TeeStream:
@@ -595,10 +636,16 @@ def _run_single_game_worker(
     model: nn.Module,
     network_config: NetworkConfig,
     config: SelfPlayConfig,
-    inference_server: BatchInferenceServer,
+    inference_server: Optional[BatchInferenceServer],
     seed: int,
+    *,
+    device: str = "cpu",
 ) -> Tuple[List[Dict[str, Any]], float, Dict[str, Any]]:
     """Run one complete self-play game.
+
+    When ``inference_server`` is ``None`` the game evaluates the network
+    synchronously in-process (used by the process-based CPU path, which has no
+    shared server); otherwise it delegates to the cross-worker batched server.
 
     Returns ``(samples, elapsed_seconds, game_info)``.
     """
@@ -617,12 +664,21 @@ def _run_single_game_worker(
     truncated = False
     ply = 0
 
+    # Resignation bookkeeping: a fraction of games never resign (calibration set).
+    resign_enabled = rng.random() >= config.resign_disable_fraction
+    resign_low_streak = {Player.RED: 0, Player.BLUE: 0}
+    resigned_winner: Optional[str] = None
+
+    resolved_device = (
+        str(inference_server.device) if inference_server is not None else str(device)
+    )
+
     # Create MCTS once per game and update config per-move via replace()
     mcts_config = MCTSConfig(
         num_simulations=config.base_simulations,
         batch_size=config.batch_size,
         history_length=network_config.history_length,
-        device=str(inference_server.device),
+        device=resolved_device,
         add_root_noise=True,
         action_temperature=1.0,
     )
@@ -660,6 +716,19 @@ def _run_single_game_worker(
                 f"for {player_to_move.name}; legal actions were {legal_actions}"
             )
 
+        # Resignation: if the side to move has been decisively losing
+        # (root value <= threshold) for ``resign_plies`` of its own turns,
+        # concede now and award the win to the opponent. Only after the
+        # exploratory opening, since early root values are noisy.
+        if resign_enabled and ply >= config.temperature_drop_ply:
+            if result.root_value <= config.resign_threshold:
+                resign_low_streak[player_to_move] += 1
+            else:
+                resign_low_streak[player_to_move] = 0
+            if resign_low_streak[player_to_move] >= config.resign_plies:
+                resigned_winner = player_to_move.opposite().name
+                break
+
         pending.append(
             {
                 "state_planes": state_planes,
@@ -692,8 +761,14 @@ def _run_single_game_worker(
         root = mcts.advance_root(result.root, action)
         ply += 1
 
-    # Finalize samples with game outcome
-    winner = info.get("winner")
+    # Finalize samples with game outcome. A resignation produces a decisive
+    # (non-truncated) game so its samples are kept, with the conceding side's
+    # positions labelled as losses.
+    if resigned_winner is not None:
+        winner = resigned_winner
+        truncated = False
+    else:
+        winner = info.get("winner")
     lead = info.get("lead")
     final_metadata = {
         "winner": winner,
@@ -701,6 +776,7 @@ def _run_single_game_worker(
         "N_moves": info.get("N_moves"),
         "game_length": info.get("steps"),
         "truncated": bool(truncated),
+        "resigned": resigned_winner is not None,
     }
     for sample in pending:
         sample.update(final_metadata)
@@ -729,6 +805,7 @@ def _run_single_game_worker(
         "lead": lead,
         "handicap_mode": handicap.get("mode", "standard"),
         "ply": ply,
+        "resigned": resigned_winner is not None,
     }
     return pending, game_elapsed, game_info
 
@@ -752,6 +829,62 @@ def _clear_replay_iteration(output_dir: Path, iteration: int) -> int:
     return removed
 
 
+# Per-worker-process state, built once by ``_process_worker_init`` and reused for
+# every game that worker runs. The model is loaded from a temp state-dict file so
+# it is never pickled per task; weights are read-only during self-play.
+_PROC_CTX: Dict[str, Any] = {}
+
+
+def _process_worker_init(
+    state_path: str,
+    network_config: NetworkConfig,
+    config: SelfPlayConfig,
+    device: str,
+    threads_per_worker: int,
+) -> None:
+    """Initializer run once per spawned worker: load the model and cap threads.
+
+    Workers are spawned via forkserver/spawn (never plain fork), so they get a
+    clean process and reconstruct the model from ``state_path`` rather than
+    inheriting it — this avoids deadlocking on the training phase's hot OpenMP
+    thread pool that a fork would carry over.
+    """
+    try:
+        torch.set_num_threads(max(1, int(threads_per_worker)))
+    except Exception:  # noqa: BLE001 - thread tuning is best-effort
+        pass
+    model = build_model(network_config)
+    state_dict = torch.load(state_path, map_location="cpu", weights_only=False)
+    _load_model_state(model, state_dict)
+    model.to(torch.device(device))
+    model.eval()
+    _PROC_CTX.clear()
+    _PROC_CTX.update(
+        {
+            "model": model,
+            "network_config": network_config,
+            "config": config,
+            "device": device,
+        }
+    )
+
+
+def _process_game_entry(
+    game_index: int, iteration: int, seed: int
+) -> Tuple[List[Dict[str, Any]], float, Dict[str, Any]]:
+    """Top-level entry run inside a worker process (one game, synchronous)."""
+    return _run_single_game_worker(
+        game_index,
+        iteration,
+        _PROC_CTX["model"],
+        _PROC_CTX["network_config"],
+        _PROC_CTX["config"],
+        None,  # no shared inference server in the process path
+        seed,
+        device=_PROC_CTX["device"],
+    )
+
+
 def run_self_play(
     model: nn.Module,
     network_config: NetworkConfig,
@@ -759,134 +892,118 @@ def run_self_play(
     *,
     device: Optional[str] = None,
 ) -> List[Path]:
-    """Run parallel self-play games with cross-worker batched inference."""
+    """Run parallel self-play games.
+
+    On CPU this uses true multi-process workers (each game runs synchronously in
+    its own forked process, memory reclaimed per game) instead of the GPU-oriented
+    thread+BatchInferenceServer design, which on CPU only made worker threads
+    contend on the GIL while accumulating memory across long games.
+    """
     resolved_device = torch.device(
         device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
-    rng = random.Random(config.seed)
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _clear_replay_iteration(output_dir, config.iteration)
     model.eval()
 
     num_workers = max(1, config.num_workers)
+    if config.use_processes is None:
+        use_processes = resolved_device.type == "cpu" and num_workers > 1
+    else:
+        use_processes = bool(config.use_processes)
     max_inference_batch = min(512, config.batch_size * num_workers * 2)
+    mode = "process" if use_processes else "thread+server"
 
     print(
         f"[{_timestamp()}] [self-play] starting iteration {config.iteration}: "
-        f"games={config.games} workers={num_workers} "
+        f"games={config.games} workers={num_workers} mode={mode} "
         f"simulations={config.base_simulations} mcts_batch={config.batch_size} "
+        f"max_steps={config.max_steps} resign<={config.resign_threshold} "
         f"max_nn_batch={max_inference_batch} device={resolved_device}",
         flush=True,
     )
-
-    # Start the shared inference server
-    collection_timeout = 0.001 if num_workers > 1 else 0.0
-    server = BatchInferenceServer(
-        model,
-        resolved_device,
-        max_batch_size=max_inference_batch,
-        collection_timeout=collection_timeout,
-    )
-    server.start()
 
     all_samples: List[Dict[str, Any]] = []
     written_chunks: List[Path] = []
     chunk_index = 0
     completed_games = 0
     skipped_games = 0
+    resigned_games = 0
     total_samples_generated = 0
     total_samples_collected = 0
     start_time = time.time()
+    server: Optional[BatchInferenceServer] = None
 
-    try:
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures: Dict[Any, int] = {}
-            for game_index in range(config.games):
-                future = executor.submit(
-                    _run_single_game_worker,
-                    game_index,
-                    config.iteration,
-                    model,
-                    network_config,
-                    config,
-                    server,
-                    config.seed + game_index + 1,
-                )
-                futures[future] = game_index
+    def _handle_completed(
+        game_index: int,
+        game_samples: List[Dict[str, Any]],
+        game_elapsed: float,
+        game_info: Dict[str, Any],
+    ) -> None:
+        nonlocal all_samples, chunk_index, completed_games, skipped_games
+        nonlocal resigned_games, total_samples_generated, total_samples_collected
 
-            for future in as_completed(futures):
-                game_index = futures[future]
-                try:
-                    game_samples, game_elapsed, game_info = future.result()
-                except Exception as e:
-                    print(
-                        f"[{_timestamp()}] [self-play] ERROR game {game_index}: {e}",
-                        flush=True,
-                    )
-                    completed_games += 1
-                    continue
+        total_samples_generated += len(game_samples)
+        keep_game = _is_decisive_game(
+            game_info.get("winner"), bool(game_info.get("truncated", False))
+        )
+        kept_samples = len(game_samples) if keep_game else 0
+        if keep_game:
+            all_samples.extend(game_samples)
+            total_samples_collected += kept_samples
+        else:
+            skipped_games += 1
+        if game_info.get("resigned"):
+            resigned_games += 1
+        completed_games += 1
 
-                total_samples_generated += len(game_samples)
-                keep_game = _is_decisive_game(
-                    game_info.get("winner"),
-                    bool(game_info.get("truncated", False)),
-                )
-                kept_samples = len(game_samples) if keep_game else 0
-                if keep_game:
-                    all_samples.extend(game_samples)
-                    total_samples_collected += kept_samples
-                else:
-                    skipped_games += 1
-                completed_games += 1
+        winner_str = game_info.get("winner") or "draw"
+        steps = game_info.get("steps") or 0
+        trunc = game_info.get("truncated", False)
+        handicap_mode = game_info.get("handicap_mode", "?")
+        resigned = bool(game_info.get("resigned", False))
 
-                winner_str = game_info.get("winner") or "draw"
-                steps = game_info.get("steps") or 0
-                trunc = game_info.get("truncated", False)
-                handicap_mode = game_info.get("handicap_mode", "?")
+        elapsed = time.time() - start_time
+        games_per_sec = completed_games / max(elapsed, 0.001)
+        samples_per_sec = total_samples_collected / max(elapsed, 0.001)
+        mem_avail_mb, swap_used_mb = _system_mem_stats()
+        mem_str = (
+            f"mem_avail={mem_avail_mb:.0f}MB swap_used={swap_used_mb:.0f}MB"
+            if mem_avail_mb is not None
+            else "mem_avail=? swap_used=?"
+        )
+        nn_str = ""
+        if server is not None:
+            nn_stats = server.stats
+            nn_str = (
+                f"nn_avg_batch={nn_stats['avg_batch_size']:.1f} "
+                f"nn_max_batch={nn_stats['max_batch_size']} "
+            )
 
-                elapsed = time.time() - start_time
-                games_per_sec = completed_games / max(elapsed, 0.001)
-                samples_per_sec = total_samples_collected / max(elapsed, 0.001)
-                nn_stats = server.stats
+        print(
+            f"[{_timestamp()}] [self-play] "
+            f"game {completed_games}/{config.games} "
+            f"(idx={game_index}) "
+            f"winner={winner_str} steps={steps} "
+            f"trunc={trunc} resigned={resigned} mode={handicap_mode} "
+            f"samples={len(game_samples)} kept={kept_samples} "
+            f"time={_format_duration(game_elapsed)} "
+            f"| total_kept={total_samples_collected} "
+            f"skipped_games={skipped_games} resigned_games={resigned_games} "
+            f"games/s={games_per_sec:.2f} "
+            f"samples/s={samples_per_sec:.1f} "
+            f"{nn_str}{mem_str} "
+            f"elapsed={_format_duration(elapsed)}",
+            flush=True,
+        )
 
-                print(
-                    f"[{_timestamp()}] [self-play] "
-                    f"game {completed_games}/{config.games} "
-                    f"(idx={game_index}) "
-                    f"winner={winner_str} steps={steps} "
-                    f"trunc={trunc} mode={handicap_mode} "
-                    f"samples={len(game_samples)} kept={kept_samples} "
-                    f"time={_format_duration(game_elapsed)} "
-                    f"| total_kept={total_samples_collected} "
-                    f"skipped_games={skipped_games} "
-                    f"games/s={games_per_sec:.2f} "
-                    f"samples/s={samples_per_sec:.1f} "
-                    f"nn_avg_batch={nn_stats['avg_batch_size']:.1f} "
-                    f"nn_max_batch={nn_stats['max_batch_size']} "
-                    f"elapsed={_format_duration(elapsed)}",
-                    flush=True,
-                )
-
-                # Write chunks as they fill up
-                while len(all_samples) >= config.chunk_size:
-                    chunk_samples = all_samples[: config.chunk_size]
-                    all_samples = all_samples[config.chunk_size :]
-                    path = _write_replay_chunk(
-                        chunk_samples,
-                        output_dir,
-                        config.iteration,
-                        chunk_index,
-                        network_config,
-                        config,
-                    )
-                    written_chunks.append(path)
-                    chunk_index += 1
-
-        # Write remaining samples
-        if all_samples:
+        # Write chunks as they fill up.
+        while len(all_samples) >= config.chunk_size:
+            chunk_samples = all_samples[: config.chunk_size]
+            all_samples = all_samples[config.chunk_size :]
             path = _write_replay_chunk(
-                all_samples,
+                chunk_samples,
                 output_dir,
                 config.iteration,
                 chunk_index,
@@ -894,24 +1011,190 @@ def run_self_play(
                 config,
             )
             written_chunks.append(path)
+            chunk_index += 1
 
-    finally:
-        server.stop()
+    def _drain(future_map: Dict[Any, int], done: set) -> bool:
+        """Consume completed futures. Returns True if the pool broke mid-flight.
+
+        ``done`` is updated in place with the game indices fully handled (so the
+        caller can resubmit only the unfinished ones after a pool crash).
+        """
+        nonlocal completed_games
+        for future in as_completed(future_map):
+            game_index = future_map[future]
+            try:
+                game_samples, game_elapsed, game_info = future.result()
+            except BrokenProcessPool:
+                # A worker died abruptly (OOM/segfault): every in-flight future
+                # now raises this. Stop draining and let the caller restart the
+                # pool with the games that have not completed yet.
+                return True
+            except Exception as exc:  # noqa: BLE001 - log and keep other games
+                print(
+                    f"[{_timestamp()}] [self-play] ERROR game {game_index}: {exc}",
+                    flush=True,
+                )
+                done.add(game_index)
+                completed_games += 1
+                continue
+            done.add(game_index)
+            _handle_completed(game_index, game_samples, game_elapsed, game_info)
+        return False
+
+    if use_processes:
+        # Use forkserver/spawn — never plain ``fork``. Self-play runs right after
+        # the training phase, which leaves THIS process's OpenMP/MKL thread pool
+        # "hot"; forking from it makes the children deadlock on their first torch
+        # op (inherited locked thread-pool state). A forkserver worker is spawned
+        # from a clean server process and loads the current (just-trained) model
+        # from a temp state-dict file, sidestepping the deadlock entirely.
+        start_methods = mp.get_all_start_methods()
+        ctx = mp.get_context(
+            "forkserver" if "forkserver" in start_methods else "spawn"
+        )
+        state_fd, state_path = tempfile.mkstemp(
+            suffix=".pt", prefix="selfplay_model_"
+        )
+        os.close(state_fd)
+        torch.save(model.state_dict(), state_path)
+
+        prev_threads = torch.get_num_threads()
+        # Per-game attempt budget so a deterministically-crashing game cannot loop
+        # forever (it would re-break each fresh pool); abandon it after N tries.
+        max_attempts = 3
+        attempts: Dict[int, int] = {gi: 0 for gi in range(config.games)}
+        remaining = list(range(config.games))
+        current_workers = num_workers
+        try:
+            torch.set_num_threads(1)
+            while remaining:
+                # Drop (once) any games that exhausted their attempt budget.
+                runnable = []
+                for gi in remaining:
+                    if attempts[gi] >= max_attempts:
+                        print(
+                            f"[{_timestamp()}] [self-play] ABANDON game {gi}: "
+                            f"crashed its worker {max_attempts} times",
+                            flush=True,
+                        )
+                        completed_games += 1
+                    else:
+                        runnable.append(gi)
+                remaining = runnable
+                if not remaining:
+                    break
+                for gi in runnable:
+                    attempts[gi] += 1
+
+                workers = max(1, min(current_workers, len(runnable)))
+                threads_per_worker = max(1, (os.cpu_count() or workers) // workers)
+                executor = ProcessPoolExecutor(
+                    max_workers=workers,
+                    mp_context=ctx,
+                    initializer=_process_worker_init,
+                    initargs=(
+                        state_path,
+                        network_config,
+                        config,
+                        str(resolved_device),
+                        threads_per_worker,
+                    ),
+                )
+                done: set = set()
+                try:
+                    futures: Dict[Any, int] = {
+                        executor.submit(
+                            _process_game_entry,
+                            game_index,
+                            config.iteration,
+                            config.seed + game_index + 1,
+                        ): game_index
+                        for game_index in runnable
+                    }
+                    broke = _drain(futures, done)
+                finally:
+                    executor.shutdown(wait=False, cancel_futures=True)
+
+                remaining = [gi for gi in remaining if gi not in done]
+                if broke and remaining:
+                    # Back off concurrency: a worker died (most likely OOM under
+                    # peak tree memory), so retry the survivors with fewer
+                    # parallel games to lower the memory high-water mark.
+                    current_workers = max(1, workers // 2)
+                    print(
+                        f"[{_timestamp()}] [self-play] worker pool broke; "
+                        f"restarting {len(remaining)} game(s) with "
+                        f"{current_workers} worker(s)",
+                        flush=True,
+                    )
+        finally:
+            torch.set_num_threads(prev_threads)
+            _PROC_CTX.clear()
+            if state_path is not None:
+                try:
+                    os.unlink(state_path)
+                except OSError:
+                    pass
+    else:
+        collection_timeout = 0.001 if num_workers > 1 else 0.0
+        server = BatchInferenceServer(
+            model,
+            resolved_device,
+            max_batch_size=max_inference_batch,
+            collection_timeout=collection_timeout,
+        )
+        server.start()
+        try:
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = {
+                    executor.submit(
+                        _run_single_game_worker,
+                        game_index,
+                        config.iteration,
+                        model,
+                        network_config,
+                        config,
+                        server,
+                        config.seed + game_index + 1,
+                        device=str(resolved_device),
+                    ): game_index
+                    for game_index in range(config.games)
+                }
+                _drain(futures, set())
+        finally:
+            server.stop()
+
+    # Write remaining samples.
+    if all_samples:
+        path = _write_replay_chunk(
+            all_samples,
+            output_dir,
+            config.iteration,
+            chunk_index,
+            network_config,
+            config,
+        )
+        written_chunks.append(path)
 
     elapsed = time.time() - start_time
-    nn_stats = server.stats
+    nn_tail = ""
+    if server is not None:
+        nn_stats = server.stats
+        nn_tail = (
+            f" nn_batches={nn_stats['total_batches']} "
+            f"nn_inferences={nn_stats['total_inferences']} "
+            f"nn_avg_batch={nn_stats['avg_batch_size']:.1f} "
+            f"nn_max_batch={nn_stats['max_batch_size']}"
+        )
     print(
         f"[{_timestamp()}] [self-play] DONE iteration {config.iteration}: "
         f"games={completed_games} chunks={len(written_chunks)} "
-        f"skipped_games={skipped_games} "
+        f"skipped_games={skipped_games} resigned_games={resigned_games} "
         f"generated_samples={total_samples_generated} "
         f"kept_samples={total_samples_collected} "
         f"elapsed={_format_duration(elapsed)} "
-        f"games/s={completed_games / max(elapsed, 0.001):.2f} "
-        f"nn_batches={nn_stats['total_batches']} "
-        f"nn_inferences={nn_stats['total_inferences']} "
-        f"nn_avg_batch={nn_stats['avg_batch_size']:.1f} "
-        f"nn_max_batch={nn_stats['max_batch_size']}",
+        f"games/s={completed_games / max(elapsed, 0.001):.2f}"
+        f"{nn_tail}",
         flush=True,
     )
 
@@ -1587,6 +1870,32 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--checkpoint", type=str, default=None)
         p.add_argument("--device", type=str, default=None)
 
+    def add_selfplay_runtime_args(p: argparse.ArgumentParser) -> None:
+        """Resignation + worker-mode knobs shared by the self-play and loop commands."""
+        p.add_argument(
+            "--resign-threshold",
+            type=float,
+            default=-0.85,
+            help="Resign when root value <= this for --resign-plies turns "
+            "(set to -1.0 to effectively disable).",
+        )
+        p.add_argument("--resign-plies", type=int, default=6)
+        p.add_argument("--resign-disable-fraction", type=float, default=0.1)
+        proc = p.add_mutually_exclusive_group()
+        proc.add_argument(
+            "--use-processes",
+            dest="use_processes",
+            action="store_true",
+            default=None,
+            help="Force multi-process self-play workers (default: auto on CPU).",
+        )
+        proc.add_argument(
+            "--no-use-processes",
+            dest="use_processes",
+            action="store_false",
+            help="Force the thread+inference-server path even on CPU.",
+        )
+
     # --- self-play ---
     self_play = subparsers.add_parser("self-play")
     add_network_args(self_play)
@@ -1594,7 +1903,7 @@ def parse_args() -> argparse.Namespace:
     self_play.add_argument("--games", type=int, default=16)
     self_play.add_argument("--base-simulations", type=int, default=128)
     self_play.add_argument("--mcts-batch-size", type=int, default=16)
-    self_play.add_argument("--max-steps", type=int, default=500)
+    self_play.add_argument("--max-steps", type=int, default=100)
     self_play.add_argument("--chunk-size", type=int, default=2048)
     self_play.add_argument("--temperature-drop-ply", type=int, default=20)
     self_play.add_argument("--seed", type=int, default=1)
@@ -1606,6 +1915,7 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Number of parallel game workers for self-play",
     )
+    add_selfplay_runtime_args(self_play)
 
     # --- train ---
     train = subparsers.add_parser("train")
@@ -1651,7 +1961,7 @@ def parse_args() -> argparse.Namespace:
     loop.add_argument("--games", type=int, default=16)
     loop.add_argument("--base-simulations", type=int, default=128)
     loop.add_argument("--mcts-batch-size", type=int, default=16)
-    loop.add_argument("--max-steps", type=int, default=500)
+    loop.add_argument("--max-steps", type=int, default=100)
     loop.add_argument("--chunk-size", type=int, default=2048)
     loop.add_argument("--temperature-drop-ply", type=int, default=20)
     loop.add_argument("--replay-dir", type=str, default=str(SELFPLAY_DIR))
@@ -1686,6 +1996,7 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Number of parallel game workers for self-play",
     )
+    add_selfplay_runtime_args(loop)
 
     return parser.parse_args()
 
@@ -1727,6 +2038,10 @@ def main() -> None:
             output_dir=args.output_dir,
             base_walls=args.walls,
             num_workers=args.num_workers,
+            resign_threshold=args.resign_threshold,
+            resign_plies=args.resign_plies,
+            resign_disable_fraction=args.resign_disable_fraction,
+            use_processes=args.use_processes,
         )
         run_self_play(model, network_config, config, device=args.device)
 
@@ -1797,6 +2112,10 @@ def main() -> None:
             output_dir=args.replay_dir,
             base_walls=args.walls,
             num_workers=args.num_workers,
+            resign_threshold=args.resign_threshold,
+            resign_plies=args.resign_plies,
+            resign_disable_fraction=args.resign_disable_fraction,
+            use_processes=args.use_processes,
         )
         train_config = TrainConfig(
             replay_dir=args.replay_dir,

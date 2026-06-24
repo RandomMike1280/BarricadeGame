@@ -36,6 +36,32 @@ except ImportError:  # pragma: no cover - exercised only when gymnasium is absen
     spaces = None
 
 
+# Upper bound on the per-game path/route memo caches. These dicts are shared by
+# reference across every cloned ``BarricadeState`` in a single game's MCTS tree
+# (see ``BarricadeState.copy``) and were previously insert-only, so a long game
+# with a reused search tree could accumulate millions of entries (keyed by a
+# big-int wall mask) and drive the host into swap. Bounding them keeps the peak
+# resident set flat; evicting is always safe because every value is recomputable.
+PATH_CACHE_LIMIT = 50_000
+
+
+def _bounded_cache_put(cache: Dict[Any, Any], key: Any, value: Any, limit: int) -> Any:
+    """Insert ``key -> value`` into ``cache``, evicting oldest entries past ``limit``.
+
+    Returns ``value`` so call sites can ``return _bounded_cache_put(...)``.
+    """
+    if len(cache) >= limit:
+        # Evict a batch of the oldest entries (dicts preserve insertion order) so
+        # the amortized eviction cost stays negligible relative to a path search.
+        for _ in range(max(1, limit // 8)):
+            try:
+                cache.pop(next(iter(cache)))
+            except StopIteration:
+                break
+    cache[key] = value
+    return value
+
+
 BOARD_SIZE = 9
 WALL_BOARD_SIZE = BOARD_SIZE - 1
 DEFAULT_WALLS_PER_PLAYER = 10
@@ -889,8 +915,9 @@ class BarricadeState:
             next_level = []
             for cell_index in current_level:
                 if goal_mask & (1 << cell_index):
-                    self._path_cache[key] = distance
-                    return distance
+                    return _bounded_cache_put(
+                        self._path_cache, key, distance, PATH_CACHE_LIMIT
+                    )
 
                 for next_index, edge_mask in adjacency[cell_index]:
                     next_bit = 1 << next_index
@@ -900,8 +927,7 @@ class BarricadeState:
             current_level = next_level
             distance += 1
 
-        self._path_cache[key] = None
-        return None
+        return _bounded_cache_put(self._path_cache, key, None, PATH_CACHE_LIMIT)
 
     def greedy_path_length(self, player: Player | str | int) -> Optional[int]:
         return self.shortest_path_length(player)
@@ -941,8 +967,9 @@ class BarricadeState:
                         break
                     node = parent[node]
                 result = tuple(reversed(path))
-                self._route_cache[key] = result
-                return result
+                return _bounded_cache_put(
+                    self._route_cache, key, result, PATH_CACHE_LIMIT
+                )
 
             for next_index, edge_mask in adjacency[cell_index]:
                 if parent[next_index] == -1 and not (blocked_edge_mask & edge_mask):
@@ -956,8 +983,7 @@ class BarricadeState:
                         ),
                     )
 
-        self._route_cache[key] = None
-        return None
+        return _bounded_cache_put(self._route_cache, key, None, PATH_CACHE_LIMIT)
 
     def _path_heuristic(cell: Tuple[int, int], target_row: int) -> int:
         return abs(cell[0] - target_row)
