@@ -58,3 +58,15 @@ score model_1606=182 best_1506=74 draws=0 model_1606_win_rate=0.711
 model_1606_as_red=90/128 model_1606_as_blue=92/128 first_player_wins=180/256
 avg_steps=41.0 elapsed=2432.830s games_per_second=0.11
 ```
+
+### 24-06-2026
+ - Official 9x9 training
+
+### 25-06-2026
+ - 1400 accumulated games
+ - Tabula rasa
+
+### 25-06-2026 7:44
+ - 2000 accumulated games
+
+###

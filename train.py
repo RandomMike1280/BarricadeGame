@@ -1612,12 +1612,12 @@ def run_loop(
             flush=True,
         )
 
-        if metrics["win_rate"] >= 0.5:
+        if metrics["win_rate"] >= 0.55:
             current_checkpoint = candidate_path
             _copy_latest(candidate_path)
             print(
                 f"[{_timestamp()}] [loop] candidate PROMOTED "
-                f"(win_rate={metrics['win_rate']:.1%} >= 0.5)",
+                f"(win_rate={metrics['win_rate']:.1%} >= 0.55)",
                 flush=True,
             )
         else:
@@ -1626,7 +1626,7 @@ def run_loop(
             )
             print(
                 f"[{_timestamp()}] [loop] candidate REJECTED "
-                f"(win_rate={metrics['win_rate']:.1%} < 0.5), "
+                f"(win_rate={metrics['win_rate']:.1%} < 0.55), "
                 f"reverting to previous checkpoint",
                 flush=True,
             )

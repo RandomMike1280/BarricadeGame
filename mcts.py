@@ -201,6 +201,7 @@ class MCTS:
         completed = 0
         collision_streak = 0
         collisions = 0
+        collision_flushes = 0
         neural_batches = 0
         evaluated_leaves = 0
         num_simulations = self.config.num_simulations
@@ -219,6 +220,14 @@ class MCTS:
                     self._release_virtual_visits(path)
                     collision_streak += 1
                     collisions += 1
+                    if pending or terminal_paths:
+                        # A collision means selection looped back into a leaf
+                        # already queued for this batch. On narrow or repetitive
+                        # trees, trying to force a large batch can spend tens of
+                        # thousands of selections finding no new work. Evaluate
+                        # the useful partial batch immediately instead.
+                        collision_flushes += 1
+                        break
                     if collision_streak > collision_limit:
                         break
                     continue
@@ -273,6 +282,7 @@ class MCTS:
                 "neural_batches": neural_batches,
                 "evaluated_leaves": evaluated_leaves,
                 "collisions": collisions,
+                "collision_flushes": collision_flushes,
             },
         )
 
