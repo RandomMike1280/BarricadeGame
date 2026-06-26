@@ -523,12 +523,13 @@ def generate_self_play_episode(
     stalled_plies = 0
 
     for ply in range(max_steps):
-        if state.winner is not None:
+        if state.winner is not None or getattr(state, "is_draw", False):
             break
 
         legal_actions = state.legal_actions()
         if not legal_actions:
-            state.winner = state.current_player.opposite()
+            if not getattr(state, "is_draw", False):
+                state.winner = state.current_player.opposite()
             break
 
         side_to_move = state.current_player
@@ -592,11 +593,15 @@ def generate_self_play_episode(
                     best_distance[player] = distance
                     progressed = True
             stalled_plies = 0 if progressed else stalled_plies + 1
-            if stalled_plies >= no_progress_limit and state.winner is None:
+            if (
+                stalled_plies >= no_progress_limit
+                and state.winner is None
+                and not getattr(state, "is_draw", False)
+            ):
                 truncated = True
                 break
     else:
-        truncated = state.winner is None
+        truncated = state.winner is None and not getattr(state, "is_draw", False)
 
     final_winner = state.winner
     if truncated:
@@ -803,12 +808,13 @@ def run_policy_game(
     truncated = False
 
     for ply in range(max_steps):
-        if state.winner is not None:
+        if state.winner is not None or getattr(state, "is_draw", False):
             break
 
         legal_actions = state.legal_actions()
         if not legal_actions:
-            state.winner = state.current_player.opposite()
+            if not getattr(state, "is_draw", False):
+                state.winner = state.current_player.opposite()
             break
 
         player = state.current_player
@@ -839,7 +845,7 @@ def run_policy_game(
                 )
             )
     else:
-        truncated = state.winner is None
+        truncated = state.winner is None and not getattr(state, "is_draw", False)
 
     if truncated:
         winner = adjudicated_winner(state, enabled=adjudicate_step_limit)

@@ -7,13 +7,14 @@ Pygame. It exposes a Gymnasium-style API:
     observation, info = env.reset()
     observation, reward, terminated, truncated, info = env.step(action)
 
-The action space is fixed at 132 discrete actions:
+The action space is fixed at 136 discrete actions:
     0        move pawn one square up
     1        move pawn one square down
     2        move pawn one square left
     3        move pawn one square right
     4..67    place a horizontal wall at an 8x8 wall anchor
     68..131  place a vertical wall at an 8x8 wall anchor
+    132..135 diagonal side-hop pawn moves when a straight jump is blocked
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ except ImportError:  # pragma: no cover - exercised only when gymnasium is absen
 # big-int wall mask) and drive the host into swap. Bounding them keeps the peak
 # resident set flat; evicting is always safe because every value is recomputable.
 PATH_CACHE_LIMIT = 50_000
+REPETITION_DRAW_COUNT = 3
 
 
 def _bounded_cache_put(cache: Dict[Any, Any], key: Any, value: Any, limit: int) -> Any:
@@ -72,7 +74,9 @@ MOVE_ACTIONS = 4
 WALL_ACTIONS_PER_ORIENTATION = WALL_BOARD_SIZE * WALL_BOARD_SIZE
 HORIZONTAL_WALL_OFFSET = MOVE_ACTIONS
 VERTICAL_WALL_OFFSET = HORIZONTAL_WALL_OFFSET + WALL_ACTIONS_PER_ORIENTATION
-ACTION_SIZE = MOVE_ACTIONS + WALL_ACTIONS_PER_ORIENTATION * 2
+DIAGONAL_HOP_ACTIONS = 4
+DIAGONAL_HOP_OFFSET = MOVE_ACTIONS + WALL_ACTIONS_PER_ORIENTATION * 2
+ACTION_SIZE = DIAGONAL_HOP_OFFSET + DIAGONAL_HOP_ACTIONS
 
 DIRECTIONS = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
@@ -85,6 +89,11 @@ def wall_board_size_for_board_size(board_size: int) -> int:
 
 
 def action_size_for_board_size(board_size: int) -> int:
+    wall_board_size = wall_board_size_for_board_size(board_size)
+    return MOVE_ACTIONS + wall_board_size * wall_board_size * 2 + DIAGONAL_HOP_ACTIONS
+
+
+def diagonal_hop_offset_for_board_size(board_size: int) -> int:
     wall_board_size = wall_board_size_for_board_size(board_size)
     return MOVE_ACTIONS + wall_board_size * wall_board_size * 2
 
@@ -118,6 +127,7 @@ MOVE_DIRECTION_DELTAS = {
     MoveDirection.LEFT: (0, -1),
     MoveDirection.RIGHT: (0, 1),
 }
+DIAGONAL_HOP_DELTAS = ((-1, -1), (-1, 1), (1, -1), (1, 1))
 
 ALL_WALL_PLACEMENTS = tuple(
     (orient, r, c)
@@ -346,9 +356,19 @@ def encode_move_for_board_size(move: Move, board_size: int) -> int:
     move_type = move[0]
     if move_type == "move":
         if len(move) != 2:
-            raise ValueError("Move actions must be (\"move\", direction).")
+            raise ValueError(
+                "Move actions must be (\"move\", direction); use state.encode_move "
+                "for target-cell pawn moves."
+            )
         _, direction = move
         return coerce_move_direction(direction).value
+
+    if move_type == "move_diagonal":
+        _, row_delta, col_delta = move
+        delta = (int(row_delta), int(col_delta))
+        if delta not in DIAGONAL_HOP_DELTAS:
+            raise ValueError(f"Invalid diagonal hop delta: {delta}")
+        return diagonal_hop_offset_for_board_size(board_size) + DIAGONAL_HOP_DELTAS.index(delta)
 
     if move_type == "wall":
         _, orientation, row, col = move
@@ -393,6 +413,11 @@ def decode_action_for_board_size(action: int, board_size: int) -> Move:
 
     if vertical_wall_offset <= action < action_size:
         index = action - vertical_wall_offset
+        wall_action_count = wall_board_size * wall_board_size
+        if index >= wall_action_count:
+            diagonal_index = index - wall_action_count
+            row_delta, col_delta = DIAGONAL_HOP_DELTAS[diagonal_index]
+            return ("move_diagonal", row_delta, col_delta)
         return (
             "wall",
             WallOrientation.VERTICAL,
@@ -444,6 +469,8 @@ class BarricadeState:
         self.walls: Set[WallPlacement] = set()
         self.current_player = starting_player
         self.winner: Optional[Player] = None
+        self.is_draw = False
+        self.draw_reason: Optional[str] = None
         self.initial_walls = {Player.RED: red_walls, Player.BLUE: blue_walls}
         self.walls_left = {Player.RED: red_walls, Player.BLUE: blue_walls}
 
@@ -452,6 +479,9 @@ class BarricadeState:
         self._valid_action_moves_cache: Optional[Tuple[Tuple[int, Move], ...]] = None
         self._path_cache: Dict[Tuple[Any, ...], Optional[int]] = {}
         self._route_cache: Dict[Tuple[Any, ...], Optional[Tuple[Tuple[int, int], ...]]] = {}
+        self._repetition_counts: Dict[Tuple[Any, ...], int] = {
+            self.repetition_key(): 1
+        }
 
     def copy(self) -> "BarricadeState":
         new_state = BarricadeState.__new__(BarricadeState)
@@ -472,6 +502,8 @@ class BarricadeState:
         new_state.walls = set(self.walls)
         new_state.current_player = self.current_player
         new_state.winner = self.winner
+        new_state.is_draw = self.is_draw
+        new_state.draw_reason = self.draw_reason
         new_state.initial_walls = dict(self.initial_walls)
         new_state.walls_left = dict(self.walls_left)
         new_state._valid_moves_cache_key = None
@@ -479,6 +511,7 @@ class BarricadeState:
         new_state._valid_action_moves_cache = None
         new_state._path_cache = self._path_cache
         new_state._route_cache = self._route_cache
+        new_state._repetition_counts = dict(self._repetition_counts)
         return new_state
 
     def state_cache_key(self) -> Tuple[Any, ...]:
@@ -488,13 +521,28 @@ class BarricadeState:
             self.pawns[Player.BLUE],
             self.current_player,
             self.winner,
+            self.is_draw,
             self.walls_left[Player.RED],
             self.walls_left[Player.BLUE],
             self._walls_frozenset,
         )
 
+    def repetition_key(self) -> Tuple[Any, ...]:
+        return (
+            self.board_size,
+            self.pawns[Player.RED],
+            self.pawns[Player.BLUE],
+            self.current_player,
+            self.walls_left[Player.RED],
+            self.walls_left[Player.BLUE],
+            self._walls_frozenset,
+        )
+
+    def is_terminal(self) -> bool:
+        return self.winner is not None or self.is_draw
+
     def get_valid_moves(self) -> List[Move]:
-        if self.winner is not None:
+        if self.is_terminal():
             return []
 
         key = self.state_cache_key()
@@ -515,7 +563,7 @@ class BarricadeState:
 
     def legal_action_moves(self) -> List[Tuple[int, Move]]:
         """Return legal actions paired with their rule-engine move tuples."""
-        if self.winner is not None:
+        if self.is_terminal():
             return []
 
         key = self.state_cache_key()
@@ -541,6 +589,7 @@ class BarricadeState:
     def _compute_valid_action_moves(self) -> List[Tuple[int, Move]]:
         action_moves = self._get_pawn_action_moves()
         action_moves.extend(self._get_valid_wall_action_moves())
+        action_moves.sort(key=lambda action_move: action_move[0])
         return action_moves
 
     def action_mask(self) -> List[int]:
@@ -563,7 +612,7 @@ class BarricadeState:
         return [move for _, move in self._get_pawn_action_moves()]
 
     def _get_pawn_action_moves(self) -> List[Tuple[int, Move]]:
-        if self.winner is not None:
+        if self.is_terminal():
             return []
 
         moves: List[Tuple[int, Move]] = []
@@ -582,11 +631,52 @@ class BarricadeState:
             if self.is_blocked(pawn_row, pawn_col, next_row, next_col):
                 continue
             if (next_row, next_col) == opponent_position:
+                jump_row = next_row + row_delta
+                jump_col = next_col + col_delta
+                can_jump_straight = (
+                    0 <= jump_row < self.board_size
+                    and 0 <= jump_col < self.board_size
+                    and not self.is_blocked(next_row, next_col, jump_row, jump_col)
+                )
+                if can_jump_straight:
+                    moves.append((direction.value, ("move_to", jump_row, jump_col)))
+                    continue
+
+                side_deltas = (
+                    ((0, -1), (0, 1))
+                    if row_delta
+                    else ((-1, 0), (1, 0))
+                )
+                for side_row_delta, side_col_delta in side_deltas:
+                    side_row = next_row + side_row_delta
+                    side_col = next_col + side_col_delta
+                    if not (
+                        0 <= side_row < self.board_size
+                        and 0 <= side_col < self.board_size
+                    ):
+                        continue
+                    if self.is_blocked(next_row, next_col, side_row, side_col):
+                        continue
+
+                    target_delta = (
+                        side_row - pawn_row,
+                        side_col - pawn_col,
+                    )
+                    action = self._diagonal_hop_action_for_delta(target_delta)
+                    moves.append((action, ("move_to", side_row, side_col)))
                 continue
 
-            moves.append((direction.value, ("move", direction)))
+            moves.append((direction.value, ("move_to", next_row, next_col)))
 
         return moves
+
+    def _diagonal_hop_action_for_delta(self, delta: Tuple[int, int]) -> int:
+        if delta not in DIAGONAL_HOP_DELTAS:
+            raise ValueError(f"Invalid diagonal hop delta: {delta}")
+        return (
+            diagonal_hop_offset_for_board_size(self.board_size)
+            + DIAGONAL_HOP_DELTAS.index(delta)
+        )
 
     def get_valid_wall_moves(
         self, candidates: Optional[Iterable[WallPlacement]] = None
@@ -596,6 +686,8 @@ class BarricadeState:
     def _get_valid_wall_action_moves(
         self, candidates: Optional[Iterable[WallPlacement]] = None
     ) -> List[Tuple[int, Move]]:
+        if self.is_terminal():
+            return []
         if self.walls_left[self.current_player] <= 0:
             return []
 
@@ -1069,6 +1161,25 @@ class BarricadeState:
                 new_state.winner = Player.RED
             elif row == 0 and new_state.current_player == Player.BLUE:
                 new_state.winner = Player.BLUE
+        elif move_type == "move_diagonal":
+            _, row_delta, col_delta = move
+            current_row, current_col = new_state.pawns[new_state.current_player]
+            row = current_row + int(row_delta)
+            col = current_col + int(col_delta)
+            new_state.pawns[new_state.current_player] = (row, col)
+            if row == new_state.board_size - 1 and new_state.current_player == Player.RED:
+                new_state.winner = Player.RED
+            elif row == 0 and new_state.current_player == Player.BLUE:
+                new_state.winner = Player.BLUE
+        elif move_type == "move_to":
+            _, row, col = move
+            row = int(row)
+            col = int(col)
+            new_state.pawns[new_state.current_player] = (row, col)
+            if row == new_state.board_size - 1 and new_state.current_player == Player.RED:
+                new_state.winner = Player.RED
+            elif row == 0 and new_state.current_player == Player.BLUE:
+                new_state.winner = Player.BLUE
         elif move_type == "wall":
             _, orientation, row, col = move
             orientation = coerce_orientation(orientation)
@@ -1084,6 +1195,13 @@ class BarricadeState:
             raise ValueError(f"Unknown move type: {move_type!r}")
 
         new_state.current_player = new_state.current_player.opposite()
+        if new_state.winner is None:
+            key = new_state.repetition_key()
+            count = new_state._repetition_counts.get(key, 0) + 1
+            new_state._repetition_counts[key] = count
+            if count >= REPETITION_DRAW_COUNT:
+                new_state.is_draw = True
+                new_state.draw_reason = "threefold_repetition"
         return new_state
 
     def apply_action(self, action: int, *, validate: bool = True) -> "BarricadeState":
@@ -1092,7 +1210,22 @@ class BarricadeState:
             legal_actions = self.legal_actions()
             if action not in legal_actions:
                 raise ValueError(f"Illegal action {action} for current state.")
-        return self.apply_move(decode_action_for_board_size(action, self.board_size))
+        return self.apply_move(self.move_for_action(action))
+
+    def move_for_action(self, action: int) -> Move:
+        action = int(action)
+        if self._is_pawn_action(action):
+            for legal_action, move in self._get_pawn_action_moves():
+                if legal_action == action:
+                    return move
+        return decode_action_for_board_size(action, self.board_size)
+
+    def _is_pawn_action(self, action: int) -> bool:
+        action = int(action)
+        diagonal_hop_offset = diagonal_hop_offset_for_board_size(self.board_size)
+        return 0 <= action < MOVE_ACTIONS or (
+            diagonal_hop_offset <= action < diagonal_hop_offset + DIAGONAL_HOP_ACTIONS
+        )
 
     def encode_move(self, move: Move) -> int:
         move_type = move[0]
@@ -1103,6 +1236,23 @@ class BarricadeState:
             if isinstance(direction, MoveDirection):
                 return direction.value
             return coerce_move_direction(direction).value
+
+        if move_type == "move_diagonal":
+            _, row_delta, col_delta = move
+            return self._diagonal_hop_action_for_delta((int(row_delta), int(col_delta)))
+
+        if move_type == "move_to":
+            _, row, col = move
+            current_row, current_col = self.pawns[self.current_player]
+            row_delta = int(row) - current_row
+            col_delta = int(col) - current_col
+            if row_delta == 0 and abs(col_delta) in (1, 2):
+                return MoveDirection.LEFT.value if col_delta < 0 else MoveDirection.RIGHT.value
+            if col_delta == 0 and abs(row_delta) in (1, 2):
+                return MoveDirection.UP.value if row_delta < 0 else MoveDirection.DOWN.value
+            if abs(row_delta) == 1 and abs(col_delta) == 1:
+                return self._diagonal_hop_action_for_delta((row_delta, col_delta))
+            raise ValueError(f"Cannot encode pawn target from current position: {(row, col)}")
 
         if move_type == "wall":
             _, orientation, row, col = move
@@ -1323,10 +1473,10 @@ class BarricadeEnv(BaseEnv):
                 action_int, acting_player, f"Illegal action for current state: {action_int}"
             )
         
-        decoded_move = decode_action_for_board_size(action_int, self.state.board_size)
+        decoded_move = self.state.move_for_action(action_int)
 
         self.state = self.state.apply_move(decoded_move)
-        if decoded_move[0] == "move":
+        if decoded_move[0] in {"move", "move_diagonal", "move_to"}:
             self.pawn_moves[acting_player] += 1
         self.steps += 1
 
@@ -1338,6 +1488,9 @@ class BarricadeEnv(BaseEnv):
                 if self.state.winner == acting_player
                 else self.loss_reward
             )
+        elif self.state.is_draw:
+            self.terminated = True
+            reward = 0.0
         elif not self.state.get_valid_moves():
             self.state.winner = acting_player
             self.terminated = True
@@ -1439,6 +1592,20 @@ class BarricadeEnv(BaseEnv):
                 "row_delta": row_delta,
                 "col_delta": col_delta,
             }
+        if move[0] == "move_diagonal":
+            _, row_delta, col_delta = move
+            return {
+                "type": "move",
+                "direction": "DIAGONAL",
+                "row_delta": int(row_delta),
+                "col_delta": int(col_delta),
+            }
+        if move[0] == "move_to":
+            _, row, col = move
+            return {
+                "type": "move",
+                "target": (int(row), int(col)),
+            }
 
         _, orientation, row, col = move
         return {
@@ -1521,6 +1688,8 @@ class BarricadeEnv(BaseEnv):
             "winner": (
                 self.state.winner.name if self.state.winner is not None else None
             ),
+            "draw": self.state.is_draw,
+            "draw_reason": self.state.draw_reason,
             "steps": self.steps,
             "lead": lead,
             "red_position": self.state.pawns[Player.RED],

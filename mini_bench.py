@@ -11,7 +11,7 @@ import math
 from pathlib import Path
 import random
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -24,6 +24,9 @@ from barricade_env import (
     apply_selected_action,
 )
 from mcts import MCTS, MCTSConfig
+
+
+MODEL_HISTORY_LENGTH_ATTR = "_mini_bench_history_length"
 
 
 class AlphaBetaAI:
@@ -115,20 +118,34 @@ def select_model_action_9x9(
     *,
     device: torch.device,
     rng: random.Random,
+    history: Sequence[BarricadeState] = (),
 ) -> int:
     legal_actions = state.legal_actions()
     if not legal_actions:
         return -1
     model.eval()
     from network import encode_state_stack
-    state_planes = encode_state_stack(state, history_length=0).unsqueeze(0).to(device)
+
+    history_length = int(getattr(model, MODEL_HISTORY_LENGTH_ATTR, 0))
+    state_planes = encode_state_stack(
+        state,
+        history[-history_length:] if history_length > 0 else (),
+        history_length=history_length,
+    ).unsqueeze(0).to(device)
     logits, _, _ = model.inference(state_planes)
-    logits = logits.squeeze(0).cpu()
-    # Mask out illegal actions
-    mask = torch.ones_like(logits) * -float("inf")
-    mask[legal_actions] = 0.0
-    logits = logits + mask
-    return int(torch.argmax(logits).item())
+    logits = torch.nan_to_num(
+        logits.squeeze(0),
+        nan=0.0,
+        posinf=30.0,
+        neginf=-30.0,
+    ).clamp(-30.0, 30.0)
+
+    from canonical import canonical_action
+
+    canonical_legal = [canonical_action(action, state.current_player) for action in legal_actions]
+    legal_tensor = torch.as_tensor(canonical_legal, dtype=torch.long, device=logits.device)
+    legal_logits = logits.index_select(0, legal_tensor)
+    return int(legal_actions[int(torch.argmax(legal_logits).item())])
 
 
 def build_mcts_9x9(
@@ -138,7 +155,18 @@ def build_mcts_9x9(
     rng: random.Random,
     config: MCTSConfig,
 ) -> MCTS:
-    return MCTS(model, config=config, device=device, rng=rng)
+    from canonical import canonical_action
+
+    return MCTS(
+        model,
+        config=config,
+        device=device,
+        rng=rng,
+        policy_action_transform=lambda action, state: canonical_action(
+            action,
+            state.current_player,
+        ),
+    )
 
 
 def choose_model_action(
@@ -150,6 +178,7 @@ def choose_model_action(
     rng: random.Random,
     simulations: int,
     batch_size: int,
+    history: Sequence[BarricadeState] = (),
 ) -> int:
     if board_size == 7:
         from train_7x7_tabula_rasa import build_mcts, select_model_action
@@ -173,23 +202,45 @@ def choose_model_action(
         return select_model_action(model, state, device=device, rng=rng)
     else:
         if simulations <= 0:
-            return select_model_action_9x9(model, state, device=device, rng=rng)
+            return select_model_action_9x9(
+                model,
+                state,
+                device=device,
+                rng=rng,
+                history=history,
+            )
         
+        history_length = int(getattr(model, MODEL_HISTORY_LENGTH_ATTR, 0))
         config = MCTSConfig(
             num_simulations=simulations,
             batch_size=batch_size,
             cpuct_init=1.5,
             policy_target_temperature=1.0,
             action_temperature=0.0,
+            history_length=history_length,
             add_root_noise=False,
             lead_weight=0.02,
             lead_scale=5.0,
         )
-        result = build_mcts_9x9(model, device=device, rng=rng, config=config).search(state)
+        result = build_mcts_9x9(
+            model,
+            device=device,
+            rng=rng,
+            config=config,
+        ).search(
+            state,
+            history=history[-history_length:] if history_length > 0 else (),
+        )
         action = int(result.action)
         if action in state.legal_actions():
             return action
-        return select_model_action_9x9(model, state, device=device, rng=rng)
+        return select_model_action_9x9(
+            model,
+            state,
+            device=device,
+            rng=rng,
+            history=history,
+        )
 
 
 def format_move(move_type: str, details: Tuple) -> str:
@@ -229,6 +280,7 @@ def play_single_game(
     device: torch.device,
     rng: random.Random,
     verbose: bool = True,
+    adjudicate_step_limit: bool = False,
 ) -> Tuple[Optional[Player], int, bool]:
     # Alternate who goes first
     starting_player = Player.RED if game_idx % 2 == 0 else Player.BLUE
@@ -257,14 +309,16 @@ def play_single_game(
 
     steps = 0
     truncated = False
+    history: List[BarricadeState] = []
 
     for ply in range(max_steps):
-        if state.winner is not None:
+        if state.winner is not None or getattr(state, "is_draw", False):
             break
 
         legal_actions = state.legal_actions()
         if not legal_actions:
-            state.winner = state.current_player.opposite()
+            if not getattr(state, "is_draw", False):
+                state.winner = state.current_player.opposite()
             break
 
         current_player = state.current_player
@@ -279,12 +333,15 @@ def play_single_game(
                 rng=rng,
                 simulations=simulations,
                 batch_size=batch_size,
+                history=history,
             )
         else:
             action = ab_agent.get_best_move(state)
 
+        state_before = state.copy()
         move_decoded = state.decode_action(action)
         state = apply_selected_action(state, action, legal_actions)
+        history.append(state_before)
         steps = ply + 1
 
         if verbose:
@@ -298,7 +355,7 @@ def play_single_game(
     else:
         truncated = state.winner is None
 
-    if truncated:
+    if truncated and adjudicate_step_limit:
         winner = adjudicated_winner(state)
         if winner is not None:
             state.winner = winner
@@ -309,7 +366,9 @@ def play_single_game(
         actor = "Model" if state.winner == model_role else "AB Opponent"
         if state.winner is None:
             actor = "None"
-        print(f"Winner: {winner_name} ({actor}) in {steps} steps")
+        draw_reason = getattr(state, "draw_reason", None)
+        suffix = f" [{draw_reason}]" if draw_reason else ""
+        print(f"Winner: {winner_name} ({actor}) in {steps} steps{suffix}")
 
     return state.winner, steps, truncated
 
@@ -318,13 +377,15 @@ def _infer_model_config(
     state_dict: Dict[str, torch.Tensor],
     fallback_hidden_channels: int,
     fallback_residual_blocks: int,
-) -> Tuple[int, int]:
+) -> Tuple[int, int, int, int, int, int]:
     hidden_channels = fallback_hidden_channels
     stem_weight_keys = ["stem.0.weight", "conv_tower.0.conv.weight"]
+    input_planes = 9
     for key in stem_weight_keys:
         weight = state_dict.get(key)
         if weight is not None:
             hidden_channels = int(weight.shape[0])
+            input_planes = int(weight.shape[1])
             break
 
     block_indices = []
@@ -336,7 +397,43 @@ def _infer_model_config(
             block_indices.append(int(parts[1]))
     residual_blocks = max(block_indices) + 1 if block_indices else fallback_residual_blocks
 
-    return hidden_channels, residual_blocks
+    residual_channels = hidden_channels
+    residual_weight = state_dict.get("residual_tower.0.conv1.weight")
+    if residual_weight is not None:
+        residual_channels = int(residual_weight.shape[0])
+
+    value_hidden_size = hidden_channels
+    value_weight = state_dict.get("value_head.fc1.weight")
+    if value_weight is not None:
+        value_hidden_size = int(value_weight.shape[0])
+
+    num_conv_layers = 1
+    conv_layer_indices = []
+    for key in state_dict:
+        if not key.startswith("conv_tower."):
+            continue
+        parts = key.split(".")
+        if len(parts) > 2 and parts[1].isdigit():
+            conv_layer_indices.append(int(parts[1]))
+    if conv_layer_indices:
+        num_conv_layers = max(conv_layer_indices) + 1
+
+    return (
+        hidden_channels,
+        residual_blocks,
+        input_planes,
+        residual_channels,
+        value_hidden_size,
+        num_conv_layers,
+    )
+
+
+def _history_length_from_input_planes(input_planes: int) -> int:
+    if input_planes % 9 != 0:
+        raise RuntimeError(
+            f"Cannot infer history length from {input_planes} input planes."
+        )
+    return input_planes // 9 - 1
 
 
 def load_model(
@@ -356,20 +453,52 @@ def load_model(
 
     if board_size == 7:
         from train_7x7_tabula_rasa import AlphaZeroNet
-        hidden_channels, residual_blocks = _infer_model_config(state_dict, 64, 4)
+        hidden_channels, residual_blocks, *_ = _infer_model_config(state_dict, 64, 4)
         model = AlphaZeroNet(
             hidden_channels=hidden_channels,
             residual_blocks=residual_blocks,
         ).to(device)
+        setattr(model, MODEL_HISTORY_LENGTH_ATTR, 0)
     else:
         from network import build_network
-        hidden_channels, residual_blocks = _infer_model_config(state_dict, 128, 10)
+
+        (
+            hidden_channels,
+            residual_blocks,
+            input_planes,
+            residual_channels,
+            value_hidden_size,
+            num_conv_layers,
+        ) = _infer_model_config(state_dict, 128, 10)
+        history_length = _history_length_from_input_planes(input_planes)
+
+        network_config = {}
+        if isinstance(payload, dict) and isinstance(payload.get("network_config"), dict):
+            network_config = dict(payload["network_config"])
+            history_length = int(network_config.get("history_length", history_length))
+            hidden_channels = int(network_config.get("conv_channels", hidden_channels))
+            residual_channels = network_config.get("residual_channels", residual_channels)
+            if residual_channels is None:
+                residual_channels = hidden_channels
+            else:
+                residual_channels = int(residual_channels)
+            num_conv_layers = int(network_config.get("num_conv_layers", num_conv_layers))
+            residual_blocks = int(
+                network_config.get("num_residual_layers", residual_blocks)
+            )
+            value_hidden_size = int(
+                network_config.get("value_hidden_size", value_hidden_size)
+            )
+
         model = build_network(
-            history_length=0,
+            history_length=history_length,
             conv_channels=hidden_channels,
-            residual_channels=hidden_channels,
+            residual_channels=residual_channels,
+            num_conv_layers=num_conv_layers,
             num_residual_layers=residual_blocks,
+            value_hidden_size=value_hidden_size,
         ).to(device)
+        setattr(model, MODEL_HISTORY_LENGTH_ATTR, history_length)
 
     model.load_state_dict(state_dict, strict=False)
     model.eval()
@@ -446,6 +575,11 @@ def main() -> None:
         action="store_true",
         help="If set, suppresses printing move-by-move logs.",
     )
+    parser.add_argument(
+        "--adjudicate-step-limit",
+        action="store_true",
+        help="Award max-step games by shortest path instead of counting them as draws.",
+    )
     args = parser.parse_args()
 
     # Seed configuration
@@ -493,6 +627,7 @@ def main() -> None:
             device=device,
             rng=rng,
             verbose=not args.quiet,
+            adjudicate_step_limit=args.adjudicate_step_limit,
         )
         total_steps += steps
 

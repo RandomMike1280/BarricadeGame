@@ -260,12 +260,13 @@ def play_game(
     truncated = False
 
     for ply in range(max_steps):
-        if state.winner is not None:
+        if state.winner is not None or getattr(state, "is_draw", False):
             break
 
         legal_actions = state.legal_actions()
         if not legal_actions:
-            state.winner = state.current_player.opposite()
+            if not getattr(state, "is_draw", False):
+                state.winner = state.current_player.opposite()
             break
 
         action = choose_action(
@@ -279,7 +280,7 @@ def play_game(
         state = apply_selected_action(state, action, legal_actions)
         steps = ply + 1
     else:
-        truncated = state.winner is None
+        truncated = state.winner is None and not getattr(state, "is_draw", False)
 
     if truncated:
         winner = adjudicated_winner(state, enabled=adjudicate_step_limit)

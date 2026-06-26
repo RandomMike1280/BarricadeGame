@@ -8,3 +8,6 @@ checkpoint_copies/
 *.fdb_latexmk
 *.aux
 *.txt
+*.out
+*.toc
+*.xdv

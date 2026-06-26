@@ -15,6 +15,7 @@ from barricade_env import (
     ACTION_SIZE,
     Player,
     MoveDirection,
+    DIAGONAL_HOP_OFFSET,
 )
 
 WALL_BOARD_SIZE = BOARD_SIZE - 1
@@ -43,6 +44,10 @@ def _build_canonical_flip_permutation() -> Tuple[int, ...]:
                 perm[offset + row * WALL_BOARD_SIZE + col] = (
                     offset + (WALL_BOARD_SIZE - 1 - row) * WALL_BOARD_SIZE + col
                 )
+    perm[DIAGONAL_HOP_OFFSET + 0] = DIAGONAL_HOP_OFFSET + 2
+    perm[DIAGONAL_HOP_OFFSET + 1] = DIAGONAL_HOP_OFFSET + 3
+    perm[DIAGONAL_HOP_OFFSET + 2] = DIAGONAL_HOP_OFFSET + 0
+    perm[DIAGONAL_HOP_OFFSET + 3] = DIAGONAL_HOP_OFFSET + 1
     return tuple(perm)
 
 

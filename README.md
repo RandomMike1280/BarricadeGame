@@ -56,7 +56,7 @@ obs, info = env.reset(
 
 ## Action space
 
-The environment uses a fixed discrete action space with 132 actions:
+The environment uses a fixed discrete action space with 136 actions:
 
 - `0`: move pawn one square up
 - `1`: move pawn one square down
@@ -64,6 +64,8 @@ The environment uses a fixed discrete action space with 132 actions:
 - `3`: move pawn one square right
 - `4..67`: place a horizontal wall, encoded as `4 + row * 8 + col`
 - `68..131`: place a vertical wall, encoded as `68 + row * 8 + col`
+- `132..135`: diagonal side-hop pawn moves, legal only when a straight pawn
+  jump is blocked
 
 Use `env.legal_action_mask()` or `info["action_mask"]` to mask illegal moves.
 Use `env.decode_action(action)` and `env.encode_move(move)` to convert between

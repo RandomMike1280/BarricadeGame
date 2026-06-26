@@ -91,8 +91,9 @@ class TrainConfig:
     checkpoint_dir: str = str(CHECKPOINT_DIR)
     replay_limit: Optional[int] = None
     replay_max_iteration: Optional[int] = None
-    # Sliding replay window: train only on the last N iterations of self-play
-    # data. Default 1 == on-policy (current iteration only). 0/None == unbounded.
+    # Sliding replay window: train on the current iteration plus the previous N
+    # iterations of self-play data. Default 1 == current + previous iteration.
+    # 0/None == unbounded.
     replay_window_size: Optional[int] = 1
     epochs: int = 1
     batch_size: int = 256
@@ -680,7 +681,7 @@ def _run_single_game_worker(
         history_length=network_config.history_length,
         device=resolved_device,
         add_root_noise=True,
-        action_temperature=1.0,
+        action_temperature=1.5,
     )
     mcts = MCTS(
         model,
@@ -1221,15 +1222,16 @@ def train_from_replay(
 
     if config.replay_window_size is not None and config.replay_window_size > 0:
         # Anchor the window at the explicit max iteration if given, otherwise at
-        # the iteration currently being trained. The window is [anchor-N+1, anchor],
-        # so chunks older than the window AND any stray future chunks are skipped.
+        # the iteration currently being trained. The window is [anchor-N, anchor],
+        # where N is the number of previous iterations to include. Chunks older
+        # than the window and any stray future chunks are skipped.
         replay_window_anchor = (
             config.replay_max_iteration
             if config.replay_max_iteration is not None
             else config.iteration
         )
         replay_min_iteration: Optional[int] = max(
-            1, replay_window_anchor - config.replay_window_size + 1
+            1, replay_window_anchor - config.replay_window_size
         )
         replay_max_iteration: Optional[int] = replay_window_anchor
     else:
@@ -1528,6 +1530,7 @@ def run_loop(
     network_config: NetworkConfig,
     *,
     iterations: int,
+    starting_iter: int = 1,
     self_play_config: SelfPlayConfig,
     train_config: TrainConfig,
     eval_config: EvalConfig,
@@ -1535,11 +1538,17 @@ def run_loop(
     device: Optional[str] = None,
 ) -> None:
     current_checkpoint = Path(checkpoint_path) if checkpoint_path else None
-    for iteration in range(1, iterations + 1):
+    if starting_iter < 1:
+        raise ValueError("--starting-iter must be >= 1.")
+    if iterations < 1:
+        raise ValueError("--iterations must be >= 1.")
+
+    final_iteration = starting_iter + iterations - 1
+    for iteration in range(starting_iter, final_iteration + 1):
         iter_start = time.time()
         print(
             f"\n{'=' * 70}\n"
-            f"[{_timestamp()}] [loop] iteration {iteration}/{iterations}\n"
+            f"[{_timestamp()}] [loop] iteration {iteration}/{final_iteration}\n"
             f"{'=' * 70}",
             flush=True,
         )
@@ -1921,6 +1930,7 @@ def parse_args() -> argparse.Namespace:
     train = subparsers.add_parser("train")
     add_network_args(train)
     train.add_argument("--iteration", type=int, default=1)
+    train.add_argument("--starting-iter", type=int, default=None)
     train.add_argument("--replay-dir", type=str, default=str(SELFPLAY_DIR))
     train.add_argument("--checkpoint-dir", type=str, default=str(CHECKPOINT_DIR))
     train.add_argument("--replay-limit", type=int, default=None)
@@ -1929,8 +1939,8 @@ def parse_args() -> argparse.Namespace:
         "--replay-window-size",
         type=int,
         default=1,
-        help="Train on the last N iterations of self-play data "
-        "(1=on-policy, 0=unbounded).",
+        help="Train on the current iteration plus the previous N iterations "
+        "of self-play data (default: 1; 0=unbounded).",
     )
     train.add_argument("--epochs", type=int, default=1)
     train.add_argument("--train-batch-size", type=int, default=256)
@@ -1958,6 +1968,7 @@ def parse_args() -> argparse.Namespace:
     loop = subparsers.add_parser("loop")
     add_network_args(loop)
     loop.add_argument("--iterations", type=int, default=1)
+    loop.add_argument("--starting-iter", type=int, default=1)
     loop.add_argument("--games", type=int, default=16)
     loop.add_argument("--base-simulations", type=int, default=128)
     loop.add_argument("--mcts-batch-size", type=int, default=16)
@@ -1972,8 +1983,8 @@ def parse_args() -> argparse.Namespace:
         "--replay-window-size",
         type=int,
         default=1,
-        help="Train on the last N iterations of self-play data "
-        "(1=on-policy, 0=unbounded).",
+        help="Train on the current iteration plus the previous N iterations "
+        "of self-play data (default: 1; 0=unbounded).",
     )
     loop.add_argument("--epochs", type=int, default=1)
     loop.add_argument("--train-batch-size", type=int, default=256)
@@ -2047,8 +2058,15 @@ def main() -> None:
 
     elif args.command == "train":
         model = build_model(network_config)
+        train_iteration = (
+            args.starting_iter if args.starting_iter is not None else args.iteration
+        )
+        if train_iteration < 1:
+            raise ValueError("--starting-iter/--iteration must be >= 1.")
+        if args.replay_window_size is not None and args.replay_window_size < 0:
+            raise ValueError("--replay-window-size must be >= 0.")
         config = TrainConfig(
-            iteration=args.iteration,
+            iteration=train_iteration,
             replay_dir=args.replay_dir,
             checkpoint_dir=args.checkpoint_dir,
             replay_limit=args.replay_limit,
@@ -2094,6 +2112,12 @@ def main() -> None:
         print(metrics)
 
     elif args.command == "loop":
+        if args.starting_iter < 1:
+            raise ValueError("--starting-iter must be >= 1.")
+        if args.iterations < 1:
+            raise ValueError("--iterations must be >= 1.")
+        if args.replay_window_size is not None and args.replay_window_size < 0:
+            raise ValueError("--replay-window-size must be >= 0.")
         model = build_model(network_config)
         if args.checkpoint:
             _load_checkpoint_into(
@@ -2146,6 +2170,7 @@ def main() -> None:
             model,
             network_config,
             iterations=args.iterations,
+            starting_iter=args.starting_iter,
             self_play_config=self_play_config,
             train_config=train_config,
             eval_config=eval_config,

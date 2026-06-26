@@ -716,6 +716,8 @@ class MCTS:
     # ------------------------------------------------------------------
 
     def _winner_evaluation(self, node: SearchNode) -> Optional[SearchEvaluation]:
+        if getattr(node.state, "is_draw", False):
+            return SearchEvaluation(value=0.0, lead=0.0)
         winner = node.state.winner
         if winner is not None:
             value = 1.0 if winner == node.state.current_player else -1.0
