@@ -33,6 +33,14 @@ class MCTSConfig:
     root_exploration_fraction: float = 0.25
     action_temperature: float = 1.0
     policy_target_temperature: Optional[float] = None
+    # Label-smoothing floor applied to the *training* policy target only (not the
+    # action-selection policy). Mixes ``policy_target_floor`` mass uniformly over
+    # the legal moves: target = (1 - floor) * visit_dist + floor * uniform_legal.
+    # This guarantees every legal move (e.g. the 4 pawn moves in a 130-wide action
+    # space) keeps nonzero target mass, preventing cross-entropy from driving rarely
+    # visited moves' logits to -inf (the policy-collapse failure mode). Default 0.0
+    # preserves legacy behavior for eval/benchmark callers.
+    policy_target_floor: float = 0.0
     history_length: int = 0
     device: Optional[str] = None
     add_root_noise: bool = True
@@ -266,7 +274,9 @@ class MCTS:
             if self.config.policy_target_temperature is None
             else self.config.policy_target_temperature
         )
-        policy_target = self._policy_target(root, policy_target_temperature)
+        policy_target = self._policy_target(
+            root, policy_target_temperature, floor=self.config.policy_target_floor
+        )
         action_policy = self._policy_target(root, self.config.action_temperature)
         action = self._sample_policy(action_policy)
         stats = self._action_stats(root, policy_target)
@@ -790,17 +800,22 @@ class MCTS:
             return 0.0
         return self._lead_weight * math.tanh(float(lead) * self._inv_lead_scale)
 
-    def _policy_target(self, root: SearchNode, temperature: float) -> List[float]:
+    def _policy_target(
+        self, root: SearchNode, temperature: float, floor: float = 0.0
+    ) -> List[float]:
+        policy = [0.0] * self.action_size
+        legal_actions = list(root.edges.keys())
+        if not legal_actions:
+            return policy
+
         stats = [
             (action, edge.visits)
             for action, edge in root.edges.items()
             if edge.visits > 0
         ]
-        policy = [0.0] * self.action_size
         if not stats:
-            legal_actions = list(root.edges.keys())
-            if not legal_actions:
-                return policy
+            # No visits: uniform over legal moves already covers every legal
+            # action, so the floor would be a no-op.
             uniform = 1.0 / len(legal_actions)
             for action in legal_actions:
                 policy[action] = uniform
@@ -816,23 +831,30 @@ class MCTS:
                 ),
             )[0]
             policy[best_action] = 1.0
-            return policy
+        else:
+            inv_temp = 1.0 / max(temperature, 1e-6)
+            weights = [
+                (action, float(visits) ** inv_temp)
+                for action, visits in stats
+            ]
+            total = sum(w for _, w in weights)
+            if total <= 0:
+                uniform = 1.0 / len(stats)
+                for action, _ in stats:
+                    policy[action] = uniform
+            else:
+                inv_total = 1.0 / total
+                for action, weight in weights:
+                    policy[action] = weight * inv_total
 
-        inv_temp = 1.0 / max(temperature, 1e-6)
-        weights = [
-            (action, float(visits) ** inv_temp)
-            for action, visits in stats
-        ]
-        total = sum(w for _, w in weights)
-        if total <= 0:
-            uniform = 1.0 / len(stats)
-            for action, _ in stats:
-                policy[action] = uniform
-            return policy
-
-        inv_total = 1.0 / total
-        for action, weight in weights:
-            policy[action] = weight * inv_total
+        # Label-smoothing floor: spread ``floor`` mass uniformly over the legal
+        # moves so every legal action keeps a nonzero target probability. Applied
+        # only when requested (training target), leaving action-selection intact.
+        if floor > 0.0:
+            keep = 1.0 - floor
+            floor_share = floor / len(legal_actions)
+            for action in legal_actions:
+                policy[action] = keep * policy[action] + floor_share
         return policy
 
     def _sample_policy(self, policy: Sequence[float]) -> int:

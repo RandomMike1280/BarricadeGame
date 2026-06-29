@@ -27,6 +27,137 @@ from mcts import MCTS, MCTSConfig
 
 
 MODEL_HISTORY_LENGTH_ATTR = "_mini_bench_history_length"
+MODEL_VALUE_MULTIPLIER_ATTR = "_mini_bench_value_multiplier"
+
+
+class ValueSignCorrectedModel(nn.Module):
+    def __init__(self, model: nn.Module, value_multiplier: float):
+        super().__init__()
+        self.model = model
+        self.value_multiplier = float(value_multiplier)
+
+    def forward(self, *args, **kwargs):
+        outputs = self.model(*args, **kwargs)
+        if not isinstance(outputs, tuple) or len(outputs) < 2:
+            return outputs
+        outputs_list = list(outputs)
+        outputs_list[1] = outputs_list[1] * self.value_multiplier
+        return tuple(outputs_list)
+
+    def inference(self, *args, **kwargs):
+        logits, value, lead = self.model.inference(*args, **kwargs)
+        return logits, value * self.value_multiplier, lead
+
+
+def model_for_mcts(model: nn.Module) -> nn.Module:
+    value_multiplier = float(getattr(model, MODEL_VALUE_MULTIPLIER_ATTR, 1.0))
+    if value_multiplier == 1.0:
+        return model
+    return ValueSignCorrectedModel(model, value_multiplier)
+
+
+@torch.inference_mode()
+def raw_value_head(
+    model: nn.Module,
+    state: BarricadeState,
+    *,
+    board_size: int,
+    device: torch.device,
+    history: Sequence[BarricadeState] = (),
+) -> float:
+    model.eval()
+    if board_size == 7:
+        from train_7x7_tabula_rasa import encode_state
+
+        state_planes = encode_state(state, device).unsqueeze(0)
+    else:
+        from network import encode_state_stack
+
+        history_length = int(getattr(model, MODEL_HISTORY_LENGTH_ATTR, 0))
+        state_planes = encode_state_stack(
+            state,
+            history[-history_length:] if history_length > 0 else (),
+            history_length=history_length,
+        ).unsqueeze(0).to(device)
+
+    _, value, _ = model.inference(state_planes)
+    return float(
+        torch.nan_to_num(
+            value.reshape(-1)[0],
+            nan=0.0,
+            posinf=1.0,
+            neginf=-1.0,
+        )
+        .clamp(-1.0, 1.0)
+        .item()
+    )
+
+
+def probe_value_perspective(
+    model: nn.Module,
+    *,
+    board_size: int,
+    device: torch.device,
+) -> float:
+    walls = 5 if board_size == 7 else 10
+    columns = sorted({0, board_size // 2, board_size - 1})
+    probes: List[BarricadeState] = []
+    for col in columns:
+        other_col = (col + 1) % board_size
+        probes.append(
+            BarricadeState(
+                red_start=(board_size - 2, col),
+                blue_start=(board_size - 1, other_col),
+                red_walls=walls,
+                blue_walls=walls,
+                starting_player=Player.RED,
+                board_size=board_size,
+            )
+        )
+        probes.append(
+            BarricadeState(
+                red_start=(0, other_col),
+                blue_start=(1, col),
+                red_walls=walls,
+                blue_walls=walls,
+                starting_player=Player.BLUE,
+                board_size=board_size,
+            )
+        )
+
+    mean_raw_value = sum(
+        raw_value_head(
+            model,
+            state,
+            board_size=board_size,
+            device=device,
+        )
+        for state in probes
+    ) / max(1, len(probes))
+    return mean_raw_value
+
+
+def infer_value_perspective(
+    model: nn.Module,
+    *,
+    board_size: int,
+    device: torch.device,
+) -> Tuple[str, float]:
+    """Auto-detect the raw value-head sign convention.
+
+    ``probe_value_perspective`` evaluates positions where the side-to-move is
+    clearly winning, so a side-to-move POV head returns a positive mean and an
+    inverted ("opponent") head returns a negative mean. Returns the detected
+    perspective ("side-to-move" or "opponent") and the probe score.
+
+    Note: the training target in train.py is side-to-move POV by construction
+    (+1 iff side_to_move == winner), so "side-to-move" is the expected result.
+    The probe magnitude can be small for under-trained value heads, which is why
+    the CLI defaults to "side-to-move" rather than this auto-detection.
+    """
+    score = probe_value_perspective(model, board_size=board_size, device=device)
+    perspective = "side-to-move" if score >= 0.0 else "opponent"
+    return perspective, score
 
 
 class AlphaBetaAI:
@@ -195,7 +326,12 @@ def choose_model_action(
             lead_weight=0.02,
             lead_scale=5.0,
         )
-        result = build_mcts(model, device=device, rng=rng, config=config).search(state)
+        result = build_mcts(
+            model_for_mcts(model),
+            device=device,
+            rng=rng,
+            config=config,
+        ).search(state)
         action = int(result.action)
         if action in state.legal_actions():
             return action
@@ -223,7 +359,7 @@ def choose_model_action(
             lead_scale=5.0,
         )
         result = build_mcts_9x9(
-            model,
+            model_for_mcts(model),
             device=device,
             rng=rng,
             config=config,
@@ -241,6 +377,37 @@ def choose_model_action(
             rng=rng,
             history=history,
         )
+
+
+@torch.inference_mode()
+def evaluate_value_head_blue_pov(
+    model: nn.Module,
+    state: BarricadeState,
+    *,
+    board_size: int,
+    device: torch.device,
+    history: Sequence[BarricadeState] = (),
+) -> float:
+    """Return the value head from a fixed Blue perspective.
+
+    ``MODEL_VALUE_MULTIPLIER_ATTR`` converts the checkpoint's raw scalar into
+    side-to-move POV before this function converts it into Blue POV.
+    """
+    if getattr(state, "is_draw", False):
+        return 0.0
+    if state.winner is not None:
+        return 1.0 if state.winner == Player.BLUE else -1.0
+
+    side_to_move_value = raw_value_head(
+        model,
+        state,
+        board_size=board_size,
+        device=device,
+        history=history,
+    )
+    value_multiplier = float(getattr(model, MODEL_VALUE_MULTIPLIER_ATTR, 1.0))
+    side_to_move_value *= value_multiplier
+    return -side_to_move_value if state.current_player == Player.BLUE else side_to_move_value
 
 
 def format_move(move_type: str, details: Tuple) -> str:
@@ -279,11 +446,10 @@ def play_single_game(
     ab_depth: int,
     device: torch.device,
     rng: random.Random,
+    starting_player: Player = Player.RED,
     verbose: bool = True,
     adjudicate_step_limit: bool = False,
 ) -> Tuple[Optional[Player], int, bool]:
-    # Alternate who goes first
-    starting_player = Player.RED if game_idx % 2 == 0 else Player.BLUE
     # Alternate roles for model: game 0: model is RED, game 1: model is BLUE
     model_role = Player.RED if (game_idx // 2) % 2 == 0 else Player.BLUE
     ab_role = model_role.opposite()
@@ -301,15 +467,27 @@ def play_single_game(
         board_size=board_size,
     )
 
+    history: List[BarricadeState] = []
+
     if verbose:
         print(f"\n--- Game {game_idx + 1} ---")
         print(f"Model Role: {model_role.name} | AB Opponent Role: {ab_role.name}")
         print(f"Starting Player: {starting_player.name} | Random Start Col: {start_col}")
         print(f"Initial Walls: {walls} | Board Size: {board_size}x{board_size}")
+        initial_value = evaluate_value_head_blue_pov(
+            model,
+            state,
+            board_size=board_size,
+            device=device,
+            history=history,
+        )
+        print(
+            f"Value Head (Blue POV): {initial_value:+.3f} "
+            "(+1 BLUE winning / RED losing, -1 RED winning / BLUE losing)"
+        )
 
     steps = 0
     truncated = False
-    history: List[BarricadeState] = []
 
     for ply in range(max_steps):
         if state.winner is not None or getattr(state, "is_draw", False):
@@ -323,6 +501,18 @@ def play_single_game(
 
         current_player = state.current_player
         is_model_turn = current_player == model_role
+        state_before = state.copy()
+        value_blue_pov = (
+            evaluate_value_head_blue_pov(
+                model,
+                state,
+                board_size=board_size,
+                device=device,
+                history=history,
+            )
+            if verbose
+            else 0.0
+        )
 
         if is_model_turn:
             action = choose_model_action(
@@ -338,7 +528,6 @@ def play_single_game(
         else:
             action = ab_agent.get_best_move(state)
 
-        state_before = state.copy()
         move_decoded = state.decode_action(action)
         state = apply_selected_action(state, action, legal_actions)
         history.append(state_before)
@@ -346,11 +535,22 @@ def play_single_game(
 
         if verbose:
             move_str = format_move(move_decoded[0], move_decoded[1:])
+            pre_red_pos = state_before.pawns[Player.RED]
+            pre_blue_pos = state_before.pawns[Player.BLUE]
+            pre_walls = (
+                state_before.walls_left[Player.RED],
+                state_before.walls_left[Player.BLUE],
+            )
             red_pos = state.pawns[Player.RED]
             blue_pos = state.pawns[Player.BLUE]
+            post_walls = (
+                state.walls_left[Player.RED],
+                state.walls_left[Player.BLUE],
+            )
             print(
-                f"{steps:03d} {current_player.name:<4} {move_str:<25} "
-                f"R={red_pos} B={blue_pos} walls=({state.walls_left[Player.RED]},{state.walls_left[Player.BLUE]})"
+                f"{steps:03d} {current_player.name:<4} valueB_pre={value_blue_pov:+.3f} "
+                f"{move_str:<25} R={pre_red_pos}->{red_pos} "
+                f"B={pre_blue_pos}->{blue_pos} walls={pre_walls}->{post_walls}"
             )
     else:
         truncated = state.winner is None
@@ -580,6 +780,23 @@ def main() -> None:
         action="store_true",
         help="Award max-step games by shortest path instead of counting them as draws.",
     )
+    parser.add_argument(
+        "--starting-player",
+        choices=("red", "blue"),
+        default="red",
+        help="Fixed starting player for every game.",
+    )
+    parser.add_argument(
+        "--value-perspective",
+        choices=("auto", "side-to-move", "opponent"),
+        default="side-to-move",
+        help=(
+            "Raw value-head convention. train.py trains value as side-to-move "
+            "POV (+1 == player-to-move winning), so this is the default. Use "
+            "'opponent' if -1 means the current player is winning, or 'auto' to "
+            "probe near-winning states (can be unreliable for weak value heads)."
+        ),
+    )
     args = parser.parse_args()
 
     # Seed configuration
@@ -602,10 +819,31 @@ def main() -> None:
 
     print(f"Loading checkpoint from: {args.checkpoint} on device: {device}")
     model = load_model(args.checkpoint, board_size=args.board_size, device=device)
+    value_perspective = args.value_perspective
+    value_probe_score: Optional[float] = None
+    if value_perspective == "auto":
+        value_perspective, value_probe_score = infer_value_perspective(
+            model,
+            board_size=args.board_size,
+            device=device,
+        )
+    value_multiplier = 1.0 if value_perspective == "side-to-move" else -1.0
+    setattr(model, MODEL_VALUE_MULTIPLIER_ATTR, value_multiplier)
 
     print(f"\nStarting benchmark: {args.games} games, board size: {args.board_size}x{args.board_size}")
     print(f"Model: MCTS simulations = {args.simulations}")
     print(f"Alpha-Beta Opponent: search depth = {args.depth}")
+    starting_player = Player[args.starting_player.upper()]
+    print(f"Starting player: {starting_player.name}")
+    probe_suffix = (
+        f" (auto probe mean raw={value_probe_score:+.3f})"
+        if value_probe_score is not None
+        else ""
+    )
+    print(
+        f"Value perspective: {value_perspective} "
+        f"(MCTS multiplier {value_multiplier:+.0f}){probe_suffix}"
+    )
 
     rng = random.Random(args.seed)
     model_wins = 0
@@ -626,6 +864,7 @@ def main() -> None:
             ab_depth=args.depth,
             device=device,
             rng=rng,
+            starting_player=starting_player,
             verbose=not args.quiet,
             adjudicate_step_limit=args.adjudicate_step_limit,
         )

@@ -80,6 +80,10 @@ class SelfPlayConfig:
     resign_threshold: float = -0.85
     resign_plies: int = 6
     resign_disable_fraction: float = 0.1
+    # Adjudicate threefold-repetition (shuffle) draws by race lead so self-play
+    # stays decisive and the value head keeps a win/loss signal instead of
+    # collapsing to 0 everywhere. Set False to keep pure rules draws.
+    adjudicate_repetition_draws: bool = True
     # Force process-based (vs thread+server) self-play; None => auto by device.
     use_processes: Optional[bool] = None
 
@@ -375,12 +379,20 @@ class BatchInferenceServer:
 # Replay dataset
 # ======================================================================
 
-def _is_decisive_game(winner: Any, truncated: bool) -> bool:
-    return winner is not None and not truncated
+def _is_trainable_game(winner: Any, truncated: bool) -> bool:
+    """Whether a finished game's samples are worth training on.
+
+    Keeps decisive games (a winner) and rules draws (a terminal draw reached by
+    the game's own rules, ``winner is None`` with ``truncated`` False — value
+    target 0.0 is the true outcome). Skips ONLY truncation draws: games that hit
+    the step limit with no result, whose 0.0 value target labels an unfinished
+    position and is therefore noise.
+    """
+    return not (winner is None and bool(truncated))
 
 
-def _is_decisive_replay_sample(sample: Dict[str, Any]) -> bool:
-    return _is_decisive_game(
+def _is_trainable_replay_sample(sample: Dict[str, Any]) -> bool:
+    return _is_trainable_game(
         sample.get("winner"),
         bool(sample.get("truncated", False)),
     )
@@ -457,12 +469,12 @@ class ReplayDataset(Dataset):
             samples.extend(payload.get("samples", []))
 
         self.total_samples_loaded = len(samples)
-        decisive_samples = [
-            sample for sample in samples if _is_decisive_replay_sample(sample)
+        trainable_samples = [
+            sample for sample in samples if _is_trainable_replay_sample(sample)
         ]
         bad_policy_games = set()
         bad_policy_ungrouped = set()
-        for index, sample in enumerate(decisive_samples):
+        for index, sample in enumerate(trainable_samples):
             if _policy_target_is_legal(sample):
                 continue
             game_id = sample.get("game_id")
@@ -473,12 +485,12 @@ class ReplayDataset(Dataset):
 
         self.samples = [
             sample
-            for index, sample in enumerate(decisive_samples)
+            for index, sample in enumerate(trainable_samples)
             if sample.get("game_id") not in bad_policy_games
             and index not in bad_policy_ungrouped
         ]
-        self.filtered_samples = self.total_samples_loaded - len(decisive_samples)
-        self.filtered_policy_samples = len(decisive_samples) - len(self.samples)
+        self.filtered_samples = self.total_samples_loaded - len(trainable_samples)
+        self.filtered_policy_samples = len(trainable_samples) - len(self.samples)
         self.filtered_policy_games = len(bad_policy_games)
         self.replay_max_iteration = max_iteration
         self.replay_min_iteration = min_iteration
@@ -487,7 +499,7 @@ class ReplayDataset(Dataset):
             self.samples = self.samples[-limit:]
         if not self.samples:
             raise ValueError(
-                f"No non-truncated, non-draw replay samples found in {self.replay_dir}"
+                f"No trainable (non-truncation) replay samples found in {self.replay_dir}"
             )
 
     def __len__(self) -> int:
@@ -682,6 +694,25 @@ def _run_single_game_worker(
         device=resolved_device,
         add_root_noise=True,
         action_temperature=1.5,
+        # Policy TARGET (training label) is the true normalized visit
+        # distribution at a fixed temperature, decoupled from the per-move
+        # action-SELECTION temperature schedule (which still varies below).
+        # Without this it falls back to action_temperature -> one-hot targets
+        # after the temperature drop, which collapses the policy onto walls.
+        policy_target_temperature=1.0,
+        # Guarantee every legal move keeps nonzero target mass so the 4 pawn
+        # moves can never be driven to zero prior by the 128-wide wall action
+        # space (the observed policy-collapse failure mode).
+        policy_target_floor=0.03,
+        # Dirichlet alpha scaled to the ~130-move branching factor (~10/N) so
+        # low-prior pawn moves are actually surfaced and visited at the root.
+        root_dirichlet_alpha=0.1,
+        # FPU=0: do NOT penalize unvisited moves. With the default 0.33 and a
+        # near-flat value head, every unvisited move is scored ~parent_q-0.31,
+        # so low-prior pawn moves never earn a first visit even at 16k sims and
+        # MCTS just follows the (wall-biased) policy. 0 lets the search actually
+        # probe pawn moves and discover terminal wins at the 512-sim budget.
+        fpu_reduction=0.0,
     )
     mcts = MCTS(
         model,
@@ -701,7 +732,7 @@ def _run_single_game_worker(
         ).cpu()
 
         simulations = sample_playout_cap(config.base_simulations, rng)
-        temp = 1.0 if ply < config.temperature_drop_ply else 0.0
+        temp = 2.0 if ply < config.temperature_drop_ply else 0.0
         mcts.config = replace(
             mcts.config,
             num_simulations=simulations,
@@ -770,6 +801,15 @@ def _run_single_game_worker(
         truncated = False
     else:
         winner = info.get("winner")
+        if (
+            config.adjudicate_repetition_draws
+            and winner is None
+            and not truncated
+            and getattr(env.state, "is_draw", False)
+        ):
+            adjudicated = _adjudicate_repetition_draw(env.state)
+            if adjudicated is not None:
+                winner = adjudicated
     lead = info.get("lead")
     final_metadata = {
         "winner": winner,
@@ -946,7 +986,7 @@ def run_self_play(
         nonlocal resigned_games, total_samples_generated, total_samples_collected
 
         total_samples_generated += len(game_samples)
-        keep_game = _is_decisive_game(
+        keep_game = _is_trainable_game(
             game_info.get("winner"), bool(game_info.get("truncated", False))
         )
         kept_samples = len(game_samples) if keep_game else 0
@@ -1448,6 +1488,10 @@ def evaluate_models(
             device=device,
             add_root_noise=False,
             action_temperature=0.0,
+            # Match self-play: without this, eval games shuffle into repetition
+            # draws (MCTS can't explore the winning pawn moves), so every
+            # candidate scores 50% and is rejected.
+            fpu_reduction=0.0,
         )
 
         while not terminated and not truncated:
@@ -1468,6 +1512,10 @@ def evaluate_models(
             roots[current.opposite()] = None
 
         winner = info.get("winner")
+        if winner is None and getattr(env.state, "is_draw", False):
+            adjudicated = _adjudicate_repetition_draw(env.state)
+            if adjudicated is not None:
+                winner = adjudicated
         if winner is None:
             draws += 1
             result_str = "draw"
@@ -1790,6 +1838,29 @@ def _write_replay_chunk(
 # ======================================================================
 # Target computation helpers
 # ======================================================================
+
+def _adjudicate_repetition_draw(state: Any) -> Optional[str]:
+    """Award a threefold-repetition draw to whoever is ahead in the race.
+
+    Self-play between two equal models tends to shuffle into repetition draws,
+    whose value target (0.0) gives the value head no signal — it goes flat and
+    MCTS degenerates into following the policy. Adjudicating a lopsided draw by
+    race lead (shorter shortest-path, then more walls remaining) yields a
+    decisive signal that teaches racing. Genuinely balanced positions (equal
+    path AND equal walls) remain true draws.
+    """
+    red = state.shortest_path_length(Player.RED)
+    blue = state.shortest_path_length(Player.BLUE)
+    if red is None or blue is None:
+        return None
+    if red != blue:
+        return Player.RED.name if red < blue else Player.BLUE.name
+    red_walls = state.walls_left[Player.RED]
+    blue_walls = state.walls_left[Player.BLUE]
+    if red_walls != blue_walls:
+        return Player.RED.name if red_walls > blue_walls else Player.BLUE.name
+    return None
+
 
 def _value_target(side_to_move: str, winner: Optional[str], truncated: bool) -> float:
     if winner is None:

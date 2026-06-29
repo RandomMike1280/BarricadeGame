@@ -71,3 +71,15 @@ avg_steps=41.0 elapsed=2432.830s games_per_second=0.11
 
 ### 25-05-2026 19:17
  - 5000 accumulated games
+
+### 26-06-2026
+ - model_iter_000010.pt
+ - base line elo
+
+### 27-06-2026
+ - model_iter_000033.pt
+ - +52 elo (256 simulations per move)
+
+### 28-06-2026
+ - latest_2806h1203.pt
+ - +259 elo (256 sims per move)

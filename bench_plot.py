@@ -9,6 +9,7 @@ Edit the lists/config values below directly, then run:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import random
@@ -17,7 +18,11 @@ import time
 from typing import Any, Dict, Optional, Sequence
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path("/tmp") / "matplotlib-barricade-bench"))
+os.environ.setdefault("MPLBACKEND", "Agg")
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 from torch import nn
@@ -33,7 +38,7 @@ SIMULATION_COUNTS = [16, 32, 64, 128, 256, 512, 1024]
 
 # Edit these settings directly too; no command-line args are used.
 REPEATS = 3
-POSITIONS = 1
+POSITIONS = 10
 SEARCHES_PER_POSITION = 1
 WARMUP_PLIES = 12
 WARMUP_SEARCHES = 1
@@ -292,31 +297,113 @@ def print_result(result: BenchResult, *, run_index: int, total_runs: int) -> Non
 
 def plot_results(results: Sequence[BenchResult], path: Path) -> None:
     grouped = grouped_results(results)
+    colors = plt.get_cmap("tab10").colors
 
-    plt.figure(figsize=(10, 6))
-    for simulations in SIMULATION_COUNTS:
+    figure, axis = plt.subplots(figsize=(11.5, 6.4), facecolor="white")
+    axis.set_facecolor("white")
+
+    for index, simulations in enumerate(SIMULATION_COUNTS):
+        x_values = [float(batch_size) for batch_size in NETWORK_BATCH_SIZES]
         y_values = [
             average_metric(grouped[(simulations, batch_size)], "simulations_per_second")
             for batch_size in NETWORK_BATCH_SIZES
         ]
-        plt.plot(
-            NETWORK_BATCH_SIZES,
-            y_values,
-            marker="o",
-            linewidth=2.0,
+        smooth_x, smooth_y = smooth_curve(x_values, y_values)
+        color = colors[index % len(colors)]
+
+        axis.plot(
+            smooth_x,
+            smooth_y,
+            color=color,
+            linewidth=2.4,
+            alpha=0.95,
+            solid_capstyle="round",
             label=f"{simulations} simulations",
         )
+        axis.plot(
+            x_values,
+            y_values,
+            linestyle="none",
+            marker="o",
+            markersize=6.5,
+            markerfacecolor=color,
+            markeredgecolor="white",
+            markeredgewidth=0.9,
+            color=color,
+        )
 
-    plt.xscale("log", base=2)
-    plt.xticks(NETWORK_BATCH_SIZES, [str(batch_size) for batch_size in NETWORK_BATCH_SIZES])
-    plt.xlabel("MCTS neural-network batch size")
-    plt.ylabel("Completed simulations per second")
-    plt.title("MCTS Speed vs Batch Size and Simulation Count")
-    plt.grid(True, which="both", linestyle="--", alpha=0.35)
-    plt.legend(title="Search budget")
-    plt.tight_layout()
-    plt.savefig(path, dpi=160)
-    plt.close()
+    axis.set_xscale("log", base=2)
+    axis.set_xticks(NETWORK_BATCH_SIZES)
+    axis.set_xticklabels([str(batch_size) for batch_size in NETWORK_BATCH_SIZES])
+    axis.set_xlabel("MCTS neural-network batch size", fontsize=11)
+    axis.set_ylabel("Completed simulations per second", fontsize=11)
+    axis.set_title("MCTS Speed vs Batch Size and Simulation Count", fontsize=15, pad=12)
+    axis.grid(True, which="major", color="#e5e7eb", linestyle="--", linewidth=0.85)
+    axis.grid(True, which="minor", color="#f1f5f9", linestyle=":", linewidth=0.55)
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    axis.spines["left"].set_color("#d1d5db")
+    axis.spines["bottom"].set_color("#d1d5db")
+    axis.tick_params(colors="#111827", labelsize=10)
+    axis.margins(x=0.03, y=0.08)
+    axis.legend(
+        title="Search budget",
+        frameon=True,
+        facecolor="white",
+        edgecolor="#d1d5db",
+        fontsize=9.5,
+        title_fontsize=10.5,
+    )
+    figure.tight_layout()
+    figure.savefig(path, dpi=180, facecolor=figure.get_facecolor())
+    plt.close(figure)
+
+
+def smooth_curve(
+    x_values: Sequence[float],
+    y_values: Sequence[float],
+    *,
+    points_per_segment: int = 28,
+) -> tuple[list[float], list[float]]:
+    if len(x_values) < 4:
+        return list(x_values), list(y_values)
+
+    log_x = [log2(value) for value in x_values]
+    smooth_log_x: list[float] = []
+    smooth_y: list[float] = []
+
+    for index in range(len(log_x) - 1):
+        x0 = log_x[max(0, index - 1)]
+        x1 = log_x[index]
+        x2 = log_x[index + 1]
+        x3 = log_x[min(len(log_x) - 1, index + 2)]
+        y0 = y_values[max(0, index - 1)]
+        y1 = y_values[index]
+        y2 = y_values[index + 1]
+        y3 = y_values[min(len(y_values) - 1, index + 2)]
+
+        for step in range(points_per_segment):
+            if index > 0 or step > 0:
+                t = step / points_per_segment
+                smooth_log_x.append(catmull_rom(x0, x1, x2, x3, t))
+                smooth_y.append(catmull_rom(y0, y1, y2, y3, t))
+
+    smooth_log_x.append(log_x[-1])
+    smooth_y.append(y_values[-1])
+    return [2.0**value for value in smooth_log_x], smooth_y
+
+
+def catmull_rom(p0: float, p1: float, p2: float, p3: float, t: float) -> float:
+    return 0.5 * (
+        (2.0 * p1)
+        + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t * t
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t * t * t
+    )
+
+
+def log2(value: float) -> float:
+    return math.log2(value)
 
 
 if __name__ == "__main__":

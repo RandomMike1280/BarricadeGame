@@ -1,9 +1,9 @@
 """
-Benchmark two 7x7 Barricade checkpoints head-to-head.
+Benchmark two 9x9 Barricade checkpoints from train.py head-to-head.
 
 Examples:
     python benchmark_models.py checkpoints/a.pt checkpoints/b.pt --games 32 --simulations 64
-    python benchmark_models.py checkpoint_copies/best_1506.pt checkpoints/7x7_mcts_aux.pt --games 8 --simulations 0
+    python benchmark_models.py checkpoints/latest.pt checkpoints/model_iter_000010.pt --games 8 --simulations 0
 """
 
 from __future__ import annotations
@@ -13,33 +13,33 @@ from dataclasses import dataclass
 from pathlib import Path
 import random
 import time
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import torch
-from torch import nn
+from torch import Tensor, nn
 
-from barricade_env import apply_selected_action
-from mcts import MCTSConfig
-from train_7x7_tabula_rasa import (
-    AlphaZeroNet,
+from barricade_env import (
     BOARD_SIZE,
-    DEFAULT_MAX_STEPS,
     DEFAULT_WALLS_PER_PLAYER,
-    GameState,
+    BarricadeEnv,
+    BarricadeState,
     Player,
-    adjudicated_winner,
-    build_mcts,
-    select_model_action,
 )
+from canonical import canonical_action
+from mcts import MCTS, MCTSConfig
+from network import encode_state_stack
+from train import NetworkConfig, _load_model_state, build_model, policy_action_for_mcts
+
+
+DEFAULT_MAX_STEPS = 500
 
 
 @dataclass(frozen=True)
 class LoadedModel:
     name: str
     path: Path
-    model: AlphaZeroNet
-    hidden_channels: int
-    residual_blocks: int
+    model: nn.Module
+    network_config: NetworkConfig
 
 
 @dataclass(frozen=True)
@@ -63,7 +63,7 @@ class GameResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Play two 7x7 Barricade checkpoints against each other."
+        description="Play two 9x9 train.py Barricade checkpoints against each other."
     )
     parser.add_argument("checkpoint_a", type=Path)
     parser.add_argument("checkpoint_b", type=Path)
@@ -77,16 +77,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument(
-        "--hidden-channels",
+        "--history-length",
         type=int,
         default=None,
-        help="Fallback model width if it cannot be inferred from a checkpoint.",
+        help="Override checkpoint history length when loading plain state_dict checkpoints.",
     )
     parser.add_argument(
-        "--residual-blocks",
+        "--conv-channels",
         type=int,
         default=None,
-        help="Fallback residual block count if it cannot be inferred from a checkpoint.",
+        help="Override checkpoint conv channel count when loading plain state_dict checkpoints.",
+    )
+    parser.add_argument(
+        "--residual-channels",
+        type=int,
+        default=None,
+        help="Override checkpoint residual channel count when loading plain state_dict checkpoints.",
+    )
+    parser.add_argument(
+        "--num-conv-layers",
+        type=int,
+        default=None,
+        help="Override checkpoint conv layer count when loading plain state_dict checkpoints.",
+    )
+    parser.add_argument(
+        "--num-residual-layers",
+        type=int,
+        default=None,
+        help="Override checkpoint residual layer count when loading plain state_dict checkpoints.",
+    )
+    parser.add_argument(
+        "--value-hidden-size",
+        type=int,
+        default=None,
+        help="Override checkpoint value hidden size when loading plain state_dict checkpoints.",
     )
     parser.add_argument("--no-adjudicate-step-limit", action="store_true")
     parser.add_argument("--quiet", action="store_true")
@@ -108,20 +132,8 @@ def main() -> None:
         torch.cuda.manual_seed_all(args.seed)
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model_a = load_model(
-        args.checkpoint_a,
-        device=device,
-        name=args.name_a,
-        fallback_hidden_channels=args.hidden_channels,
-        fallback_residual_blocks=args.residual_blocks,
-    )
-    model_b = load_model(
-        args.checkpoint_b,
-        device=device,
-        name=args.name_b,
-        fallback_hidden_channels=args.hidden_channels,
-        fallback_residual_blocks=args.residual_blocks,
-    )
+    model_a = load_model(args.checkpoint_a, device=device, name=args.name_a, args=args)
+    model_b = load_model(args.checkpoint_b, device=device, name=args.name_b, args=args)
 
     rng = random.Random(args.seed)
     started = time.perf_counter()
@@ -129,8 +141,8 @@ def main() -> None:
     for game_index in range(args.games):
         result = play_game(
             game_index,
-            model_a.model,
-            model_b.model,
+            model_a,
+            model_b,
             rng=rng,
             device=device,
             simulations=max(0, int(args.simulations)),
@@ -162,33 +174,23 @@ def load_model(
     *,
     device: torch.device,
     name: Optional[str],
-    fallback_hidden_channels: Optional[int],
-    fallback_residual_blocks: Optional[int],
+    args: argparse.Namespace,
 ) -> LoadedModel:
     payload = torch.load(path, map_location=device, weights_only=False)
-    state_dict = _state_dict_from_payload(payload)
-    hidden_channels, residual_blocks = _infer_model_config(
-        payload,
-        state_dict,
-        fallback_hidden_channels=fallback_hidden_channels,
-        fallback_residual_blocks=fallback_residual_blocks,
-    )
-    model = AlphaZeroNet(
-        hidden_channels=hidden_channels,
-        residual_blocks=residual_blocks,
-    ).to(device)
-    model.load_state_dict(state_dict)
+    state_dict = state_dict_from_payload(payload)
+    network_config = network_config_from_payload(payload, args)
+    model = build_model(network_config).to(device)
+    _load_model_state(model, state_dict)
     model.eval()
     return LoadedModel(
         name=name or path.stem,
         path=path,
         model=model,
-        hidden_channels=hidden_channels,
-        residual_blocks=residual_blocks,
+        network_config=network_config,
     )
 
 
-def _state_dict_from_payload(payload: object) -> Dict[str, torch.Tensor]:
+def state_dict_from_payload(payload: object) -> Dict[str, Tensor]:
     if isinstance(payload, dict) and "model_state" in payload:
         state_dict = payload["model_state"]
     else:
@@ -198,43 +200,38 @@ def _state_dict_from_payload(payload: object) -> Dict[str, torch.Tensor]:
     return state_dict
 
 
-def _infer_model_config(
+def network_config_from_payload(
     payload: object,
-    state_dict: Dict[str, torch.Tensor],
-    *,
-    fallback_hidden_channels: Optional[int],
-    fallback_residual_blocks: Optional[int],
-) -> tuple[int, int]:
-    args = payload.get("args", {}) if isinstance(payload, dict) else {}
-    if not isinstance(args, dict):
-        args = {}
+    args: argparse.Namespace,
+) -> NetworkConfig:
+    raw_config: Dict[str, Any] = {}
+    if isinstance(payload, dict) and isinstance(payload.get("network_config"), dict):
+        raw_config = dict(payload["network_config"])
 
-    hidden_channels = args.get("hidden_channels", fallback_hidden_channels)
-    if hidden_channels is None:
-        stem_weight = state_dict.get("stem.0.weight")
-        if stem_weight is not None:
-            hidden_channels = int(stem_weight.shape[0])
-    if hidden_channels is None:
-        hidden_channels = 64
+    defaults = NetworkConfig()
+    values = {
+        "history_length": raw_config.get("history_length", defaults.history_length),
+        "conv_channels": raw_config.get("conv_channels", defaults.conv_channels),
+        "residual_channels": raw_config.get("residual_channels", defaults.residual_channels),
+        "num_conv_layers": raw_config.get("num_conv_layers", defaults.num_conv_layers),
+        "num_residual_layers": raw_config.get(
+            "num_residual_layers", defaults.num_residual_layers
+        ),
+        "value_hidden_size": raw_config.get("value_hidden_size", defaults.value_hidden_size),
+    }
 
-    residual_blocks = args.get("residual_blocks", fallback_residual_blocks)
-    if residual_blocks is None:
-        block_indices = []
-        for key in state_dict:
-            if not key.startswith("tower."):
-                continue
-            parts = key.split(".")
-            if len(parts) > 1 and parts[1].isdigit():
-                block_indices.append(int(parts[1]))
-        residual_blocks = max(block_indices) + 1 if block_indices else 4
+    for key in values:
+        override = getattr(args, key)
+        if override is not None:
+            values[key] = override
 
-    return int(hidden_channels), int(residual_blocks)
+    return NetworkConfig(**values)
 
 
 def play_game(
     game_index: int,
-    model_a: AlphaZeroNet,
-    model_b: AlphaZeroNet,
+    model_a: LoadedModel,
+    model_b: LoadedModel,
     *,
     rng: random.Random,
     device: torch.device,
@@ -246,46 +243,53 @@ def play_game(
 ) -> GameResult:
     a_player = Player.RED if game_index % 2 == 0 else Player.BLUE
     starting_player = Player.RED if (game_index // 2) % 2 == 0 else Player.BLUE
-    models = {
+    players = {
         a_player: model_a,
         a_player.opposite(): model_b,
     }
     start_col = rng.randrange(BOARD_SIZE)
-    state = standard_state(
-        walls=walls,
-        starting_player=starting_player,
-        start_col=start_col,
+    env = BarricadeEnv(max_steps=max_steps, invalid_action_mode="raise")
+    _, info = env.reset(
+        options=standard_options(
+            walls=walls,
+            starting_player=starting_player,
+            start_col=start_col,
+        )
     )
-    steps = 0
+    history: list[BarricadeState] = []
+    roots = {Player.RED: None, Player.BLUE: None}
+    terminated = False
     truncated = False
 
-    for ply in range(max_steps):
-        if state.winner is not None or getattr(state, "is_draw", False):
-            break
-
-        legal_actions = state.legal_actions()
-        if not legal_actions:
-            if not getattr(state, "is_draw", False):
-                state.winner = state.current_player.opposite()
-            break
-
-        action = choose_action(
-            models[state.current_player],
-            state,
+    while not terminated and not truncated:
+        current = env.state.current_player
+        player_model = players[current]
+        state_before = env.state.copy()
+        history_before = history_window(
+            history,
+            player_model.network_config.history_length,
+        )
+        action, root = choose_action(
+            player_model.model,
+            state_before,
+            history=history_before,
+            root=roots[current],
             device=device,
             rng=rng,
             simulations=simulations,
             batch_size=batch_size,
+            history_length=player_model.network_config.history_length,
         )
-        state = apply_selected_action(state, action, legal_actions)
-        steps = ply + 1
-    else:
-        truncated = state.winner is None and not getattr(state, "is_draw", False)
+        history.append(state_before)
+        _, _, terminated, truncated, info = env.step(action)
+        roots[current] = root
+        roots[current.opposite()] = None
 
+    winner = player_from_name(info.get("winner"))
     if truncated:
-        winner = adjudicated_winner(state, enabled=adjudicate_step_limit)
-        if winner is not None:
-            state.winner = winner
+        adjudicated = adjudicated_winner(env.state, enabled=adjudicate_step_limit)
+        if adjudicated is not None:
+            winner = adjudicated
             truncated = False
 
     return GameResult(
@@ -293,55 +297,153 @@ def play_game(
         a_player=a_player,
         starting_player=starting_player,
         start_col=start_col,
-        winner=state.winner,
+        winner=winner,
         truncated=truncated,
-        steps=steps,
+        steps=int(info.get("steps") or max_steps),
     )
 
 
-def standard_state(*, walls: int, starting_player: Player, start_col: int) -> GameState:
-    return GameState(
-        red_start=(0, int(start_col)),
-        blue_start=(BOARD_SIZE - 1, int(start_col)),
-        red_walls=walls,
-        blue_walls=walls,
-        starting_player=starting_player,
-        board_size=BOARD_SIZE,
-    )
+def standard_options(*, walls: int, starting_player: Player, start_col: int) -> Dict[str, Any]:
+    return {
+        "red_start": (0, int(start_col)),
+        "blue_start": (BOARD_SIZE - 1, int(start_col)),
+        "red_walls": walls,
+        "blue_walls": walls,
+        "starting_player": starting_player,
+    }
 
 
 def choose_action(
-    model: AlphaZeroNet,
-    state: GameState,
+    model: nn.Module,
+    state: BarricadeState,
     *,
+    history: Sequence[BarricadeState],
+    root: object,
     device: torch.device,
     rng: random.Random,
     simulations: int,
     batch_size: int,
-) -> int:
+    history_length: int,
+) -> tuple[int, object]:
     if simulations <= 0:
-        return select_model_action(model, state, device=device, rng=rng)
+        return select_model_action(
+            model,
+            state,
+            history=history,
+            device=device,
+            history_length=history_length,
+        ), None
 
-    result = build_mcts(
+    mcts = MCTS(
         model,
-        device=device,
-        rng=rng,
-        config=MCTSConfig(
+        MCTSConfig(
             num_simulations=simulations,
             batch_size=batch_size,
             cpuct_init=1.5,
             policy_target_temperature=1.0,
             action_temperature=0.0,
+            history_length=history_length,
+            device=str(device),
             add_root_noise=False,
             lead_weight=0.02,
             lead_scale=5.0,
         ),
-    ).search(state)
+        device=device,
+        rng=rng,
+        policy_action_transform=policy_action_for_mcts,
+    )
+    result = mcts.search(state, history=history, root=root)
     action = int(result.action)
     legal_actions = state.legal_actions()
     if action in legal_actions:
-        return action
-    return select_model_action(model, state, device=device, rng=rng)
+        return action, mcts.advance_root(result.root, action)
+    return (
+        select_model_action(
+            model,
+            state,
+            history=history,
+            device=device,
+            history_length=history_length,
+        ),
+        None,
+    )
+
+
+@torch.inference_mode()
+def select_model_action(
+    model: nn.Module,
+    state: BarricadeState,
+    *,
+    history: Sequence[BarricadeState],
+    device: torch.device,
+    history_length: int,
+) -> int:
+    legal_actions = state.legal_actions()
+    if not legal_actions:
+        return -1
+
+    model.eval()
+    encoded = encode_state_stack(
+        state,
+        history,
+        history_length=history_length,
+    ).unsqueeze(0).to(device)
+    logits, _, _ = model.inference(encoded)
+    logits = torch.nan_to_num(logits.squeeze(0), nan=0.0, posinf=30.0, neginf=-30.0)
+    canonical_legal = [
+        canonical_action(action, state.current_player)
+        for action in legal_actions
+    ]
+    legal_tensor = torch.as_tensor(canonical_legal, dtype=torch.long, device=device)
+    legal_logits = logits.index_select(0, legal_tensor).clamp(-30.0, 30.0)
+    return int(legal_actions[int(torch.argmax(legal_logits).item())])
+
+
+def history_window(
+    history: Sequence[BarricadeState],
+    history_length: int,
+) -> tuple[BarricadeState, ...]:
+    if history_length <= 0:
+        return ()
+    return tuple(history[-history_length:])
+
+
+def player_from_name(name: object) -> Optional[Player]:
+    if not isinstance(name, str):
+        return None
+    try:
+        return Player[name]
+    except KeyError:
+        return None
+
+
+def adjudicated_winner(state: BarricadeState, *, enabled: bool) -> Optional[Player]:
+    if not enabled:
+        return None
+
+    red_distance = state.shortest_path_length(Player.RED)
+    blue_distance = state.shortest_path_length(Player.BLUE)
+    if red_distance is not None and blue_distance is not None:
+        if red_distance < blue_distance:
+            return Player.RED
+        if blue_distance < red_distance:
+            return Player.BLUE
+
+    red_walls = state.walls_left[Player.RED]
+    blue_walls = state.walls_left[Player.BLUE]
+    if red_walls > blue_walls:
+        return Player.RED
+    if blue_walls > red_walls:
+        return Player.BLUE
+
+    red_row = state.pawns[Player.RED][0]
+    blue_progress = BOARD_SIZE - 1 - state.pawns[Player.BLUE][0]
+    if red_row > blue_progress:
+        return Player.RED
+    if blue_progress > red_row:
+        return Player.BLUE
+
+    return None
 
 
 def format_game_result(result: GameResult, name_a: str, name_b: str) -> str:
@@ -397,11 +499,11 @@ def print_summary(
     )
     print(
         f"model_a={model_a.name} path={model_a.path} "
-        f"hidden={model_a.hidden_channels} residual_blocks={model_a.residual_blocks}"
+        f"network_config={model_a.network_config}"
     )
     print(
         f"model_b={model_b.name} path={model_b.path} "
-        f"hidden={model_b.hidden_channels} residual_blocks={model_b.residual_blocks}"
+        f"network_config={model_b.network_config}"
     )
     print(
         f"score {model_a.name}={a_wins} {model_b.name}={b_wins} draws={draws} "
