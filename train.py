@@ -713,6 +713,7 @@ def _run_single_game_worker(
         # MCTS just follows the (wall-biased) policy. 0 lets the search actually
         # probe pawn moves and discover terminal wins at the 512-sim budget.
         fpu_reduction=0.0,
+        pawn_prior_floor=0.1
     )
     mcts = MCTS(
         model,

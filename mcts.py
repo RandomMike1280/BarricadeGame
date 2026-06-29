@@ -16,7 +16,15 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import torch
 from torch import Tensor
 
-from barricade_env import ACTION_SIZE, BarricadeState, Move, Player, encode_move
+from barricade_env import (
+    ACTION_SIZE,
+    DIAGONAL_HOP_ACTIONS,
+    MOVE_ACTIONS,
+    BarricadeState,
+    Move,
+    Player,
+    encode_move,
+)
 from network import encode_state_stack
 
 
@@ -28,6 +36,13 @@ class MCTSConfig:
     cpuct_base: float = 38739.0
     cpuct_factor: float = 3.89
     fpu_reduction: float = 0.33
+    # EXPERIMENTAL (default 0.0 == off): rebalance the search prior so the pawn
+    # action group (orthogonal moves + diagonal hops) holds at least this much
+    # mass, renormalizing within each group. A test-time probe for whether the
+    # wall-biased prior is the lever behind pawn-move starvation; mirrors the
+    # effect a factored type/wall/pawn head would have on the prior. 0.0 keeps
+    # the plain masked softmax (legacy behavior).
+    pawn_prior_floor: float = 0.0
     policy_temperature: float = 1.0
     root_dirichlet_alpha: float = 0.3
     root_exploration_fraction: float = 0.25
@@ -176,6 +191,7 @@ class MCTS:
         self._lead_scale = max(float(cfg.lead_scale), 1e-6)
         self._inv_lead_scale = 1.0 / self._lead_scale
         self._fpu_reduction = cfg.fpu_reduction
+        self._pawn_prior_floor = cfg.pawn_prior_floor
         self._cpuct_init = cfg.cpuct_init
         self._cpuct_base = max(cfg.cpuct_base, 1e-6)
         self._cpuct_factor = cfg.cpuct_factor
@@ -635,7 +651,54 @@ class MCTS:
             return [uniform] * n
 
         inv_total = 1.0 / total
-        return [e * inv_total for e in exp_values]
+        priors = [e * inv_total for e in exp_values]
+
+        if self._pawn_prior_floor > 0.0:
+            priors = self._apply_pawn_prior_floor(priors, legal_actions)
+        return priors
+
+    def _apply_pawn_prior_floor(
+        self, priors: List[float], legal_actions: Sequence[int]
+    ) -> List[float]:
+        """Ensure the pawn action group holds >= ``pawn_prior_floor`` prior mass.
+
+        Pawn actions are the first ``MOVE_ACTIONS`` (orthogonal) and last
+        ``DIAGONAL_HOP_ACTIONS`` (diagonal hops) indices of the action space;
+        everything between is a wall placement. Within-group proportions are
+        preserved; a no-op when one group is empty (e.g. walls exhausted).
+        """
+        floor = self._pawn_prior_floor
+        size = self.action_size
+        pawn_idx = [
+            i
+            for i, a in enumerate(legal_actions)
+            if a < MOVE_ACTIONS or a >= size - DIAGONAL_HOP_ACTIONS
+        ]
+        if not pawn_idx:
+            return priors
+        wall_idx = [i for i in range(len(legal_actions)) if i not in set(pawn_idx)]
+        if not wall_idx:
+            return priors
+
+        pawn_mass = sum(priors[i] for i in pawn_idx)
+        if pawn_mass >= floor:
+            return priors
+
+        wall_mass = sum(priors[i] for i in wall_idx)
+        # Scale the pawn group up to ``floor`` (uniform within group if it had no
+        # mass), and the wall group down to ``1 - floor``.
+        if pawn_mass > 0.0:
+            pawn_scale = floor / pawn_mass
+            for i in pawn_idx:
+                priors[i] *= pawn_scale
+        else:
+            share = floor / len(pawn_idx)
+            for i in pawn_idx:
+                priors[i] = share
+        wall_scale = (1.0 - floor) / wall_mass if wall_mass > 0.0 else 0.0
+        for i in wall_idx:
+            priors[i] *= wall_scale
+        return priors
 
     # ------------------------------------------------------------------
     # Root Dirichlet noise
