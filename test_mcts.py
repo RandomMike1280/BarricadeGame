@@ -1,5 +1,7 @@
 import random
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -15,6 +17,23 @@ from barricade_env import (
     WallOrientation,
 )
 from mcts import MCTS, MCTSConfig
+from mini_bench import (
+    MODEL_VALUE_MULTIPLIER_ATTR,
+    evaluate_value_head_blue_pov,
+    load_model as load_bench_model,
+)
+from finetune_tactical_value import (
+    parameters_for_scope,
+    probe_summary,
+    set_training_mode_for_scope,
+)
+from train import (
+    NetworkConfig,
+    _load_model_state,
+    build_model,
+    tactical_value_batch,
+    tactical_value_policy_batch,
+)
 
 
 class TinyMCTSModel(nn.Module):
@@ -27,6 +46,21 @@ class TinyMCTSModel(nn.Module):
         device = batch.device
         logits = torch.zeros((batch_size, ACTION_SIZE), device=device)
         values = torch.zeros((batch_size, 1), device=device)
+        leads = torch.zeros((batch_size, 1), device=device)
+        return logits, values, leads
+
+
+class ConstantValueModel(nn.Module):
+    def __init__(self, value: float) -> None:
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(()))
+        self.value = float(value)
+
+    def inference(self, batch: torch.Tensor):
+        batch_size = batch.shape[0]
+        device = batch.device
+        logits = torch.zeros((batch_size, ACTION_SIZE), device=device)
+        values = torch.full((batch_size, 1), self.value, device=device)
         leads = torch.zeros((batch_size, 1), device=device)
         return logits, values, leads
 
@@ -51,6 +85,187 @@ def wall_heavy_state(plies: int = 20):
 
 
 class MCTSTests(unittest.TestCase):
+    def test_blue_pov_conversion_from_side_to_move_value(self) -> None:
+        model = ConstantValueModel(0.75)
+        setattr(model, MODEL_VALUE_MULTIPLIER_ATTR, 1.0)
+        red_turn = BarricadeState(
+            red_start=(4, 4),
+            blue_start=(8, 4),
+            starting_player=Player.RED,
+        )
+        blue_turn = BarricadeState(
+            red_start=(0, 4),
+            blue_start=(4, 4),
+            starting_player=Player.BLUE,
+        )
+
+        self.assertAlmostEqual(
+            evaluate_value_head_blue_pov(
+                model, red_turn, board_size=9, device=torch.device("cpu")
+            ),
+            -0.75,
+        )
+        self.assertAlmostEqual(
+            evaluate_value_head_blue_pov(
+                model, blue_turn, board_size=9, device=torch.device("cpu")
+            ),
+            0.75,
+        )
+
+    def test_mini_bench_loads_flat_policy_checkpoint_without_random_head(self) -> None:
+        model = build_model(
+            NetworkConfig(
+                history_length=0,
+                conv_channels=8,
+                num_residual_layers=0,
+                value_hidden_size=8,
+                policy_head_type="flat",
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "flat.pt"
+            torch.save(
+                {
+                    "model_state": model.state_dict(),
+                    "network_config": {
+                        "history_length": 0,
+                        "conv_channels": 8,
+                        "residual_channels": None,
+                        "num_conv_layers": 1,
+                        "num_residual_layers": 0,
+                        "value_hidden_size": 8,
+                    },
+                },
+                path,
+            )
+
+            loaded = load_bench_model(path, board_size=9, device=torch.device("cpu"))
+
+        self.assertEqual(getattr(loaded, "policy_head_type"), "flat")
+
+    def test_policy_head_mismatch_requires_explicit_reset(self) -> None:
+        flat = build_model(
+            NetworkConfig(
+                history_length=0,
+                conv_channels=8,
+                num_residual_layers=0,
+                value_hidden_size=8,
+                policy_head_type="flat",
+            )
+        )
+        factored = build_model(
+            NetworkConfig(
+                history_length=0,
+                conv_channels=8,
+                num_residual_layers=0,
+                value_hidden_size=8,
+                policy_head_type="factored",
+            )
+        )
+
+        with self.assertRaises(RuntimeError):
+            _load_model_state(factored, flat.state_dict())
+        _load_model_state(factored, flat.state_dict(), reset_policy_head=True)
+        self.assertTrue(
+            torch.equal(
+                factored.policy_head.move_fc.weight,
+                flat.policy_head.fc.weight[factored.policy_head.move_index],
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                factored.policy_head.wall_fc.bias,
+                flat.policy_head.fc.bias[factored.policy_head.wall_index],
+            )
+        )
+        self.assertTrue(torch.equal(factored.policy_head.type_fc.weight, torch.zeros_like(factored.policy_head.type_fc.weight)))
+
+    def test_tactical_value_batch_targets_match_shortest_race(self) -> None:
+        rng = random.Random(7)
+        planes, targets = tactical_value_batch(
+            batch_size=32,
+            history_length=2,
+            rng=rng,
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(planes.shape, (32, 27, 9, 9))
+        self.assertEqual(targets.shape, (32,))
+        self.assertTrue(torch.all((targets == 1.0) | (targets == -1.0)))
+        for planes_i, target in zip(planes, targets):
+            own = torch.nonzero(planes_i[1] > 0.5)[0]
+            opp = torch.nonzero(planes_i[2] > 0.5)[0]
+            own_distance = 8 - int(own[0])
+            opp_distance = int(opp[0])
+            expected = 1.0 if own_distance < opp_distance else -1.0
+            self.assertEqual(float(target.item()), expected)
+
+    def test_tactical_policy_batch_targets_forward_move_when_winning(self) -> None:
+        rng = random.Random(11)
+        planes, value_targets, policy_targets, policy_mask = tactical_value_policy_batch(
+            batch_size=64,
+            history_length=0,
+            rng=rng,
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(planes.shape, (64, 9, 9, 9))
+        self.assertTrue(torch.all(policy_targets == MoveDirection.DOWN.value))
+        self.assertTrue(torch.all(policy_mask[value_targets < 0.0] == 0.0))
+        self.assertGreater(float(policy_mask.sum().item()), 0.0)
+
+    def test_probe_summary_uses_eval_mode_without_leaving_it_changed(self) -> None:
+        model = build_model(
+            NetworkConfig(
+                history_length=0,
+                conv_channels=8,
+                num_residual_layers=0,
+                value_hidden_size=8,
+                policy_head_type="flat",
+            )
+        )
+        model.train()
+
+        values = probe_summary(model, device=torch.device("cpu"))
+
+        self.assertTrue(model.training)
+        self.assertIn("RED wins next move", values)
+
+    def test_value_head_train_scope_freezes_policy_and_trunk(self) -> None:
+        model = build_model(
+            NetworkConfig(
+                history_length=0,
+                conv_channels=8,
+                num_residual_layers=0,
+                value_hidden_size=8,
+                policy_head_type="flat",
+            )
+        )
+
+        trainable = parameters_for_scope(model, "value-head")
+
+        self.assertEqual(set(trainable), set(model.value_head.parameters()))
+        self.assertTrue(all(parameter.requires_grad for parameter in model.value_head.parameters()))
+        self.assertFalse(any(parameter.requires_grad for parameter in model.policy_head.parameters()))
+
+    def test_value_head_train_scope_keeps_frozen_batchnorm_in_eval(self) -> None:
+        model = build_model(
+            NetworkConfig(
+                history_length=0,
+                conv_channels=8,
+                num_residual_layers=0,
+                value_hidden_size=8,
+                policy_head_type="flat",
+            )
+        )
+
+        parameters_for_scope(model, "value-head")
+        set_training_mode_for_scope(model, "value-head")
+
+        self.assertFalse(model.conv_tower.training)
+        self.assertFalse(model.policy_head.training)
+        self.assertTrue(model.value_head.training)
+
     def test_adjacent_pawn_can_jump_straight_when_unblocked(self) -> None:
         state = BarricadeState(
             red_start=(4, 4),

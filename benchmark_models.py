@@ -27,7 +27,7 @@ from barricade_env import (
 )
 from canonical import canonical_action
 from mcts import MCTS, MCTSConfig
-from network import encode_state_stack
+from network import encode_state_stack, infer_policy_head_type_from_state_dict
 from train import NetworkConfig, _load_model_state, build_model, policy_action_for_mcts
 
 
@@ -111,6 +111,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Override checkpoint value hidden size when loading plain state_dict checkpoints.",
+    )
+    parser.add_argument(
+        "--policy-head-type",
+        choices=("factored", "flat"),
+        default=None,
+        help="Override checkpoint policy head type when loading plain state_dict checkpoints.",
     )
     parser.add_argument("--no-adjudicate-step-limit", action="store_true")
     parser.add_argument("--quiet", action="store_true")
@@ -207,6 +213,11 @@ def network_config_from_payload(
     raw_config: Dict[str, Any] = {}
     if isinstance(payload, dict) and isinstance(payload.get("network_config"), dict):
         raw_config = dict(payload["network_config"])
+    state_dict = state_dict_from_payload(payload)
+    if "policy_head_type" not in raw_config:
+        raw_config["policy_head_type"] = infer_policy_head_type_from_state_dict(
+            state_dict
+        )
 
     defaults = NetworkConfig()
     values = {
@@ -218,6 +229,9 @@ def network_config_from_payload(
             "num_residual_layers", defaults.num_residual_layers
         ),
         "value_hidden_size": raw_config.get("value_hidden_size", defaults.value_hidden_size),
+        "policy_head_type": raw_config.get(
+            "policy_head_type", defaults.policy_head_type
+        ),
     }
 
     for key in values:

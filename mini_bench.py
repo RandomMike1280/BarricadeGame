@@ -28,6 +28,7 @@ from mcts import MCTS, MCTSConfig
 
 MODEL_HISTORY_LENGTH_ATTR = "_mini_bench_history_length"
 MODEL_VALUE_MULTIPLIER_ATTR = "_mini_bench_value_multiplier"
+MODEL_POLICY_HEAD_TYPE_ATTR = "_mini_bench_policy_head_type"
 
 
 class ValueSignCorrectedModel(nn.Module):
@@ -407,7 +408,7 @@ def evaluate_value_head_blue_pov(
     )
     value_multiplier = float(getattr(model, MODEL_VALUE_MULTIPLIER_ATTR, 1.0))
     side_to_move_value *= value_multiplier
-    return -side_to_move_value if state.current_player == Player.BLUE else side_to_move_value
+    return side_to_move_value if state.current_player == Player.BLUE else -side_to_move_value
 
 
 def format_move(move_type: str, details: Tuple) -> str:
@@ -458,9 +459,10 @@ def play_single_game(
 
     # Random starting column
     start_col = rng.randrange(board_size)
+    start_col2 = rng.randrange(board_size)
     state = BarricadeState(
         red_start=(0, start_col),
-        blue_start=(board_size - 1, start_col),
+        blue_start=(board_size - 1, start_col2),
         red_walls=walls,
         blue_walls=walls,
         starting_player=starting_player,
@@ -573,11 +575,17 @@ def play_single_game(
     return state.winner, steps, truncated
 
 
+def _infer_policy_head_type(state_dict: Dict[str, torch.Tensor]) -> str:
+    from network import infer_policy_head_type_from_state_dict
+
+    return infer_policy_head_type_from_state_dict(state_dict)
+
+
 def _infer_model_config(
     state_dict: Dict[str, torch.Tensor],
     fallback_hidden_channels: int,
     fallback_residual_blocks: int,
-) -> Tuple[int, int, int, int, int, int]:
+) -> Tuple[int, int, int, int, int, int, str]:
     hidden_channels = fallback_hidden_channels
     stem_weight_keys = ["stem.0.weight", "conv_tower.0.conv.weight"]
     input_planes = 9
@@ -617,6 +625,7 @@ def _infer_model_config(
             conv_layer_indices.append(int(parts[1]))
     if conv_layer_indices:
         num_conv_layers = max(conv_layer_indices) + 1
+    policy_head_type = _infer_policy_head_type(state_dict)
 
     return (
         hidden_channels,
@@ -625,6 +634,7 @@ def _infer_model_config(
         residual_channels,
         value_hidden_size,
         num_conv_layers,
+        policy_head_type,
     )
 
 
@@ -669,6 +679,7 @@ def load_model(
             residual_channels,
             value_hidden_size,
             num_conv_layers,
+            policy_head_type,
         ) = _infer_model_config(state_dict, 128, 10)
         history_length = _history_length_from_input_planes(input_planes)
 
@@ -689,6 +700,9 @@ def load_model(
             value_hidden_size = int(
                 network_config.get("value_hidden_size", value_hidden_size)
             )
+            policy_head_type = str(
+                network_config.get("policy_head_type", policy_head_type)
+            )
 
         model = build_network(
             history_length=history_length,
@@ -697,10 +711,24 @@ def load_model(
             num_conv_layers=num_conv_layers,
             num_residual_layers=residual_blocks,
             value_hidden_size=value_hidden_size,
+            policy_head_type=policy_head_type,
         ).to(device)
         setattr(model, MODEL_HISTORY_LENGTH_ATTR, history_length)
+        setattr(model, MODEL_POLICY_HEAD_TYPE_ATTR, policy_head_type)
 
-    model.load_state_dict(state_dict, strict=False)
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    allowed_missing = ("lead_head.", "future_map_head.", "score_head.")
+    disallowed_missing = [
+        key
+        for key in incompatible.missing_keys
+        if not key.startswith(allowed_missing)
+    ]
+    if incompatible.unexpected_keys or disallowed_missing:
+        raise RuntimeError(
+            "Checkpoint architecture mismatch while loading benchmark model: "
+            f"missing={disallowed_missing[:8]} "
+            f"unexpected={list(incompatible.unexpected_keys)[:8]}"
+        )
     model.eval()
     return model
 

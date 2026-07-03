@@ -35,11 +35,17 @@ from barricade_env import (
     DEFAULT_WALLS_PER_PLAYER,
     BarricadeEnv,
     BarricadeState,
+    MoveDirection,
     Player,
 )
 from canonical import canonical_action, canonicalize_action_vector
 from mcts import MCTS, MCTSConfig
-from network import EncoderConfig, build_network, encode_state_stack
+from network import (
+    EncoderConfig,
+    build_network,
+    encode_state_stack,
+    infer_policy_head_type_from_state_dict,
+)
 
 
 SELFPLAY_DIR = Path("data/selfplay")
@@ -59,6 +65,7 @@ class NetworkConfig:
     num_conv_layers: int = 1
     num_residual_layers: int = 10
     value_hidden_size: int = 256
+    policy_head_type: str = "factored"
 
 
 @dataclass(frozen=True)
@@ -66,6 +73,9 @@ class SelfPlayConfig:
     iteration: int = 1
     games: int = 16
     base_simulations: int = 128
+    cpuct_base: float = 19652.0
+    cpuct_factor: float = 3.89
+    cpuct_init: float = 2.5
     batch_size: int = 16
     max_steps: int = 100
     chunk_size: int = 2048
@@ -103,6 +113,8 @@ class TrainConfig:
     batch_size: int = 256
     learning_rate: float = 1e-3
     value_loss_weight: float = 1.0
+    tactical_value_loss_weight: float = 0.25
+    tactical_value_batch_size: int = 64
     lead_loss_weight: float = 0.1
     future_loss_weight: float = 0.1
     score_loss_weight: float = 0.01
@@ -436,6 +448,16 @@ def _renormalize_policy_target(policy_target: Tensor, mask: Tensor) -> Tensor:
     return torch.where(row_sum > 1.0e-8, normalized, uniform)
 
 
+def _network_config_from_payload(payload: Dict[str, Any]) -> NetworkConfig:
+    state_dict = payload.get("model_state", {})
+    raw_config = dict(payload.get("network_config", {}))
+    if "policy_head_type" not in raw_config and isinstance(state_dict, dict):
+        raw_config["policy_head_type"] = infer_policy_head_type_from_state_dict(
+            state_dict
+        )
+    return NetworkConfig(**raw_config)
+
+
 class ReplayDataset(Dataset):
     def __init__(
         self,
@@ -693,7 +715,7 @@ def _run_single_game_worker(
         history_length=network_config.history_length,
         device=resolved_device,
         add_root_noise=True,
-        action_temperature=1.5,
+        action_temperature=1.0,
         # Policy TARGET (training label) is the true normalized visit
         # distribution at a fixed temperature, decoupled from the per-move
         # action-SELECTION temperature schedule (which still varies below).
@@ -712,8 +734,12 @@ def _run_single_game_worker(
         # so low-prior pawn moves never earn a first visit even at 16k sims and
         # MCTS just follows the (wall-biased) policy. 0 lets the search actually
         # probe pawn moves and discover terminal wins at the 512-sim budget.
-        fpu_reduction=0.0,
-        pawn_prior_floor=0.1
+        fpu_reduction=0.25,
+        pawn_prior_floor=0.1,
+        cpuct_base=config.cpuct_base,
+        cpuct_factor=config.cpuct_factor,
+        cpuct_init=config.cpuct_init,
+        root_exploration_fraction=0.25
     )
     mcts = MCTS(
         model,
@@ -733,7 +759,7 @@ def _run_single_game_worker(
         ).cpu()
 
         simulations = sample_playout_cap(config.base_simulations, rng)
-        temp = 2.0 if ply < config.temperature_drop_ply else 0.0
+        temp = 1.5 if ply < config.temperature_drop_ply else 0.15
         mcts.config = replace(
             mcts.config,
             num_simulations=simulations,
@@ -838,7 +864,6 @@ def _run_single_game_worker(
         )
         sample["score_target"] = score_target
         sample["score_mask"] = score_mask
-
     game_elapsed = time.time() - game_start
     game_info = {
         "winner": winner,
@@ -1070,6 +1095,8 @@ def run_self_play(
                 # A worker died abruptly (OOM/segfault): every in-flight future
                 # now raises this. Stop draining and let the caller restart the
                 # pool with the games that have not completed yet.
+                import traceback
+                traceback.print_exc()
                 return True
             except Exception as exc:  # noqa: BLE001 - log and keep other games
                 print(
@@ -1078,6 +1105,8 @@ def run_self_play(
                 )
                 done.add(game_index)
                 completed_games += 1
+                import traceback
+                traceback.print_exc()
                 continue
             done.add(game_index)
             _handle_completed(game_index, game_samples, game_elapsed, game_info)
@@ -1254,6 +1283,7 @@ def train_from_replay(
     *,
     checkpoint_path: Optional[str | Path] = None,
     device: Optional[str] = None,
+    reset_policy_head: bool = False,
 ) -> Path:
     _set_seed(config.seed)
     resolved_device = torch.device(
@@ -1299,7 +1329,11 @@ def train_from_replay(
 
     if checkpoint_path:
         _load_checkpoint_into(
-            model, checkpoint_path, optimizer=optimizer, device=resolved_device
+            model,
+            checkpoint_path,
+            optimizer=optimizer,
+            device=resolved_device,
+            reset_policy_head=reset_policy_head,
         )
 
     print(
@@ -1320,12 +1354,14 @@ def train_from_replay(
     stats = []
     model.train()
     train_start = time.time()
+    tactical_rng = random.Random(config.seed + 1_000_003)
 
     for epoch in range(config.epochs):
         epoch_start = time.time()
         total_loss_sum = 0.0
         policy_loss_sum = 0.0
         value_loss_sum = 0.0
+        tactical_value_loss_sum = 0.0
         lead_loss_sum = 0.0
         future_loss_sum = 0.0
         score_loss_sum = 0.0
@@ -1367,9 +1403,25 @@ def train_from_replay(
             score_loss = masked_smooth_l1_loss(
                 score.squeeze(-1), symlog(score_target), score_mask,
             )
+            tactical_value_loss = value.new_zeros(())
+            if (
+                config.tactical_value_loss_weight > 0.0
+                and config.tactical_value_batch_size > 0
+            ):
+                tactical_planes, tactical_target = tactical_value_batch(
+                    batch_size=config.tactical_value_batch_size,
+                    history_length=network_config.history_length,
+                    rng=tactical_rng,
+                    device=resolved_device,
+                )
+                _, tactical_value, _, _, _ = model(tactical_planes)
+                tactical_value_loss = F.mse_loss(
+                    tactical_value.squeeze(-1), tactical_target
+                )
             loss = (
                 policy_loss
                 + config.value_loss_weight * value_loss
+                + config.tactical_value_loss_weight * tactical_value_loss
                 + config.lead_loss_weight * lead_loss
                 + config.future_loss_weight * future_loss
                 + config.score_loss_weight * score_loss
@@ -1384,6 +1436,7 @@ def train_from_replay(
             total_loss_sum += float(loss.item())
             policy_loss_sum += float(policy_loss.item())
             value_loss_sum += float(value_loss.item())
+            tactical_value_loss_sum += float(tactical_value_loss.item())
             lead_loss_sum += float(lead_loss.item())
             future_loss_sum += float(future_loss.item())
             score_loss_sum += float(score_loss.item())
@@ -1397,6 +1450,7 @@ def train_from_replay(
             "total_loss": total_loss_sum / max(1, batches),
             "policy_loss": policy_loss_sum / max(1, batches),
             "value_loss": value_loss_sum / max(1, batches),
+            "tactical_value_loss": tactical_value_loss_sum / max(1, batches),
             "lead_loss": lead_loss_sum / max(1, batches),
             "future_loss": future_loss_sum / max(1, batches),
             "score_loss": score_loss_sum / max(1, batches),
@@ -1410,6 +1464,7 @@ def train_from_replay(
             f"avg_total={epoch_stats['total_loss']:.4f} "
             f"avg_policy={epoch_stats['policy_loss']:.4f} "
             f"avg_value={epoch_stats['value_loss']:.4f} "
+            f"avg_tactical_value={epoch_stats['tactical_value_loss']:.4f} "
             f"avg_lead={epoch_stats['lead_loss']:.4f} "
             f"avg_future={epoch_stats['future_loss']:.4f} "
             f"avg_score={epoch_stats['score_loss']:.4f} "
@@ -1492,7 +1547,7 @@ def evaluate_models(
             # Match self-play: without this, eval games shuffle into repetition
             # draws (MCTS can't explore the winning pawn moves), so every
             # candidate scores 50% and is rejected.
-            fpu_reduction=0.0,
+            fpu_reduction=0.0
         )
 
         while not terminated and not truncated:
@@ -1731,6 +1786,130 @@ def masked_binary_cross_entropy(logits: Tensor, target: Tensor, mask: Tensor) ->
     return _masked_mean(per_sample, mask, logits)
 
 
+def tactical_value_batch(
+    *,
+    batch_size: int,
+    history_length: int,
+    rng: random.Random,
+    device: torch.device,
+) -> Tuple[Tensor, Tensor]:
+    """Generate empty-board race positions where the winner is tactically obvious.
+
+    Self-play reaches near-goal states mostly after many wall placements, so a
+    history-aware model can miss "teleported" benchmark positions with no walls.
+    This value-only batch teaches the scalar head the invariant shortest-path
+    race signal without assigning arbitrary policy targets.
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+
+    planes: List[Tensor] = []
+    targets: List[float] = []
+    columns = list(range(BOARD_SIZE))
+    for _ in range(batch_size):
+        current = Player.RED if rng.random() < 0.5 else Player.BLUE
+        own_distance = rng.choice((1, 2, 3))
+        opp_distance = rng.choice((5, 6, 7, 8))
+        if rng.random() < 0.5:
+            own_distance, opp_distance = opp_distance, own_distance
+
+        own_col = rng.choice(columns)
+        opp_col = rng.choice(columns)
+        if current == Player.RED:
+            red_start = (BOARD_SIZE - 1 - own_distance, own_col)
+            blue_start = (opp_distance, opp_col)
+        else:
+            blue_start = (own_distance, own_col)
+            red_start = (BOARD_SIZE - 1 - opp_distance, opp_col)
+        if red_start == blue_start:
+            opp_col = (opp_col + 1) % BOARD_SIZE
+            if current == Player.RED:
+                blue_start = (opp_distance, opp_col)
+            else:
+                red_start = (BOARD_SIZE - 1 - opp_distance, opp_col)
+
+        state = BarricadeState(
+            red_start=red_start,
+            blue_start=blue_start,
+            red_walls=DEFAULT_WALLS_PER_PLAYER,
+            blue_walls=DEFAULT_WALLS_PER_PLAYER,
+            starting_player=current,
+            board_size=BOARD_SIZE,
+        )
+        target = 1.0 if own_distance < opp_distance else -1.0
+        planes.append(
+            encode_state_stack(
+                state,
+                (),
+                history_length=history_length,
+            )
+        )
+        targets.append(target)
+
+    return (
+        torch.stack(planes, dim=0).to(device, non_blocking=True),
+        torch.as_tensor(targets, dtype=torch.float32, device=device),
+    )
+
+
+def tactical_value_policy_batch(
+    *,
+    batch_size: int,
+    history_length: int,
+    rng: random.Random,
+    device: torch.device,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    planes: List[Tensor] = []
+    value_targets: List[float] = []
+    policy_targets: List[int] = []
+    policy_mask: List[float] = []
+    columns = list(range(BOARD_SIZE))
+
+    for _ in range(batch_size):
+        current = Player.RED if rng.random() < 0.5 else Player.BLUE
+        own_distance = rng.choice((1, 2, 3))
+        opp_distance = rng.choice((5, 6, 7, 8))
+        own_is_winning = rng.random() < 0.75
+        if not own_is_winning:
+            own_distance, opp_distance = opp_distance, own_distance
+
+        own_col = rng.choice(columns)
+        opp_col = rng.choice(columns)
+        if current == Player.RED:
+            red_start = (BOARD_SIZE - 1 - own_distance, own_col)
+            blue_start = (opp_distance, opp_col)
+        else:
+            blue_start = (own_distance, own_col)
+            red_start = (BOARD_SIZE - 1 - opp_distance, opp_col)
+        if red_start == blue_start:
+            opp_col = (opp_col + 1) % BOARD_SIZE
+            if current == Player.RED:
+                blue_start = (opp_distance, opp_col)
+            else:
+                red_start = (BOARD_SIZE - 1 - opp_distance, opp_col)
+
+        state = BarricadeState(
+            red_start=red_start,
+            blue_start=blue_start,
+            red_walls=DEFAULT_WALLS_PER_PLAYER,
+            blue_walls=DEFAULT_WALLS_PER_PLAYER,
+            starting_player=current,
+            board_size=BOARD_SIZE,
+        )
+        target = 1.0 if own_distance < opp_distance else -1.0
+        planes.append(encode_state_stack(state, (), history_length=history_length))
+        value_targets.append(target)
+        policy_targets.append(MoveDirection.DOWN.value)
+        policy_mask.append(1.0 if target > 0.0 and MoveDirection.DOWN.value in state.legal_actions() else 0.0)
+
+    return (
+        torch.stack(planes, dim=0).to(device, non_blocking=True),
+        torch.as_tensor(value_targets, dtype=torch.float32, device=device),
+        torch.as_tensor(policy_targets, dtype=torch.long, device=device),
+        torch.as_tensor(policy_mask, dtype=torch.float32, device=device),
+    )
+
+
 def _masked_mean(per_sample: Tensor, mask: Tensor, fallback: Tensor) -> Tensor:
     mask = mask.to(device=per_sample.device, dtype=per_sample.dtype).view_as(per_sample)
     denominator = mask.sum()
@@ -1751,6 +1930,7 @@ def build_model(config: NetworkConfig) -> nn.Module:
         num_conv_layers=config.num_conv_layers,
         num_residual_layers=config.num_residual_layers,
         value_hidden_size=config.value_hidden_size,
+        policy_head_type=config.policy_head_type,
     )
 
 
@@ -1758,7 +1938,7 @@ def load_model_from_checkpoint(
     path: str | Path, device: Optional[str] = None
 ) -> Tuple[nn.Module, NetworkConfig]:
     payload = torch.load(path, map_location=device or "cpu", weights_only=False)
-    network_config = NetworkConfig(**payload.get("network_config", {}))
+    network_config = _network_config_from_payload(payload)
     model = build_model(network_config)
     _load_model_state(model, payload["model_state"])
     if device:
@@ -1772,10 +1952,15 @@ def _load_checkpoint_into(
     *,
     optimizer: Optional[torch.optim.Optimizer] = None,
     device: Optional[torch.device] = None,
+    reset_policy_head: bool = False,
 ) -> Dict[str, Any]:
     payload = torch.load(path, map_location=device or "cpu", weights_only=False)
-    _load_model_state(model, payload["model_state"])
-    if optimizer is not None and "optimizer_state" in payload:
+    _load_model_state(
+        model,
+        payload["model_state"],
+        reset_policy_head=reset_policy_head,
+    )
+    if optimizer is not None and "optimizer_state" in payload and not reset_policy_head:
         try:
             optimizer.load_state_dict(payload["optimizer_state"])
         except ValueError:
@@ -1783,9 +1968,78 @@ def _load_checkpoint_into(
     return payload
 
 
-def _load_model_state(model: nn.Module, state_dict: Dict[str, Tensor]) -> None:
+def _load_model_state(
+    model: nn.Module,
+    state_dict: Dict[str, Tensor],
+    *,
+    reset_policy_head: bool = False,
+) -> None:
+    source_state_dict = state_dict
+    if reset_policy_head:
+        model_state = model.state_dict()
+        state_dict = {
+            key: value
+            for key, value in state_dict.items()
+            if not key.startswith("policy_head.fc.")
+            and key in model_state
+            and tuple(value.shape) == tuple(model_state[key].shape)
+        }
     incompatible = model.load_state_dict(state_dict, strict=False)
+    allowed_missing_prefixes = ("lead_head.", "future_map_head.", "score_head.")
+    if reset_policy_head:
+        allowed_missing_prefixes = (*allowed_missing_prefixes, "policy_head.")
+    unexpected = list(incompatible.unexpected_keys)
+    disallowed_missing = [
+        key
+        for key in incompatible.missing_keys
+        if not key.startswith(allowed_missing_prefixes)
+    ]
+    if unexpected or disallowed_missing:
+        raise RuntimeError(
+            "Checkpoint architecture mismatch: "
+            f"missing={disallowed_missing[:8]} unexpected={unexpected[:8]}"
+        )
+    if reset_policy_head:
+        _initialize_reset_policy_head(model, source_state_dict)
     _initialize_missing_auxiliary_outputs(model, incompatible.missing_keys)
+
+
+def _initialize_reset_policy_head(
+    model: nn.Module,
+    source_state_dict: Dict[str, Tensor],
+) -> None:
+    """Warm-start a reset factored policy head from an old flat policy head."""
+    policy_head = getattr(model, "policy_head", None)
+    if policy_head is None:
+        return
+    required = ("type_fc", "move_fc", "wall_fc", "move_index", "wall_index")
+    if not all(hasattr(policy_head, name) for name in required):
+        return
+
+    flat_weight = source_state_dict.get("policy_head.fc.weight")
+    flat_bias = source_state_dict.get("policy_head.fc.bias")
+    if flat_weight is None or flat_bias is None:
+        return
+
+    move_index = policy_head.move_index.tolist()
+    wall_index = policy_head.wall_index.tolist()
+    if flat_weight.shape[0] <= max(move_index + wall_index):
+        return
+    if flat_weight.shape[1] != policy_head.move_fc.weight.shape[1]:
+        return
+
+    device = policy_head.move_fc.weight.device
+    dtype = policy_head.move_fc.weight.dtype
+    flat_weight = flat_weight.to(device=device, dtype=dtype)
+    flat_bias = flat_bias.to(device=device, dtype=dtype)
+
+    with torch.no_grad():
+        policy_head.move_fc.weight.copy_(flat_weight[move_index])
+        policy_head.move_fc.bias.copy_(flat_bias[move_index])
+        policy_head.wall_fc.weight.copy_(flat_weight[wall_index])
+        policy_head.wall_fc.bias.copy_(flat_bias[wall_index])
+        policy_head.type_fc.weight.zero_()
+        policy_head.type_fc.bias.zero_()
 
 
 def _initialize_missing_auxiliary_outputs(
@@ -1948,6 +2202,23 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--num-conv-layers", type=int, default=1)
         p.add_argument("--num-residual-layers", type=int, default=6)
         p.add_argument("--value-hidden-size", type=int, default=128)
+        p.add_argument(
+            "--policy-head-type",
+            choices=("factored", "flat"),
+            default=None,
+            help=(
+                "Policy head architecture. Defaults to factored for new models; "
+                "when loading a checkpoint, defaults to the checkpoint's head."
+            ),
+        )
+        p.add_argument(
+            "--reset-policy-head",
+            action="store_true",
+            help=(
+                "Allow loading a checkpoint with a different policy head type by "
+                "reinitializing the policy head while keeping compatible trunk/value weights."
+            ),
+        )
         p.add_argument("--checkpoint", type=str, default=None)
         p.add_argument("--device", type=str, default=None)
 
@@ -2018,6 +2289,8 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--train-batch-size", type=int, default=256)
     train.add_argument("--learning-rate", type=float, default=1e-3)
     train.add_argument("--value-loss-weight", type=float, default=1.0)
+    train.add_argument("--tactical-value-loss-weight", type=float, default=0.25)
+    train.add_argument("--tactical-value-batch-size", type=int, default=64)
     train.add_argument("--lead-loss-weight", type=float, default=0.1)
     train.add_argument("--future-loss-weight", type=float, default=0.1)
     train.add_argument("--score-loss-weight", type=float, default=0.01)
@@ -2039,12 +2312,15 @@ def parse_args() -> argparse.Namespace:
     # --- loop ---
     loop = subparsers.add_parser("loop")
     add_network_args(loop)
-    loop.add_argument("--iterations", type=int, default=1)
+    loop.add_argument("--iterations", type=int, default=100)
     loop.add_argument("--starting-iter", type=int, default=1)
-    loop.add_argument("--games", type=int, default=16)
+    loop.add_argument("--games", type=int, default=100)
     loop.add_argument("--base-simulations", type=int, default=128)
-    loop.add_argument("--mcts-batch-size", type=int, default=16)
-    loop.add_argument("--max-steps", type=int, default=100)
+    loop.add_argument("--cpuct-base", type=float, default=19652.0)
+    loop.add_argument("--cpuct-init", type=float, default=2.5)
+    loop.add_argument("--cpuct-factor", type=float, default=3.89)
+    loop.add_argument("--mcts-batch-size", type=int, default=128)
+    loop.add_argument("--max-steps", type=int, default=150)
     loop.add_argument("--chunk-size", type=int, default=2048)
     loop.add_argument("--temperature-drop-ply", type=int, default=20)
     loop.add_argument("--replay-dir", type=str, default=str(SELFPLAY_DIR))
@@ -2054,14 +2330,16 @@ def parse_args() -> argparse.Namespace:
     loop.add_argument(
         "--replay-window-size",
         type=int,
-        default=1,
+        default=10,
         help="Train on the current iteration plus the previous N iterations "
-        "of self-play data (default: 1; 0=unbounded).",
+        "of self-play data (default: 10; 0=unbounded).",
     )
-    loop.add_argument("--epochs", type=int, default=1)
+    loop.add_argument("--epochs", type=int, default=6)
     loop.add_argument("--train-batch-size", type=int, default=256)
     loop.add_argument("--learning-rate", type=float, default=1e-3)
     loop.add_argument("--value-loss-weight", type=float, default=1.0)
+    loop.add_argument("--tactical-value-loss-weight", type=float, default=0.25)
+    loop.add_argument("--tactical-value-batch-size", type=int, default=64)
     loop.add_argument("--lead-loss-weight", type=float, default=0.1)
     loop.add_argument("--future-loss-weight", type=float, default=0.1)
     loop.add_argument("--score-loss-weight", type=float, default=0.01)
@@ -2076,7 +2354,7 @@ def parse_args() -> argparse.Namespace:
     loop.add_argument(
         "--num-workers",
         type=int,
-        default=4,
+        default=6,
         help="Number of parallel game workers for self-play",
     )
     add_selfplay_runtime_args(loop)
@@ -2092,6 +2370,7 @@ def network_config_from_args(args: argparse.Namespace) -> NetworkConfig:
         num_conv_layers=args.num_conv_layers,
         num_residual_layers=args.num_residual_layers,
         value_hidden_size=args.value_hidden_size,
+        policy_head_type=args.policy_head_type or "factored",
     )
 
 
@@ -2101,13 +2380,29 @@ def main() -> None:
         _start_train_log_capture()
 
     network_config = network_config_from_args(args)
+    if args.checkpoint:
+        payload = torch.load(
+            args.checkpoint,
+            map_location=torch.device(args.device or "cpu"),
+            weights_only=False,
+        )
+        if isinstance(payload, dict) and "model_state" in payload:
+            network_config = _network_config_from_payload(payload)
+            if args.policy_head_type is not None:
+                network_config = replace(
+                    network_config,
+                    policy_head_type=args.policy_head_type,
+                )
     _set_seed(getattr(args, "seed", 1))
 
     if args.command == "self-play":
         model = build_model(network_config)
         if args.checkpoint:
             _load_checkpoint_into(
-                model, args.checkpoint, device=torch.device(args.device or "cpu")
+                model,
+                args.checkpoint,
+                device=torch.device(args.device or "cpu"),
+                reset_policy_head=args.reset_policy_head,
             )
         config = SelfPlayConfig(
             iteration=args.iteration,
@@ -2125,6 +2420,9 @@ def main() -> None:
             resign_plies=args.resign_plies,
             resign_disable_fraction=args.resign_disable_fraction,
             use_processes=args.use_processes,
+            cpuct_base=args.cpuct_base,
+            cpuct_init=args.cpuct_init,
+            cpuct_factor=args.cpuct_factor
         )
         run_self_play(model, network_config, config, device=args.device)
 
@@ -2148,6 +2446,8 @@ def main() -> None:
             batch_size=args.train_batch_size,
             learning_rate=args.learning_rate,
             value_loss_weight=args.value_loss_weight,
+            tactical_value_loss_weight=args.tactical_value_loss_weight,
+            tactical_value_batch_size=args.tactical_value_batch_size,
             lead_loss_weight=args.lead_loss_weight,
             future_loss_weight=args.future_loss_weight,
             score_loss_weight=args.score_loss_weight,
@@ -2161,6 +2461,7 @@ def main() -> None:
             config,
             checkpoint_path=args.checkpoint,
             device=args.device,
+            reset_policy_head=args.reset_policy_head,
         )
 
     elif args.command == "eval":
@@ -2196,10 +2497,14 @@ def main() -> None:
                 model,
                 args.checkpoint,
                 device=torch.device(args.device or "cpu"),
+                reset_policy_head=args.reset_policy_head,
             )
         self_play_config = SelfPlayConfig(
             games=args.games,
             base_simulations=args.base_simulations,
+            cpuct_base=args.cpuct_base,
+            cpuct_factor=args.cpuct_factor,
+            cpuct_init=args.cpuct_init,
             batch_size=args.mcts_batch_size,
             max_steps=args.max_steps,
             chunk_size=args.chunk_size,
@@ -2223,6 +2528,8 @@ def main() -> None:
             batch_size=args.train_batch_size,
             learning_rate=args.learning_rate,
             value_loss_weight=args.value_loss_weight,
+            tactical_value_loss_weight=args.tactical_value_loss_weight,
+            tactical_value_batch_size=args.tactical_value_batch_size,
             lead_loss_weight=args.lead_loss_weight,
             future_loss_weight=args.future_loss_weight,
             score_loss_weight=args.score_loss_weight,

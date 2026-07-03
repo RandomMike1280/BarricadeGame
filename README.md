@@ -131,3 +131,31 @@ python train.py eval --checkpoint checkpoints/latest.pt --baseline-checkpoint ch
 
 Replay chunks are written under `data/selfplay/` and checkpoints under
 `checkpoints/` by default.
+
+The 9x9 network supports `--policy-head-type flat|factored`. New runs default
+to the factored policy head, while checkpoint loading preserves the head type
+stored in the checkpoint so old flat-head checkpoints are not accidentally
+loaded with random factored policy layers.
+
+Training also includes value-only tactical race regularization by default:
+`--tactical-value-loss-weight 0.25 --tactical-value-batch-size 64`. These
+synthetic empty-board near-terminal samples keep the value head sensitive to
+obvious pawn-race wins even when the position did not arise from normal
+self-play history. Set either value to `0` to disable it.
+
+To inspect that failure mode before or after retraining:
+
+```powershell
+python probe_tactical_value.py --checkpoint checkpoints/latest.pt
+```
+
+For a quick value-only repair pass on an existing checkpoint:
+
+```powershell
+python finetune_tactical_value.py --checkpoint checkpoints/latest.pt --output checkpoints/tactical_value_finetuned.pt --steps 500
+```
+
+To migrate an old flat policy checkpoint to the factored head during that pass,
+use `--policy-head-type factored --reset-policy-head`; compatible flat-head
+action rows are copied into the factored move/wall subheads, while the type head
+starts balanced.

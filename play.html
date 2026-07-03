@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Barricade — Play vs AlphaZero</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  background: #1a1a2e;
+  color: #e0e0e0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 20px;
+}
+h1 {
+  font-size: 1.6rem;
+  margin-bottom: 16px;
+  color: #f0c040;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+}
+.container {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: 1150px;
+  width: 100%;
+}
+.board-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+#board-wrapper {
+  position: relative;
+  border: 2px solid #444;
+  border-radius: 4px;
+  background: #2a2a3e;
+}
+canvas {
+  display: block;
+  cursor: pointer;
+}
+.status-bar {
+  margin-top: 10px;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  font-size: 0.9rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.status-bar span {
+  background: #222;
+  padding: 3px 10px;
+  border-radius: 4px;
+}
+#status-text {
+  font-weight: bold;
+  color: #f0c040;
+}
+.player-red { color: #ff6b6b; }
+.player-blue { color: #6b9fff; }
+.side-btn { font-size:0.78rem; padding:3px 10px; background:#222; border:1px solid #444; color:#aaa; border-radius:3px; cursor:pointer; }
+.side-btn.active { background:#4361ee; border-color:#4361ee; color:#fff; }
+#side-selector { display:flex; align-items:center; gap:2px; }
+.btn {
+  padding: 5px 14px;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.82rem;
+  font-weight: 600;
+  transition: background 0.2s;
+}
+.btn-primary { background: #4361ee; color: #fff; }
+.btn-primary:hover { background: #3a56d4; }
+.btn-danger { background: #e63946; color: #fff; }
+.btn-danger:hover { background: #c1121f; }
+.btn-success { background: #2d6a4f; color: #fff; }
+.btn-success:hover { background: #1b4332; }
+.btn-small { padding: 3px 10px; font-size:0.75rem; }
+
+.panel {
+  background: #222;
+  border: 1px solid #333;
+  border-radius: 6px;
+  padding: 12px 14px;
+  min-width: 260px;
+  max-width: 340px;
+}
+.panel h3 {
+  font-size: 0.92rem;
+  margin-bottom: 8px;
+  color: #ccc;
+  border-bottom: 1px solid #333;
+  padding-bottom: 4px;
+}
+.panel-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 5px;
+  font-size: 0.82rem;
+}
+.panel-row label { color: #aaa; }
+.panel-row input[type="range"] {
+  width: 80px;
+  accent-color: #4361ee;
+}
+.panel-row .val {
+  width: 38px;
+  text-align: right;
+  font-family: monospace;
+  color: #f0c040;
+}
+#eval-panel .val-row {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 3px;
+  font-size: 0.82rem;
+}
+#eval-panel .val-row .label { color: #888; }
+#eval-panel .val-row .value { font-family: monospace; font-weight: bold; }
+.val-positive { color: #6b9fff; }
+.val-negative { color: #ff6b6b; }
+.val-neutral { color: #aaa; }
+#stats-panel {
+  max-height: 420px;
+  overflow-y: auto;
+  font-size: 0.72rem;
+}
+#stats-panel table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.68rem;
+}
+#stats-panel th, #stats-panel td {
+  padding: 2px 3px;
+  text-align: right;
+  border-bottom: 1px solid #333;
+}
+#stats-panel th { color: #888; font-weight: normal; position: sticky; top:0; background:#222; }
+#stats-panel td { font-family: monospace; }
+#stats-panel .move-row { cursor: pointer; }
+#stats-panel .move-row:hover { background: #2a2a3e; }
+#diagnostics-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 0.72rem;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid #333;
+}
+#diagnostics-row span { color: #888; }
+#diagnostics-row .val { color: #f0c040; }
+.hidden { display: none; }
+#thinking-indicator {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: rgba(0,0,0,0.85);
+  color: #f0c040;
+  padding: 12px 24px;
+  border-radius: 6px;
+  font-weight: bold;
+  z-index: 10;
+}
+#mode-toggle {
+  display: flex;
+  gap: 3px;
+}
+#mode-toggle button {
+  padding: 3px 8px;
+  border: 1px solid #444;
+  border-radius: 3px;
+  background: #222;
+  color: #aaa;
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+#mode-toggle button.active {
+  background: #4361ee;
+  color: #fff;
+  border-color: #4361ee;
+}
+.wall-orient {
+  font-size: 0.72rem;
+  color: #888;
+  margin-left: 6px;
+}
+</style>
+</head>
+<body>
+<h1>♟ Barricade</h1>
+<div class="container">
+  <div class="board-section">
+    <div id="board-wrapper">
+      <canvas id="board" width="504" height="504"></canvas>
+      <div id="thinking-indicator" class="hidden">AI thinking...</div>
+    </div>
+    <div class="status-bar">
+      <span id="status-text">Loading...</span>
+      <span id="walls-info">R:10 B:10</span>
+      <div id="mode-toggle">
+        <button id="mode-move" class="active" onclick="setMode('move')">Move</button>
+        <button id="mode-wall" onclick="setMode('wall')">Wall</button>
+        <span class="wall-orient" id="orient-label">H</span>
+      </div>
+      <div id="side-selector">
+        <label style="font-size:0.75rem;color:#888;margin-right:2px;">As:</label>
+        <button id="side-red" class="btn side-btn active" onclick="setPlayerSide('RED')">R</button>
+        <button id="side-blue" class="btn side-btn" onclick="setPlayerSide('BLUE')">B</button>
+      </div>
+      <button class="btn btn-danger btn-small" onclick="newGame()">New</button>
+      <button class="btn btn-small" id="btn-future" onclick="toggleFutureOverlay()" style="background:#333;color:#aaa;border:1px solid #555;">🗺 Future</button>
+    </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:10px;">
+    <div class="panel" id="eval-panel">
+      <h3>Model Eval <span style="font-weight:normal;font-size:0.7rem;color:#666;">(BLUE perspective: +1 = BLUE wins)</span></h3>
+      <div class="val-row"><span class="label">Value</span><span class="value" id="eval-value">—</span></div>
+      <div class="val-row"><span class="label">Lead</span><span class="value" id="eval-lead">—</span></div>
+      <div class="val-row"><span class="label">Score</span><span class="value" id="eval-score">—</span></div>
+      <div style="margin-top:6px;border-top:1px solid #333;padding-top:4px;font-size:0.72rem;">
+        <div class="val-row"><span class="label">Root Value (BLUE)</span><span class="value" id="root-value">—</span></div>
+        <div class="val-row"><span class="label">Root Lead</span><span class="value" id="root-lead">—</span></div>
+        <div class="val-row"><span class="label">Top Policy</span><span class="value" id="top-policy" style="font-size:0.65rem;">—</span></div>
+      </div>
+    </div>
+
+    <div class="panel" id="settings-panel">
+      <h3>MCTS Settings</h3>
+      <div class="panel-row">
+        <label>Sims</label>
+        <input type="range" min="50" max="2000" step="10" value="400" data-key="num_simulations">
+        <span class="val" id="val-num_simulations">400</span>
+      </div>
+      <div class="panel-row">
+        <label>Temp</label>
+        <input type="range" min="0" max="200" step="1" value="100" data-key="action_temperature">
+        <span class="val" id="val-action_temperature">1.00</span>
+      </div>
+      <div class="panel-row">
+        <label>CPUCT</label>
+        <input type="range" min="0" max="500" step="5" value="175" data-key="cpuct_init" data-scale="100">
+        <span class="val" id="val-cpuct_init">1.75</span>
+      </div>
+      <div class="panel-row">
+        <label>FPU</label>
+        <input type="range" min="0" max="100" step="1" value="33" data-key="fpu_reduction" data-scale="100">
+        <span class="val" id="val-fpu_reduction">0.33</span>
+      </div>
+      <div class="panel-row">
+        <label>Pawn Flr</label>
+        <input type="range" min="0" max="50" step="1" value="0" data-key="pawn_prior_floor" data-scale="100">
+        <span class="val" id="val-pawn_prior_floor">0.00</span>
+      </div>
+      <div class="panel-row">
+        <label>Dir α</label>
+        <input type="range" min="1" max="100" step="1" value="30" data-key="root_dirichlet_alpha" data-scale="100">
+        <span class="val" id="val-root_dirichlet_alpha">0.30</span>
+      </div>
+      <div class="panel-row">
+        <label>Noise Frac</label>
+        <input type="range" min="0" max="50" step="1" value="25" data-key="root_exploration_fraction" data-scale="100">
+        <span class="val" id="val-root_exploration_fraction">0.25</span>
+      </div>
+      <div style="display:flex;gap:4px;margin-top:6px;">
+        <button class="btn btn-success btn-small" onclick="applySettings()">Apply</button>
+        <button class="btn btn-primary btn-small" onclick="loadSettings()">Reload</button>
+      </div>
+    </div>
+
+    <div class="panel" id="stats-panel">
+      <h3>Search Stats</h3>
+      <div id="stats-content"><em>Make a move</em></div>
+      <div id="diagnostics-row"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ============================================================
+// Board rendering constants
+// ============================================================
+const BOARD_SIZE = 9;
+const CELL = 56;
+const CANVAS_W = CELL * BOARD_SIZE;
+const CANVAS_H = CELL * BOARD_SIZE;
+
+const COLOR_BG = '#1e1e2e';
+const COLOR_CELL1 = '#2a2a3e';
+const COLOR_CELL2 = '#252538';
+const COLOR_GRID = '#3a3a4e';
+const COLOR_RED = '#ff6b6b';
+const COLOR_BLUE = '#6b9fff';
+const COLOR_WALL = '#d4a843';
+const COLOR_VALID = 'rgba(100, 255, 100, 0.25)';
+const COLOR_HOVER_VALID = 'rgba(100, 255, 100, 0.4)';
+const COLOR_HOVER_INVALID = 'rgba(255, 80, 80, 0.3)';
+const COLOR_PREVIEW_VALID = 'rgba(200, 200, 50, 0.5)';
+const COLOR_PREVIEW_INVALID = 'rgba(255, 50, 50, 0.5)';
+
+let canvas, ctx;
+
+// ============================================================
+// State
+// ============================================================
+let gameState = null;
+let validMoves = [];
+let mode = 'move';
+let wallOrientation = 'HORIZONTAL';
+let aiThinking = false;
+let searchStats = [];
+let blueValue = null;
+let blueLead = null;
+let diagnostics = null;
+let hoverCell = null;
+let hoverWall = null;
+let gameOver = false;
+let showFutureOverlay = false;
+let futureMapData = null;
+let lastEvalData = null;
+
+// ============================================================
+// Player side
+// ============================================================
+let playerSide = 'RED';
+function setPlayerSide(side) {
+  playerSide = side;
+  document.getElementById('side-red').classList.toggle('active', side === 'RED');
+  document.getElementById('side-blue').classList.toggle('active', side === 'BLUE');
+}
+
+// ============================================================
+// Init
+// ============================================================
+document.addEventListener('DOMContentLoaded', () => {
+  canvas = document.getElementById('board');
+  ctx = canvas.getContext('2d');
+  canvas.addEventListener('mousemove', onMouseMove);
+  canvas.addEventListener('click', onClick);
+  canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); toggleWallOrientation(); });
+  document.addEventListener('keydown', onKey);
+
+  document.querySelectorAll('#settings-panel input[type="range"]').forEach(slider => {
+    slider.addEventListener('input', onSliderChange);
+  });
+
+  loadSettings().then(() => newGame());
+});
+
+// ============================================================
+// API
+// ============================================================
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+// ============================================================
+// Game actions
+// ============================================================
+async function newGame() {
+  aiThinking = false;
+  gameOver = false;
+  setThinking(false);
+  futureMapData = null;
+  lastEvalData = null;
+  try {
+    const body = JSON.stringify({ player_side: playerSide });
+    const data = await api('/api/new_game', { method: 'POST', body });
+    gameState = data.state;
+    validMoves = data.valid_moves;
+    searchStats = [];
+    blueValue = null;
+    blueLead = null;
+    diagnostics = null;
+    hoverCell = null;
+    hoverWall = null;
+    updateUI();
+    draw();
+    if (data.ai_first_move) {
+      const stateResp = await api('/api/state', { method: 'GET' });
+      gameState = stateResp.state;
+      validMoves = stateResp.valid_moves;
+      updateUI();
+      draw();
+    }
+    // Run model evaluation on the new state
+    runEval();
+  } catch (e) { alert('Error: ' + e.message); }
+}
+
+async function makeMove(action) {
+  if (aiThinking || gameOver) return;
+  setThinking(true);
+  clearEvalDisplay();
+  try {
+    const data = await api('/api/move', {
+      method: 'POST',
+      body: JSON.stringify({ action }),
+    });
+    gameState = data.state;
+    validMoves = data.valid_moves;
+    searchStats = data.stats || [];
+    blueValue = data.blue_value;
+    blueLead = data.blue_lead;
+    diagnostics = data.diagnostics || null;
+    gameOver = data.game_over;
+    hoverCell = null;
+    hoverWall = null;
+    updateUI();
+    drawStats();
+    if (gameOver) setThinking(false);
+    draw();
+    // Run model evaluation
+    runEval();
+  } catch (e) {
+    setThinking(false);
+    alert('Move error: ' + e.message);
+  }
+  setThinking(false);
+}
+
+async function runEval() {
+  try {
+    const data = await api('/api/evaluate', { method: 'POST', body: '{}' });
+    lastEvalData = data;
+    futureMapData = data.future_map;
+    displayEval(data);
+    if (showFutureOverlay) draw();
+  } catch (e) { /* silently ignore eval errors after game over */ }
+}
+
+function toggleFutureOverlay() {
+  showFutureOverlay = !showFutureOverlay;
+  document.getElementById('btn-future').style.background = showFutureOverlay ? '#4361ee' : '#333';
+  document.getElementById('btn-future').style.color = showFutureOverlay ? '#fff' : '#aaa';
+  draw();
+}
+
+function setThinking(val) {
+  aiThinking = val;
+  document.getElementById('thinking-indicator').classList.toggle('hidden', !val);
+}
+
+function clearEvalDisplay() {
+  document.getElementById('eval-value').textContent = '—';
+  document.getElementById('eval-lead').textContent = '—';
+  document.getElementById('eval-score').textContent = '—';
+  document.getElementById('root-value').textContent = '—';
+  document.getElementById('root-lead').textContent = '—';
+  document.getElementById('top-policy').textContent = '—';
+}
+
+function displayEval(data) {
+  setValueSpan('eval-value', data.blue_value, 4);
+  setValueSpan('eval-lead', data.blue_lead, 4);
+  document.getElementById('eval-score').textContent = data.score.toFixed(2);
+  document.getElementById('eval-score').className = 'value val-neutral';
+
+  if (blueValue !== null) {
+    setValueSpan('root-value', blueValue, 4);
+  }
+  if (blueLead !== null) {
+    setValueSpan('root-lead', blueLead, 4);
+  }
+
+  // Top policy text
+  if (data.top_policy && data.top_policy.length) {
+    const txt = data.top_policy.slice(0, 4).map(p => `a${p.action}=${(p.prob*100).toFixed(1)}%`).join(' ');
+    document.getElementById('top-policy').textContent = txt;
+    document.getElementById('top-policy').className = 'value val-neutral';
+  }
+}
+
+function setValueSpan(elId, val, decimals) {
+  const el = document.getElementById(elId);
+  if (val === null || val === undefined) { el.textContent = '—'; return; }
+  el.textContent = (val >= 0 ? '+' : '') + val.toFixed(decimals || 4);
+  el.className = 'value ' + (val > 0.05 ? 'val-positive' : val < -0.05 ? 'val-negative' : 'val-neutral');
+}
+
+// ============================================================
+// Settings
+// ============================================================
+function onSliderChange(e) {
+  const slider = e.target;
+  const key = slider.dataset.key;
+  const scale = parseFloat(slider.dataset.scale || '1');
+  const val = parseInt(slider.value) / scale;
+  document.getElementById(`val-${key}`).textContent = val.toFixed(2);
+}
+
+async function applySettings() {
+  const body = {};
+  document.querySelectorAll('#settings-panel input[type="range"]').forEach(slider => {
+    const key = slider.dataset.key;
+    const scale = parseFloat(slider.dataset.scale || '1');
+    body[key] = parseInt(slider.value) / scale;
+  });
+  try { await api('/api/settings', { method: 'POST', body: JSON.stringify(body) }); }
+  catch (e) { console.error('Settings error:', e); }
+}
+
+async function loadSettings() {
+  try {
+    const data = await api('/api/settings', { method: 'GET' });
+    for (const [key, val] of Object.entries(data)) {
+      const slider = document.querySelector(`#settings-panel input[data-key="${key}"]`);
+      if (slider) {
+        const scale = parseFloat(slider.dataset.scale || '1');
+        slider.value = Math.round(val * scale);
+        document.getElementById(`val-${key}`).textContent = Number(val).toFixed(2);
+      }
+    }
+  } catch (e) { console.error('Load settings error:', e); }
+}
+
+// ============================================================
+// Mode helpers
+// ============================================================
+function setMode(newMode) {
+  mode = newMode;
+  document.getElementById('mode-move').classList.toggle('active', mode === 'move');
+  document.getElementById('mode-wall').classList.toggle('active', mode === 'wall');
+  hoverCell = null; hoverWall = null; draw();
+}
+
+function toggleWallOrientation() {
+  wallOrientation = wallOrientation === 'HORIZONTAL' ? 'VERTICAL' : 'HORIZONTAL';
+  document.getElementById('orient-label').textContent = wallOrientation === 'HORIZONTAL' ? 'H' : 'V';
+  hoverWall = null; draw();
+}
+
+function onKey(e) {
+  if (e.key === 'r' || e.key === 'R') toggleWallOrientation();
+  if (e.key === 'w' || e.key === 'W') setMode(mode === 'move' ? 'wall' : 'move');
+  if (e.key === 'n' || e.key === 'N') newGame();
+  if (e.key === 'f' || e.key === 'F') toggleFutureOverlay();
+}
+
+// ============================================================
+// Mouse
+// ============================================================
+function getGridPos(mx, my) {
+  const rect = canvas.getBoundingClientRect();
+  const x = mx - rect.left;
+  const y = my - rect.top;
+  if (x < 0 || x >= CANVAS_W || y < 0 || y >= CANVAS_H) return null;
+  return { row: Math.floor(y / CELL), col: Math.floor(x / CELL) };
+}
+
+function onMouseMove(e) {
+  if (aiThinking || gameOver) return;
+  const pos = getGridPos(e.clientX, e.clientY);
+  if (!pos) { hoverCell = null; hoverWall = null; draw(); return; }
+  if (mode === 'move') {
+    hoverCell = { row: pos.row, col: pos.col };
+    hoverWall = null;
+  } else {
+    hoverCell = null;
+    const cx = (e.clientX - canvas.getBoundingClientRect().left) / CELL;
+    const cy = (e.clientY - canvas.getBoundingClientRect().top) / CELL;
+    let wr = Math.round(cy - 0.5), wc = Math.round(cx - 0.5);
+    if (wr >= 0 && wr < BOARD_SIZE - 1 && wc >= 0 && wc < BOARD_SIZE - 1)
+      hoverWall = { orientation: wallOrientation, row: wr, col: wc };
+    else
+      hoverWall = null;
+  }
+  draw();
+}
+
+function onClick(e) {
+  if (aiThinking || gameOver) return;
+  if (mode === 'move' && hoverCell) {
+    const vm = validMoves.find(m => m.type === 'move' && m.row === hoverCell.row && m.col === hoverCell.col);
+    if (vm) makeMove(vm.action);
+  } else if (mode === 'wall' && hoverWall) {
+    const vm = validMoves.find(m => m.type === 'wall' && m.orientation === hoverWall.orientation && m.row === hoverWall.row && m.col === hoverWall.col);
+    if (vm) makeMove(vm.action);
+  }
+}
+
+// ============================================================
+// UI update
+// ============================================================
+function updateUI() {
+  if (!gameState) return;
+  const cp = gameState.current_player;
+  const isRed = cp === 'RED';
+  document.getElementById('status-text').textContent =
+    gameState.is_terminal
+      ? (gameState.winner ? `${gameState.winner} wins!` : gameState.draw_reason || 'Draw')
+      : `${cp}'s Turn`;
+  document.getElementById('status-text').className = isRed ? 'player-red' : 'player-blue';
+  document.getElementById('walls-info').textContent =
+    `R:${gameState.walls_left.RED} B:${gameState.walls_left.BLUE}`;
+}
+
+function drawStats() {
+  const el = document.getElementById('stats-content');
+  if (!searchStats || searchStats.length === 0) {
+    el.innerHTML = '<em>Make a move</em>';
+    document.getElementById('diagnostics-row').innerHTML = '';
+    return;
+  }
+  const sorted = [...searchStats].sort((a, b) => b.visits - a.visits).slice(0, 15);
+  let html = '<table><tr><th>#</th><th>Act</th><th>Prior</th><th>Visits</th><th>Q</th><th>LeadQ</th></tr>';
+  sorted.forEach((s, i) => {
+    html += `<tr class="move-row" onclick="makeMove(${s.action})">
+      <td>${i + 1}</td>
+      <td>${s.action}</td>
+      <td>${s.prior.toFixed(3)}</td>
+      <td>${s.visits}</td>
+      <td>${s.q.toFixed(3)}</td>
+      <td>${(s.lead_q !== undefined ? s.lead_q : 0).toFixed(3)}</td>
+    </tr>`;
+  });
+  html += '</table>';
+  el.innerHTML = html;
+
+  // Diagnostics
+  if (diagnostics) {
+    document.getElementById('diagnostics-row').innerHTML =
+      `<span>Sims: <b class="val">${diagnostics.simulations}</b></span>` +
+      `<span>Batches: <b class="val">${diagnostics.neural_batches}</b></span>` +
+      `<span>Collisions: <b class="val">${diagnostics.collisions}</b></span>`;
+  }
+}
+
+// ============================================================
+// Drawing
+// ============================================================
+function draw() {
+  ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+  drawBoard();
+  if (showFutureOverlay && futureMapData && gameState && !gameState.is_terminal) {
+    drawFutureOverlay();
+  }
+  drawWalls();
+  drawPawns();
+  drawHighlights();
+  drawHover();
+}
+
+function drawBoard() {
+  for (let r = 0; r < BOARD_SIZE; r++) {
+    for (let c = 0; c < BOARD_SIZE; c++) {
+      ctx.fillStyle = (r + c) % 2 === 0 ? COLOR_CELL1 : COLOR_CELL2;
+      ctx.fillRect(c * CELL, r * CELL, CELL, CELL);
+    }
+  }
+  ctx.strokeStyle = COLOR_GRID;
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= BOARD_SIZE; i++) {
+    ctx.beginPath(); ctx.moveTo(i * CELL, 0); ctx.lineTo(i * CELL, CANVAS_H); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i * CELL); ctx.lineTo(CANVAS_W, i * CELL); ctx.stroke();
+  }
+  ctx.fillStyle = 'rgba(255, 107, 107, 0.08)';
+  ctx.fillRect(0, (BOARD_SIZE - 1) * CELL, CANVAS_W, CELL);
+  ctx.fillStyle = 'rgba(107, 159, 255, 0.08)';
+  ctx.fillRect(0, 0, CANVAS_W, CELL);
+}
+
+function drawWalls() {
+  if (!gameState) return;
+  ctx.fillStyle = COLOR_WALL;
+  for (const w of gameState.walls) {
+    const { orientation, row, col } = w;
+    const thick = 8;
+    if (orientation === 'HORIZONTAL') {
+      ctx.fillRect(col * CELL, (row + 1) * CELL - thick / 2, CELL * 2, thick);
+    } else {
+      ctx.fillRect((col + 1) * CELL - thick / 2, row * CELL, thick, CELL * 2);
+    }
+  }
+}
+
+function drawPawns() {
+  if (!gameState) return;
+  for (const [player, pos] of Object.entries(gameState.pawns)) {
+    const [row, col] = pos;
+    const cx = col * CELL + CELL / 2;
+    const cy = row * CELL + CELL / 2;
+    const radius = CELL / 3 - 2;
+    const color = player === 'RED' ? COLOR_RED : COLOR_BLUE;
+    ctx.beginPath(); ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx.fillStyle = color; ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(player === 'RED' ? 'R' : 'B', cx, cy);
+  }
+}
+
+// ============================================================
+// Future Map Overlay
+// ============================================================
+function drawFutureOverlay() {
+  if (!futureMapData || !gameState) return;
+  const cp = gameState.current_player;
+  // side_to_move probabilities: channel 0 (current player's future occupancy)
+  // opponent probabilities: channel 1
+  // We colour each cell based on which player the model expects to occupy it:
+  //   Red tint for RED, Blue tint for BLUE
+  // Intensity = probability
+  const sideProbs = futureMapData.side_to_move;    // 9x9 list
+  const oppProbs = futureMapData.opponent;          // 9x9 list
+
+  for (let r = 0; r < BOARD_SIZE; r++) {
+    for (let c = 0; c < BOARD_SIZE; c++) {
+      const pSide = sideProbs[r][c];
+      const pOpp = oppProbs[r][c];
+      const maxP = Math.max(pSide, pOpp);
+      if (maxP < 0.15) continue;  // skip low-confidence cells
+
+      // Determine colour: side = current player, opp = opponent
+      // current player's colour depends on who is to move
+      let rTint = 0, bTint = 0;
+      if (cp === 'RED') {
+        rTint = pSide * 255;
+        bTint = pOpp * 255;
+      } else {
+        bTint = pSide * 255;
+        rTint = pOpp * 255;
+      }
+      const alpha = Math.min(0.6, maxP * 0.8);
+      ctx.fillStyle = `rgba(${rTint | 0}, 0, ${bTint | 0}, ${alpha})`;
+      ctx.fillRect(c * CELL, r * CELL, CELL, CELL);
+    }
+  }
+
+  // Legend
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(4, 4, 120, 18);
+  ctx.fillStyle = '#ddd';
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillText('🗺 Future occupancy (model)', 8, 7);
+}
+
+function drawHighlights() {
+  if (mode === 'move') {
+    for (const vm of validMoves) {
+      if (vm.type !== 'move') continue;
+      ctx.fillStyle = COLOR_VALID;
+      ctx.fillRect(vm.col * CELL, vm.row * CELL, CELL, CELL);
+    }
+  }
+}
+
+function drawHover() {
+  if (aiThinking || gameOver) return;
+  if (mode === 'move' && hoverCell) {
+    const vm = validMoves.find(m => m.type === 'move' && m.row === hoverCell.row && m.col === hoverCell.col);
+    ctx.fillStyle = vm ? COLOR_HOVER_VALID : COLOR_HOVER_INVALID;
+    ctx.fillRect(hoverCell.col * CELL, hoverCell.row * CELL, CELL, CELL);
+  }
+  if (mode === 'wall' && hoverWall) {
+    const vm = validMoves.find(m => m.type === 'wall' && m.orientation === hoverWall.orientation && m.row === hoverWall.row && m.col === hoverWall.col);
+    ctx.fillStyle = vm ? COLOR_PREVIEW_VALID : COLOR_PREVIEW_INVALID;
+    const thick = 8;
+    if (hoverWall.orientation === 'HORIZONTAL')
+      ctx.fillRect(hoverWall.col * CELL, (hoverWall.row + 1) * CELL - thick / 2, CELL * 2, thick);
+    else
+      ctx.fillRect((hoverWall.col + 1) * CELL - thick / 2, hoverWall.row * CELL, thick, CELL * 2);
+  }
+}
+</script>
+</body>
+</html>

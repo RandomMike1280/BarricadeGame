@@ -20,7 +20,7 @@ from torch import nn
 
 from barricade_env import BarricadeEnv, BarricadeState
 from mcts import MCTS, MCTSConfig
-from network import build_network
+from network import build_network, infer_policy_head_type_from_state_dict
 
 print(torch.get_num_threads())
 print(torch.get_num_interop_threads())
@@ -32,6 +32,7 @@ NETWORK_DEFAULTS = {
     "num_conv_layers": 1,
     "num_residual_layers": 10,
     "value_hidden_size": 256,
+    "policy_head_type": "factored",
 }
 
 
@@ -82,6 +83,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-conv-layers", type=int, default=None)
     parser.add_argument("--num-residual-layers", type=int, default=None)
     parser.add_argument("--value-hidden-size", type=int, default=None)
+    parser.add_argument(
+        "--policy-head-type",
+        choices=("factored", "flat"),
+        default=None,
+    )
 
 
 def resolve_device(device: Optional[str]) -> torch.device:
@@ -100,6 +106,12 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[nn.Modul
         raw_config = payload.get("network_config", {}) if isinstance(payload, dict) else {}
         if isinstance(raw_config, dict):
             checkpoint_config = raw_config
+        state_dict = payload.get("model_state", payload) if isinstance(payload, dict) else payload
+        if isinstance(state_dict, dict) and "policy_head_type" not in checkpoint_config:
+            checkpoint_config = dict(checkpoint_config)
+            checkpoint_config["policy_head_type"] = infer_policy_head_type_from_state_dict(
+                state_dict
+            )
 
     network_config = _resolved_network_config(args, checkpoint_config)
     model = build_network(**network_config).to(device)

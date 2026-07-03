@@ -29,7 +29,7 @@ from torch import nn
 
 from barricade_env import BarricadeEnv, BarricadeState
 from mcts import MCTS, MCTSConfig
-from network import build_network
+from network import build_network, infer_policy_head_type_from_state_dict
 
 
 # Edit these lists directly for the benchmark grid you want.
@@ -57,6 +57,7 @@ NETWORK_CONFIG: Dict[str, Any] = {
     "num_conv_layers": 1,
     "num_residual_layers": 10,
     "value_hidden_size": 256,
+    "policy_head_type": "factored",
 }
 
 OUTPUT_DIR = Path("media")
@@ -156,6 +157,12 @@ def load_model(device: torch.device) -> tuple[nn.Module, Dict[str, Any], Optiona
         raw_config = payload.get("network_config", {}) if isinstance(payload, dict) else {}
         if isinstance(raw_config, dict):
             checkpoint_config = raw_config
+        state_dict = payload.get("model_state", payload) if isinstance(payload, dict) else payload
+        if isinstance(state_dict, dict) and "policy_head_type" not in checkpoint_config:
+            checkpoint_config = dict(checkpoint_config)
+            checkpoint_config["policy_head_type"] = infer_policy_head_type_from_state_dict(
+                state_dict
+            )
 
     network_config = {
         key: checkpoint_config.get(key, value)

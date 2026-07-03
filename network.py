@@ -21,6 +21,9 @@ import torch.nn.functional as F
 from barricade_env import (
     ACTION_SIZE,
     BOARD_SIZE,
+    DIAGONAL_HOP_ACTIONS,
+    DIAGONAL_HOP_OFFSET,
+    MOVE_ACTIONS,
     Player,
     WallOrientation,
 )
@@ -52,6 +55,15 @@ def symlog(x: Tensor) -> Tensor:
 
 def symexp(x: Tensor) -> Tensor:
     return torch.sign(x) * (torch.expm1(torch.abs(x)))
+
+
+def infer_policy_head_type_from_state_dict(state_dict: dict) -> str:
+    """Infer whether a checkpoint stores the flat or factored policy head."""
+    if any(str(key).startswith("policy_head.type_fc.") for key in state_dict):
+        return "factored"
+    if any(str(key).startswith("policy_head.fc.") for key in state_dict):
+        return "flat"
+    return "factored"
 
 
 def encode_state_planes(state, *, dtype=torch.float32) -> Tensor:
@@ -200,6 +212,66 @@ class PolicyHead(nn.Module):
         return self.fc(out)
 
 
+class FactoredPolicyHead(nn.Module):
+    """Hierarchical policy head: ``P(action) = P(type) * P(action | type)``.
+
+    The action space mixes two modalities with wildly different cardinalities
+    (8 pawn moves vs 128 wall placements on 9x9). A flat softmax hands the pawn
+    *group* only ~6% prior mass, so PUCT (first-visit order is proportional to
+    the prior) starves pawn-move exploration and self-play collapses onto walls.
+
+    Factoring the decision into a 2-way type head (move vs wall) plus two
+    within-group heads gives the move/wall choice its own high-leverage
+    parameter, and keeps the move-group prior near 50% by construction (the
+    type head starts unbiased: ``softmax(0, 0) = 0.5``).
+
+    ``forward`` returns *combined flat log-probabilities* laid out exactly like a
+    normal policy-logit vector. Because ``sum_a exp(z_a) = sum_g p_type[g] = 1``,
+    ``z`` is already normalized, so downstream ``log_softmax`` / ``softmax`` are
+    idempotent: the training cross-entropy and MCTS prior code need no changes
+    and the gradient is the exact factored cross-entropy.
+    """
+
+    def __init__(self, channels: int, action_size: int = ACTION_SIZE) -> None:
+        super().__init__()
+        self.action_size = action_size
+        self.conv = nn.Conv2d(channels, 2, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(2)
+        flat = 2 * BOARD_SIZE * BOARD_SIZE
+
+        # Movement modality = orthogonal moves [0, MOVE_ACTIONS) plus diagonal
+        # hops [DIAGONAL_HOP_OFFSET, +DIAGONAL_HOP_ACTIONS); walls are everything
+        # in between. ``move_index`` *defines* the move_fc column -> action map,
+        # so the head is self-consistent regardless of the env's action order.
+        move_index = list(range(MOVE_ACTIONS)) + list(
+            range(DIAGONAL_HOP_OFFSET, DIAGONAL_HOP_OFFSET + DIAGONAL_HOP_ACTIONS)
+        )
+        wall_index = list(range(MOVE_ACTIONS, DIAGONAL_HOP_OFFSET))
+        # Derived constants; not part of the learned state_dict.
+        self.register_buffer(
+            "move_index", torch.tensor(move_index, dtype=torch.long), persistent=False
+        )
+        self.register_buffer(
+            "wall_index", torch.tensor(wall_index, dtype=torch.long), persistent=False
+        )
+
+        self.type_fc = nn.Linear(flat, 2)
+        self.move_fc = nn.Linear(flat, len(move_index))
+        self.wall_fc = nn.Linear(flat, len(wall_index))
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = F.relu(self.bn(self.conv(x)), inplace=True).flatten(1)
+        type_logp = F.log_softmax(self.type_fc(out), dim=1)              # (B, 2)
+        move_logp = F.log_softmax(self.move_fc(out), dim=1) + type_logp[:, 0:1]
+        wall_logp = F.log_softmax(self.wall_fc(out), dim=1) + type_logp[:, 1:2]
+        # Defensive fill: move_index and wall_index are disjoint and together
+        # cover [0, action_size), so every slot is overwritten below.
+        z = out.new_full((out.shape[0], self.action_size), -1.0e30)
+        z = z.index_copy(1, self.move_index, move_logp)
+        z = z.index_copy(1, self.wall_index, wall_logp)
+        return z
+
+
 class ValueHead(nn.Module):
     """1x1 value head that emits a scalar in [-1, 1]."""
 
@@ -267,6 +339,7 @@ class AlphaZeroNetwork(nn.Module):
         num_conv_layers: int = 1,
         num_residual_layers: int = 10,
         value_hidden_size: int = 256,
+        policy_head_type: str = "factored",
     ) -> None:
         super().__init__()
         if input_planes <= 0:
@@ -296,7 +369,15 @@ class AlphaZeroNetwork(nn.Module):
         self.residual_tower = nn.Sequential(
             *[ResidualBlock(residual_channels) for _ in range(num_residual_layers)]
         )
-        self.policy_head = PolicyHead(residual_channels, action_size)
+        if policy_head_type == "factored":
+            self.policy_head: nn.Module = FactoredPolicyHead(residual_channels, action_size)
+        elif policy_head_type == "flat":
+            self.policy_head = PolicyHead(residual_channels, action_size)
+        else:
+            raise ValueError(
+                f"Unknown policy_head_type {policy_head_type!r}; expected 'factored' or 'flat'."
+            )
+        self.policy_head_type = policy_head_type
         self.value_head = ValueHead(residual_channels, value_hidden_size)
         self.lead_head = ScalarHead(residual_channels, value_hidden_size)
         self.future_map_head = FutureMapHead(residual_channels)
@@ -357,6 +438,7 @@ def build_network(
     num_conv_layers: int = 1,
     num_residual_layers: int = 10,
     value_hidden_size: int = 256,
+    policy_head_type: str = "factored",
 ) -> AlphaZeroNetwork:
     config = EncoderConfig(history_length=history_length)
     return AlphaZeroNetwork(
@@ -366,4 +448,5 @@ def build_network(
         num_conv_layers=num_conv_layers,
         num_residual_layers=num_residual_layers,
         value_hidden_size=value_hidden_size,
+        policy_head_type=policy_head_type,
     )
