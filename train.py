@@ -66,6 +66,12 @@ class NetworkConfig:
     num_residual_layers: int = 10
     value_hidden_size: int = 256
     policy_head_type: str = "factored"
+    # Value-specific post-tower: extra residual blocks AFTER the shared
+    # residual_tower, fed only into the value head. Decouples the value
+    # representation from policy / lead / future / score gradients so the
+    # value head can learn a position-mean estimator without being pulled
+    # around by the 4-way tug-of-war on the shared trunk.
+    value_tower_layers: int = 2
 
 
 @dataclass(frozen=True)
@@ -84,12 +90,14 @@ class SelfPlayConfig:
     output_dir: str = str(SELFPLAY_DIR)
     base_walls: int = DEFAULT_WALLS_PER_PLAYER
     num_workers: int = 4
-    # Resignation: end clearly-lost games early so they become decisive (kept)
-    # samples instead of burning compute on a long truncated draw (kept=0). A
-    # fraction of games disable resignation to calibrate the false-positive rate.
-    resign_threshold: float = -0.85
+    # Resignation: DISABLED BY DEFAULT. The previous setup (threshold=-0.85,
+    # 6 plies, 90% of games) flooded training data with fake +/-1 labels for
+    # non-terminal positions, which caused the value head to saturate and
+    # collapse. Re-enable (and tune carefully) only if you want to burn compute
+    # on long truncated draws.
+    resign_threshold: float = -1.0
     resign_plies: int = 6
-    resign_disable_fraction: float = 0.1
+    resign_disable_fraction: float = 1.0
     # Adjudicate threefold-repetition (shuffle) draws by race lead so self-play
     # stays decisive and the value head keeps a win/loss signal instead of
     # collapsing to 0 everywhere. Set False to keep pure rules draws.
@@ -779,6 +787,9 @@ def _run_single_game_worker(
         # (root value <= threshold) for ``resign_plies`` of its own turns,
         # concede now and award the win to the opponent. Only after the
         # exploratory opening, since early root values are noisy.
+        # Note: the previous default (threshold=-0.85, 6 plies) flooded the
+        # replay with fake +/-1 labels for non-terminal positions. Defaults are
+        # now disabled (resign_threshold=-1.0); only re-enable with care.
         if resign_enabled and ply >= config.temperature_drop_ply:
             if result.root_value <= config.resign_threshold:
                 resign_low_streak[player_to_move] += 1
@@ -787,6 +798,15 @@ def _run_single_game_worker(
             if resign_low_streak[player_to_move] >= config.resign_plies:
                 resigned_winner = player_to_move.opposite().name
                 break
+
+        # Capture this ply's root value and the value from the OPPONENT's
+        # perspective at the NEXT ply (which equals our value at this ply).
+        # We bootstrap each sample's value target from the search-averaged
+        # next-ply Q (the standard TD-style replacement for the global game
+        # outcome). Without this every position in a game receives the same
+        # terminal +/-1/0 target, which makes the value head collapse to
+        # saturation when most games end in +/-1.
+        next_root_value_from_here = -result.root_value  # after one ply flip
 
         pending.append(
             {
@@ -800,6 +820,10 @@ def _run_single_game_worker(
                     player_to_move,
                 ),
                 "value_target": 0.0,
+                # Bootstrap target from the next ply's MCTS root value. For the
+                # very last sample in a game this is overwritten below with the
+                # terminal outcome (after env.step produces it).
+                "value_target_bootstrap": next_root_value_from_here,
                 "legal_actions": legal_actions,
                 "side_to_move": player_to_move.name,
                 "action": int(action),
@@ -846,9 +870,26 @@ def _run_single_game_worker(
         "truncated": bool(truncated),
         "resigned": resigned_winner is not None,
     }
-    for sample in pending:
+    # Terminal value target from the perspective of each sample's side-to-move.
+    # The very last sample in ``pending`` is the one played immediately before
+    # the terminal position; for that sample we use the actual terminal outcome.
+    # For all earlier samples we use the bootstrap target captured during search
+    # (the next ply's MCTS search-averaged Q, already sign-flipped to this
+    # sample's perspective). This is the standard TD-style replacement for the
+    # global game-outcome label that previously saturated the value head.
+    terminal_value_per_side = {
+        "RED": _value_target("RED", winner, truncated),
+        "BLUE": _value_target("BLUE", winner, truncated),
+    }
+    for index, sample in enumerate(pending):
         sample.update(final_metadata)
-        sample["value_target"] = _value_target(sample["side_to_move"], winner, truncated)
+        side = sample["side_to_move"]
+        is_terminal_sample = (index == len(pending) - 1) and not truncated
+        if is_terminal_sample:
+            sample["value_target"] = terminal_value_per_side[side]
+        else:
+            bootstrap = float(sample.pop("value_target_bootstrap", 0.0))
+            sample["value_target"] = max(-1.0, min(1.0, bootstrap))
         sample["lead_target"] = float(lead) if lead is not None else 0.0
         sample["lead_mask"] = 1.0 if lead is not None else 0.0
         sample["future_map_target"] = _future_map_target(
@@ -1985,7 +2026,15 @@ def _load_model_state(
             and tuple(value.shape) == tuple(model_state[key].shape)
         }
     incompatible = model.load_state_dict(state_dict, strict=False)
-    allowed_missing_prefixes = ("lead_head.", "future_map_head.", "score_head.")
+    allowed_missing_prefixes = (
+        "lead_head.",
+        "future_map_head.",
+        "score_head.",
+        # value_tower.* is allowed to be missing so old (pre-fix) checkpoints
+        # without a value-specific post-tower still load cleanly. The newly
+        # constructed model's value_tower keeps its random init in that case.
+        "value_tower.",
+    )
     if reset_policy_head:
         allowed_missing_prefixes = (*allowed_missing_prefixes, "policy_head.")
     unexpected = list(incompatible.unexpected_keys)
@@ -2203,6 +2252,15 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--num-residual-layers", type=int, default=6)
         p.add_argument("--value-hidden-size", type=int, default=128)
         p.add_argument(
+            "--value-tower-layers",
+            type=int,
+            default=2,
+            help=(
+                "Extra residual blocks in the value-specific post-tower "
+                "(0 = legacy single-trunk behaviour, default 2)."
+            ),
+        )
+        p.add_argument(
             "--policy-head-type",
             choices=("factored", "flat"),
             default=None,
@@ -2227,12 +2285,13 @@ def parse_args() -> argparse.Namespace:
         p.add_argument(
             "--resign-threshold",
             type=float,
-            default=-0.85,
+            default=-1.0,
             help="Resign when root value <= this for --resign-plies turns "
-            "(set to -1.0 to effectively disable).",
+            "(default -1.0 == disabled; previous default was -0.85 which "
+            "produced fake +/-1 labels and saturated the value head).",
         )
         p.add_argument("--resign-plies", type=int, default=6)
-        p.add_argument("--resign-disable-fraction", type=float, default=0.1)
+        p.add_argument("--resign-disable-fraction", type=float, default=1.0)
         proc = p.add_mutually_exclusive_group()
         proc.add_argument(
             "--use-processes",
@@ -2370,6 +2429,7 @@ def network_config_from_args(args: argparse.Namespace) -> NetworkConfig:
         num_conv_layers=args.num_conv_layers,
         num_residual_layers=args.num_residual_layers,
         value_hidden_size=args.value_hidden_size,
+        value_tower_layers=getattr(args, "value_tower_layers", 2),
         policy_head_type=args.policy_head_type or "factored",
     )
 

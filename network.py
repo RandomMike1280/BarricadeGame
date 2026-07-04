@@ -273,7 +273,16 @@ class FactoredPolicyHead(nn.Module):
 
 
 class ValueHead(nn.Module):
-    """1x1 value head that emits a scalar in [-1, 1]."""
+    """1x1 value head that emits a scalar in [-1, 1].
+
+    The final linear layer is zero-initialised so the very first forward pass
+    returns exactly 0 for every input (within tanh's linear regime). Without
+    this, kaiming-uniform init on a 1-output linear can produce outputs whose
+    magnitudes already drive tanh to saturation, especially under the
+    TanH/BN stacking in earlier AlphaZero reimplementations. Zero-init keeps
+    the head in the linear regime for the first thousands of updates while the
+    trunk learns useful features.
+    """
 
     def __init__(self, channels: int, hidden_size: int) -> None:
         super().__init__()
@@ -281,6 +290,10 @@ class ValueHead(nn.Module):
         self.bn = nn.BatchNorm2d(1)
         self.fc1 = nn.Linear(BOARD_SIZE * BOARD_SIZE, hidden_size)
         self.fc2 = nn.Linear(hidden_size, 1)
+        # Zero-init the output projection: tanh(0) = 0, so the value head
+        # contributes nothing to the loss / backprop on the first forward pass.
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
 
     def forward(self, x: Tensor) -> Tensor:
         out = F.relu(self.bn(self.conv(x)), inplace=True)
@@ -340,6 +353,7 @@ class AlphaZeroNetwork(nn.Module):
         num_residual_layers: int = 10,
         value_hidden_size: int = 256,
         policy_head_type: str = "factored",
+        value_tower_layers: int = 2,
     ) -> None:
         super().__init__()
         if input_planes <= 0:
@@ -348,6 +362,8 @@ class AlphaZeroNetwork(nn.Module):
             raise ValueError("num_conv_layers must be positive.")
         if num_residual_layers < 0:
             raise ValueError("num_residual_layers must be non-negative.")
+        if value_tower_layers < 0:
+            raise ValueError("value_tower_layers must be non-negative.")
 
         residual_channels = residual_channels or conv_channels
         conv_layers = []
@@ -368,6 +384,14 @@ class AlphaZeroNetwork(nn.Module):
 
         self.residual_tower = nn.Sequential(
             *[ResidualBlock(residual_channels) for _ in range(num_residual_layers)]
+        )
+        # Value-specific post-tower: extra residual blocks fed ONLY into the
+        # value head. This decouples the value representation from the policy /
+        # lead / future / score gradients so the value head can learn a stable
+        # position-mean estimator. Default 2 layers; 0 disables (legacy single-
+        # trunk behaviour).
+        self.value_tower = nn.Sequential(
+            *[ResidualBlock(residual_channels) for _ in range(value_tower_layers)]
         )
         if policy_head_type == "factored":
             self.policy_head: nn.Module = FactoredPolicyHead(residual_channels, action_size)
@@ -398,11 +422,15 @@ class AlphaZeroNetwork(nn.Module):
         out = self.residual_projection(out)
         return self.residual_tower(out)
 
+    def _value_features(self, x: Tensor) -> Tensor:
+        return self.value_tower(x)
+
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         out = self._features(x)
+        value_features = self._value_features(out)
         return (
             self.policy_head(out),
-            self.value_head(out),
+            self.value_head(value_features),
             self.lead_head(out),
             self.future_map_head(out),
             self.score_head(out),
@@ -411,7 +439,8 @@ class AlphaZeroNetwork(nn.Module):
     def inference(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Return only the heads needed by MCTS/inference."""
         out = self._features(x)
-        return self.policy_head(out), self.value_head(out), symexp(self.lead_head(out))
+        value_features = self._value_features(out)
+        return self.policy_head(out), self.value_head(value_features), symexp(self.lead_head(out))
 
     @torch.inference_mode()
     def predict(
@@ -439,6 +468,7 @@ def build_network(
     num_residual_layers: int = 10,
     value_hidden_size: int = 256,
     policy_head_type: str = "factored",
+    value_tower_layers: int = 2,
 ) -> AlphaZeroNetwork:
     config = EncoderConfig(history_length=history_length)
     return AlphaZeroNetwork(
@@ -449,4 +479,5 @@ def build_network(
         num_residual_layers=num_residual_layers,
         value_hidden_size=value_hidden_size,
         policy_head_type=policy_head_type,
+        value_tower_layers=value_tower_layers,
     )
