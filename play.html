@@ -14,27 +14,36 @@ body {
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 20px;
+  padding: 14px;
 }
 h1 {
-  font-size: 1.6rem;
-  margin-bottom: 16px;
+  font-size: 1.2rem;
+  margin-bottom: 12px;
   color: #f0c040;
   letter-spacing: 2px;
   text-transform: uppercase;
 }
-.container {
-  display: flex;
-  gap: 20px;
-  flex-wrap: wrap;
-  justify-content: center;
-  max-width: 1150px;
+
+/* Three-column app layout */
+.app {
+  display: grid;
+  grid-template-columns: minmax(540px, auto) minmax(360px, 460px) minmax(280px, 340px);
+  gap: 16px;
+  align-items: start;
+  max-width: 1400px;
   width: 100%;
 }
+@media (max-width: 1100px) {
+  .app { grid-template-columns: 1fr; }
+}
+.col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+
+/* Board column */
 .board-section {
   display: flex;
   flex-direction: column;
   align-items: center;
+  gap: 10px;
 }
 #board-wrapper {
   position: relative;
@@ -42,41 +51,36 @@ h1 {
   border-radius: 4px;
   background: #2a2a3e;
 }
-canvas {
-  display: block;
-  cursor: pointer;
-}
+canvas { display: block; cursor: pointer; }
+
 .status-bar {
-  margin-top: 10px;
   display: flex;
-  gap: 12px;
+  gap: 10px;
   align-items: center;
-  font-size: 0.9rem;
+  font-size: 0.86rem;
   flex-wrap: wrap;
   justify-content: center;
 }
-.status-bar span {
+.status-bar > span,
+.status-bar > div {
   background: #222;
   padding: 3px 10px;
   border-radius: 4px;
 }
-#status-text {
-  font-weight: bold;
-  color: #f0c040;
-}
+#status-text { font-weight: bold; color: #f0c040; }
 .player-red { color: #ff6b6b; }
 .player-blue { color: #6b9fff; }
-.side-btn { font-size:0.78rem; padding:3px 10px; background:#222; border:1px solid #444; color:#aaa; border-radius:3px; cursor:pointer; }
-.side-btn.active { background:#4361ee; border-color:#4361ee; color:#fff; }
-#side-selector { display:flex; align-items:center; gap:2px; }
+.side-btn { font-size: 0.78rem; padding: 3px 10px; background: #222; border: 1px solid #444; color: #aaa; border-radius: 3px; cursor: pointer; }
+.side-btn.active { background: #4361ee; border-color: #4361ee; color: #fff; }
+#side-selector { display: flex; align-items: center; gap: 2px; }
 .btn {
-  padding: 5px 14px;
+  padding: 5px 12px;
   border: none;
   border-radius: 4px;
   cursor: pointer;
   font-size: 0.82rem;
   font-weight: 600;
-  transition: background 0.2s;
+  transition: background 0.15s;
 }
 .btn-primary { background: #4361ee; color: #fff; }
 .btn-primary:hover { background: #3a56d4; }
@@ -84,83 +88,264 @@ canvas {
 .btn-danger:hover { background: #c1121f; }
 .btn-success { background: #2d6a4f; color: #fff; }
 .btn-success:hover { background: #1b4332; }
-.btn-small { padding: 3px 10px; font-size:0.75rem; }
+.btn-ghost { background: #333; color: #ccc; border: 1px solid #555; }
+.btn-ghost:hover { background: #3a3a4e; }
+.btn-small { padding: 3px 9px; font-size: 0.75rem; }
+#mode-toggle { display: flex; gap: 3px; }
+#mode-toggle button {
+  padding: 3px 8px;
+  border: 1px solid #444;
+  border-radius: 3px;
+  background: #222;
+  color: #aaa;
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+#mode-toggle button.active {
+  background: #4361ee; color: #fff; border-color: #4361ee;
+}
+.wall-orient { font-size: 0.72rem; color: #888; margin-left: 6px; }
 
+/* Panel base + sticky header */
 .panel {
   background: #222;
   border: 1px solid #333;
   border-radius: 6px;
-  padding: 12px 14px;
-  min-width: 260px;
-  max-width: 340px;
-}
-.panel h3 {
-  font-size: 0.92rem;
-  margin-bottom: 8px;
-  color: #ccc;
-  border-bottom: 1px solid #333;
-  padding-bottom: 4px;
-}
-.panel-row {
+  padding: 10px 12px;
+  min-width: 0;
   display: flex;
-  justify-content: space-between;
+  flex-direction: column;
+  gap: 8px;
+}
+.panel-header {
+  position: sticky;
+  top: 0;
+  display: flex;
   align-items: center;
-  margin-bottom: 5px;
-  font-size: 0.82rem;
-}
-.panel-row label { color: #aaa; }
-.panel-row input[type="range"] {
-  width: 80px;
-  accent-color: #4361ee;
-}
-.panel-row .val {
-  width: 38px;
-  text-align: right;
-  font-family: monospace;
-  color: #f0c040;
-}
-#eval-panel .val-row {
-  display: flex;
   justify-content: space-between;
-  margin-bottom: 3px;
-  font-size: 0.82rem;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #333;
+  background: #222;
+  z-index: 1;
 }
-#eval-panel .val-row .label { color: #888; }
-#eval-panel .val-row .value { font-family: monospace; font-weight: bold; }
+.panel-header h3 {
+  font-size: 0.92rem;
+  color: #ddd;
+  font-weight: 600;
+}
+.panel-header .badge {
+  font-size: 0.66rem;
+  background: #2a2a3e;
+  color: #aaa;
+  padding: 2px 7px;
+  border-radius: 9px;
+  border: 1px solid #3a3a4e;
+}
+
+/* KV rows */
+.kv { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 0.82rem; }
+.kv > .k { color: #888; }
+.kv > .v { font-family: ui-monospace, "Cascadia Mono", "Consolas", monospace; color: #f0c040; }
+.kv > .v.sub { font-size: 0.74rem; }
+.num { font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
+.win-red  { color: #ff6b6b; }
+.win-blue { color: #6b9fff; }
 .val-positive { color: #6b9fff; }
 .val-negative { color: #ff6b6b; }
-.val-neutral { color: #aaa; }
-#stats-panel {
-  max-height: 420px;
-  overflow-y: auto;
-  font-size: 0.72rem;
+.val-neutral  { color: #aaa; }
+
+/* Win-probability bar (built from two divs) */
+.bar {
+  position: relative;
+  height: 6px;
+  background: #1a1a2e;
+  border-radius: 3px;
+  overflow: hidden;
+  margin-top: 2px;
+  border: 1px solid #333;
 }
-#stats-panel table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.68rem;
-}
-#stats-panel th, #stats-panel td {
-  padding: 2px 3px;
-  text-align: right;
-  border-bottom: 1px solid #333;
-}
-#stats-panel th { color: #888; font-weight: normal; position: sticky; top:0; background:#222; }
-#stats-panel td { font-family: monospace; }
-#stats-panel .move-row { cursor: pointer; }
-#stats-panel .move-row:hover { background: #2a2a3e; }
-#diagnostics-row {
+.bar > .left  { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, #ff6b6b, #c44a4a); }
+.bar > .right { position: absolute; right: 0; top: 0; bottom: 0; background: linear-gradient(90deg, #4a6fd4, #6b9fff); }
+
+/* KPI cards */
+.kpis { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.kpi {
+  background: #1a1a2e;
+  border: 1px solid #2e2e44;
+  border-radius: 4px;
+  padding: 8px 10px;
   display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 2px;
+}
+.kpi > .lbl { font-size: 0.66rem; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+.kpi > .val { font-size: 1.05rem; font-weight: 700; font-family: ui-monospace, monospace; }
+.kpi > .val.win-red { color: #ff6b6b; }
+.kpi > .val.win-blue { color: #6b9fff; }
+.kpi > .sub { font-size: 0.66rem; color: #888; }
+.kpi.full { grid-column: 1 / -1; }
+
+/* Future map (compact) */
+.future-wrap { display: flex; gap: 10px; align-items: flex-start; }
+.future-canvas { border: 1px solid #3a3a4e; border-radius: 3px; image-rendering: pixelated; background: #1a1a2e; }
+.future-controls { display: flex; flex-direction: column; gap: 6px; font-size: 0.74rem; flex: 1; min-width: 0; }
+.future-controls label { color: #aaa; display: flex; flex-direction: column; gap: 2px; }
+.future-controls input[type="range"] { accent-color: #4361ee; }
+
+/* Top-policy bars */
+.policy-bars { display: flex; flex-direction: column; gap: 3px; }
+.policy-bar {
+  display: grid;
+  grid-template-columns: 38px 1fr 56px 38px;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.74rem;
+}
+.policy-bar .act { font-family: ui-monospace, monospace; color: #aaa; }
+.policy-bar .track {
+  position: relative;
+  height: 8px;
+  background: #1a1a2e;
+  border-radius: 2px;
+  overflow: hidden;
+  border: 1px solid #2e2e44;
+}
+.policy-bar .fill {
+  position: absolute; left: 0; top: 0; bottom: 0;
+  background: linear-gradient(90deg, #4361ee, #6b9fff);
+}
+.policy-bar.is-wall .fill { background: linear-gradient(90deg, #b48a2a, #f0c040); }
+.policy-bar.is-move-red .fill { background: linear-gradient(90deg, #b34040, #ff6b6b); }
+.policy-bar.is-move-blue .fill { background: linear-gradient(90deg, #4a6fd4, #6b9fff); }
+.policy-bar .pct { font-family: ui-monospace, monospace; color: #f0c040; text-align: right; }
+.policy-bar .play-btn { font-size: 0.66rem; padding: 1px 6px; }
+
+/* Settings panel */
+.settings-row {
+  display: grid;
+  grid-template-columns: 100px 1fr 56px;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+}
+.settings-row > label { color: #aaa; }
+.settings-row > input[type="range"] { accent-color: #4361ee; width: 100%; }
+.settings-row > .val {
+  font-family: ui-monospace, monospace;
+  color: #f0c040;
+  text-align: right;
+  font-size: 0.74rem;
+}
+.settings-row.checkbox { grid-template-columns: 100px 1fr; }
+.settings-row.checkbox > input { justify-self: end; }
+.settings-row.number > input {
+  background: #1a1a2e;
+  border: 1px solid #444;
+  color: #f0c040;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  width: 100%;
+}
+.preset-row { display: flex; gap: 4px; margin-top: 4px; }
+.group-title {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: #777;
+  margin: 6px 0 2px;
+}
+details.settings-group summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  color: #ccc;
+  padding: 4px 0;
+  user-select: none;
+}
+details.settings-group[open] summary { color: #f0c040; }
+
+/* Game config */
+.cfg-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  font-size: 0.78rem;
+}
+.cfg-cell {
+  display: flex; flex-direction: column; gap: 3px;
+  background: #1a1a2e;
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid #2e2e44;
+}
+.cfg-cell > .lbl { color: #888; font-size: 0.7rem; }
+.cfg-cell > .pair { display: flex; gap: 4px; }
+.cfg-cell input[type="number"] {
+  width: 100%;
+  background: #111;
+  border: 1px solid #333;
+  color: #f0c040;
+  padding: 2px 4px;
+  border-radius: 3px;
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+}
+.cfg-error { color: #ff6b6b; font-size: 0.7rem; min-height: 1em; }
+
+/* Move history */
+.history-list {
+  max-height: 220px;
+  overflow-y: auto;
+  font-family: ui-monospace, monospace;
+  font-size: 0.74rem;
+  background: #1a1a2e;
+  border: 1px solid #2e2e44;
+  border-radius: 3px;
+  padding: 4px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.history-list .hm { display: grid; grid-template-columns: 28px 22px 1fr; gap: 6px; }
+.history-list .hm .idx { color: #777; text-align: right; }
+.history-list .hm .who-red { color: #ff6b6b; }
+.history-list .hm .who-blue { color: #6b9fff; }
+.history-list .hm .text { color: #ddd; }
+.history-actions { display: flex; gap: 4px; margin-top: 4px; }
+
+/* Search stats */
+#stats-panel-inner { max-height: 320px; overflow-y: auto; font-size: 0.7rem; }
+#stats-table { width: 100%; border-collapse: collapse; }
+#stats-table th, #stats-table td {
+  padding: 2px 4px; text-align: right; border-bottom: 1px solid #2e2e44;
+}
+#stats-table th { color: #888; font-weight: normal; position: sticky; top: 0; background: #222; }
+#stats-table td { font-family: ui-monospace, monospace; }
+#stats-table .move-row { cursor: pointer; }
+#stats-table .move-row:hover { background: #2a2a3e; }
+#stats-table .wp-bar {
+  display: inline-block; width: 30px; height: 4px; vertical-align: middle;
+  background: #1a1a2e; border: 1px solid #2e2e44; border-radius: 1px; overflow: hidden;
+  margin-right: 3px;
+}
+#stats-table .wp-bar > i { display: block; height: 100%; background: linear-gradient(90deg, #ff6b6b, #6b9fff); }
+
+/* Diagnostics */
+.diagnostics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 10px;
   font-size: 0.72rem;
-  margin-top: 6px;
   padding-top: 6px;
   border-top: 1px solid #333;
 }
-#diagnostics-row span { color: #888; }
-#diagnostics-row .val { color: #f0c040; }
-.hidden { display: none; }
+.diagnostics .d-row { display: flex; justify-content: space-between; gap: 6px; }
+.diagnostics .d-row .k { color: #888; }
+.diagnostics .d-row .v { color: #f0c040; font-family: ui-monospace, monospace; }
+
+/* Thinking indicator */
 #thinking-indicator {
   position: absolute;
   top: 50%;
@@ -173,118 +358,303 @@ canvas {
   font-weight: bold;
   z-index: 10;
 }
-#mode-toggle {
-  display: flex;
-  gap: 3px;
+.hidden { display: none !important; }
+
+/* Misc */
+.pill {
+  display: inline-block;
+  padding: 1px 6px;
+  font-size: 0.66rem;
+  border-radius: 8px;
+  border: 1px solid #3a3a4e;
+  background: #2a2a3e;
+  color: #ccc;
 }
-#mode-toggle button {
-  padding: 3px 8px;
-  border: 1px solid #444;
-  border-radius: 3px;
-  background: #222;
-  color: #aaa;
-  cursor: pointer;
-  font-size: 0.75rem;
-}
-#mode-toggle button.active {
-  background: #4361ee;
-  color: #fff;
-  border-color: #4361ee;
-}
-.wall-orient {
-  font-size: 0.72rem;
-  color: #888;
-  margin-left: 6px;
-}
+.pill.agree { border-color: #2d6a4f; color: #8ed4a6; }
+.pill.bull  { border-color: #b48a2a; color: #f0c040; }
+.pill.bear  { border-color: #6b3a3a; color: #ff9b9b; }
+hr.sep { border: none; border-top: 1px solid #2e2e44; margin: 4px 0; }
+.muted { color: #888; font-size: 0.7rem; }
+.mono { font-family: ui-monospace, monospace; }
 </style>
 </head>
 <body>
 <h1>♟ Barricade</h1>
-<div class="container">
-  <div class="board-section">
-    <div id="board-wrapper">
-      <canvas id="board" width="504" height="504"></canvas>
-      <div id="thinking-indicator" class="hidden">AI thinking...</div>
-    </div>
-    <div class="status-bar">
-      <span id="status-text">Loading...</span>
-      <span id="walls-info">R:10 B:10</span>
-      <div id="mode-toggle">
-        <button id="mode-move" class="active" onclick="setMode('move')">Move</button>
-        <button id="mode-wall" onclick="setMode('wall')">Wall</button>
-        <span class="wall-orient" id="orient-label">H</span>
+
+<div class="app">
+  <!-- ======================================================== -->
+  <!-- COLUMN 1: BOARD + STATUS + MOVE HISTORY                  -->
+  <!-- ======================================================== -->
+  <div class="col">
+    <section class="panel board-section">
+      <div id="board-wrapper">
+        <canvas id="board" width="504" height="504"></canvas>
+        <div id="thinking-indicator" class="hidden">AI thinking...</div>
       </div>
-      <div id="side-selector">
-        <label style="font-size:0.75rem;color:#888;margin-right:2px;">As:</label>
-        <button id="side-red" class="btn side-btn active" onclick="setPlayerSide('RED')">R</button>
-        <button id="side-blue" class="btn side-btn" onclick="setPlayerSide('BLUE')">B</button>
+      <div class="status-bar">
+        <span id="status-text">Loading...</span>
+        <span id="walls-info">R:10 B:10</span>
+        <div id="mode-toggle">
+          <button id="mode-move" class="active" onclick="setMode('move')">Move</button>
+          <button id="mode-wall" onclick="setMode('wall')">Wall</button>
+          <span class="wall-orient" id="orient-label">H</span>
+        </div>
+        <button class="btn btn-ghost btn-small" id="btn-future" onclick="toggleFutureOverlay()">🗺 Future</button>
+        <button class="btn btn-ghost btn-small" id="btn-heatmap" onclick="togglePolicyHeatmap()">🎯 Heat</button>
       </div>
-      <button class="btn btn-danger btn-small" onclick="newGame()">New</button>
-      <button class="btn btn-small" id="btn-future" onclick="toggleFutureOverlay()" style="background:#333;color:#aaa;border:1px solid #555;">🗺 Future</button>
-    </div>
+    </section>
+
+    <section class="panel" id="history-panel">
+      <div class="panel-header">
+        <h3>Move History</h3>
+        <span class="badge" id="history-count">0</span>
+      </div>
+      <div class="history-list" id="history-list"><em class="muted">No moves yet</em></div>
+      <div class="history-actions">
+        <button class="btn btn-ghost btn-small" onclick="copyHistory()">Copy PGN</button>
+      </div>
+    </section>
   </div>
 
-  <div style="display:flex;flex-direction:column;gap:10px;">
-    <div class="panel" id="eval-panel">
-      <h3>Model Eval <span style="font-weight:normal;font-size:0.7rem;color:#666;">(BLUE perspective: +1 = BLUE wins)</span></h3>
-      <div class="val-row"><span class="label">Value</span><span class="value" id="eval-value">—</span></div>
-      <div class="val-row"><span class="label">Lead</span><span class="value" id="eval-lead">—</span></div>
-      <div class="val-row"><span class="label">Score</span><span class="value" id="eval-score">—</span></div>
-      <div style="margin-top:6px;border-top:1px solid #333;padding-top:4px;font-size:0.72rem;">
-        <div class="val-row"><span class="label">Root Value (BLUE)</span><span class="value" id="root-value">—</span></div>
-        <div class="val-row"><span class="label">Root Lead</span><span class="value" id="root-lead">—</span></div>
-        <div class="val-row"><span class="label">Top Policy</span><span class="value" id="top-policy" style="font-size:0.65rem;">—</span></div>
+  <!-- ======================================================== -->
+  <!-- COLUMN 2: EVALUATION, ROOT, DIAGNOSTICS                  -->
+  <!-- ======================================================== -->
+  <div class="col">
+    <section class="panel" id="net-eval-panel">
+      <div class="panel-header">
+        <h3>Network Evaluation</h3>
+        <span class="badge" id="net-eval-side">—</span>
       </div>
-    </div>
 
-    <div class="panel" id="settings-panel">
-      <h3>MCTS Settings</h3>
-      <div class="panel-row">
+      <div class="kpis">
+        <div class="kpi">
+          <span class="lbl">Value</span>
+          <span class="val num" id="ne-value">—</span>
+          <div class="bar"><div class="left"  id="ne-bar-left"  style="width:50%"></div><div class="right" id="ne-bar-right" style="width:50%"></div></div>
+          <span class="sub" id="ne-value-sub">BLUE win prob —</span>
+        </div>
+        <div class="kpi">
+          <span class="lbl">Lead</span>
+          <span class="val num" id="ne-lead">—</span>
+          <span class="sub" id="ne-lead-sub">favours —</span>
+        </div>
+        <div class="kpi full">
+          <span class="lbl">Score (steps to terminal)</span>
+          <span class="val num" id="ne-score">—</span>
+          <span class="sub" id="ne-score-sub">vs current path length —</span>
+        </div>
+      </div>
+
+      <hr class="sep" />
+      <div class="group-title">Top policy</div>
+      <div class="policy-bars" id="ne-policy-bars">
+        <em class="muted">Run a move to populate</em>
+      </div>
+
+      <hr class="sep" />
+      <div class="group-title">Future occupancy</div>
+      <div class="future-wrap">
+        <canvas id="future-canvas" class="future-canvas" width="180" height="180"></canvas>
+        <div class="future-controls">
+          <label>
+            Threshold <span class="mono" id="future-thresh-val">0.15</span>
+            <input type="range" id="future-thresh" min="0" max="80" step="1" value="15">
+          </label>
+          <span class="muted">Side-to-move in own colour; opponent in opposing colour.</span>
+          <div class="kv"><span class="k">Red path</span><span class="v num" id="ne-red-pl">—</span></div>
+          <div class="kv"><span class="k">Blue path</span><span class="v num" id="ne-blue-pl">—</span></div>
+          <div class="kv"><span class="k">Path gap</span><span class="v num" id="ne-gap">—</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="root-panel">
+      <div class="panel-header">
+        <h3>MCTS Root</h3>
+        <span class="badge" id="root-delta-pill">—</span>
+      </div>
+      <div class="kpis">
+        <div class="kpi">
+          <span class="lbl">Root Value</span>
+          <span class="val num" id="root-value">—</span>
+          <div class="bar"><div class="left"  id="root-bar-left"  style="width:50%"></div><div class="right" id="root-bar-right" style="width:50%"></div></div>
+          <span class="sub" id="root-value-sub">BLUE win prob —</span>
+        </div>
+        <div class="kpi">
+          <span class="lbl">Root Lead</span>
+          <span class="val num" id="root-lead">—</span>
+          <span class="sub" id="root-lead-sub">favours —</span>
+        </div>
+        <div class="kpi full">
+          <span class="lbl">AI's pick</span>
+          <span class="val mono" id="root-ai-action" style="font-size:0.9rem;">—</span>
+          <span class="sub" id="root-ai-action-sub">—</span>
+        </div>
+      </div>
+      <hr class="sep" />
+      <div class="group-title">Top-N actions</div>
+      <div id="stats-panel-inner">
+        <em class="muted" id="stats-empty">Make a move</em>
+        <table id="stats-table" class="hidden">
+          <thead><tr>
+            <th>#</th><th>Act</th><th>Prior</th><th>Visits</th><th>Q</th><th>WinP</th><th>LeadQ</th>
+          </tr></thead>
+          <tbody id="stats-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel" id="diag-panel">
+      <div class="panel-header">
+        <h3>Search Diagnostics</h3>
+        <span class="badge" id="diag-time">—</span>
+      </div>
+      <div class="diagnostics" id="diagnostics-row">
+        <div class="d-row"><span class="k">Simulations</span><span class="v" id="d-sims">—</span></div>
+        <div class="d-row"><span class="k">Neural batches</span><span class="v" id="d-batches">—</span></div>
+        <div class="d-row"><span class="k">Collisions</span><span class="v" id="d-collisions">—</span></div>
+        <div class="d-row"><span class="k">Eval. leaves</span><span class="v" id="d-leaves">—</span></div>
+        <div class="d-row"><span class="k">Collision flushes</span><span class="v" id="d-flushes">—</span></div>
+        <div class="d-row"><span class="k">Search time</span><span class="v" id="d-time">—</span></div>
+        <div class="d-row"><span class="k">Sims / sec</span><span class="v" id="d-sps">—</span></div>
+        <div class="d-row"><span class="k">ms / sim</span><span class="v" id="d-msps">—</span></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ======================================================== -->
+  <!-- COLUMN 3: GAME CONFIG + MCTS SETTINGS                    -->
+  <!-- ======================================================== -->
+  <div class="col">
+    <section class="panel" id="config-panel">
+      <div class="panel-header">
+        <h3>Game Config</h3>
+        <div id="side-selector">
+          <label style="font-size:0.7rem;color:#888;margin-right:4px;">Play as:</label>
+          <button id="side-red" class="btn side-btn active" onclick="setPlayerSide('RED')">R</button>
+          <button id="side-blue" class="btn side-btn" onclick="setPlayerSide('BLUE')">B</button>
+        </div>
+      </div>
+
+      <div class="cfg-grid">
+        <div class="cfg-cell">
+          <span class="lbl">Red start (row, col)</span>
+          <div class="pair">
+            <input type="number" id="cfg-red-row" min="0" max="8" value="0">
+            <input type="number" id="cfg-red-col" min="0" max="8" value="4">
+          </div>
+        </div>
+        <div class="cfg-cell">
+          <span class="lbl">Blue start (row, col)</span>
+          <div class="pair">
+            <input type="number" id="cfg-blue-row" min="0" max="8" value="8">
+            <input type="number" id="cfg-blue-col" min="0" max="8" value="4">
+          </div>
+        </div>
+        <div class="cfg-cell">
+          <span class="lbl">Red walls</span>
+          <input type="number" id="cfg-red-walls" min="0" max="20" value="10">
+        </div>
+        <div class="cfg-cell">
+          <span class="lbl">Blue walls</span>
+          <input type="number" id="cfg-blue-walls" min="0" max="20" value="10">
+        </div>
+      </div>
+      <div class="cfg-error" id="cfg-error"></div>
+      <div style="display:flex;gap:6px;margin-top:4px;">
+        <button class="btn btn-success btn-small" onclick="newGame()">New Game</button>
+        <button class="btn btn-ghost btn-small" onclick="resetConfigDefaults()">Reset</button>
+      </div>
+    </section>
+
+    <section class="panel" id="settings-panel">
+      <div class="panel-header">
+        <h3>MCTS Settings</h3>
+        <span class="badge" id="settings-status">—</span>
+      </div>
+
+      <div class="group-title">Search</div>
+      <div class="settings-row number">
         <label>Sims</label>
-        <input type="range" min="50" max="2000" step="10" value="400" data-key="num_simulations">
+        <input type="number" min="50" max="5000" step="10" value="400" data-key="num_simulations">
         <span class="val" id="val-num_simulations">400</span>
       </div>
-      <div class="panel-row">
-        <label>Temp</label>
-        <input type="range" min="0" max="200" step="1" value="100" data-key="action_temperature">
+      <div class="settings-row">
+        <label>Action Temp</label>
+        <input type="range" min="0" max="200" step="1" value="100" data-key="action_temperature" data-scale="100">
         <span class="val" id="val-action_temperature">1.00</span>
       </div>
-      <div class="panel-row">
-        <label>CPUCT</label>
-        <input type="range" min="0" max="500" step="5" value="175" data-key="cpuct_init" data-scale="100">
-        <span class="val" id="val-cpuct_init">1.75</span>
+      <div class="settings-row number">
+        <label>Batch size</label>
+        <input type="number" min="1" max="128" step="1" value="16" data-key="batch_size">
+        <span class="val" id="val-batch_size">16</span>
       </div>
-      <div class="panel-row">
-        <label>FPU</label>
-        <input type="range" min="0" max="100" step="1" value="33" data-key="fpu_reduction" data-scale="100">
-        <span class="val" id="val-fpu_reduction">0.33</span>
-      </div>
-      <div class="panel-row">
-        <label>Pawn Flr</label>
-        <input type="range" min="0" max="50" step="1" value="0" data-key="pawn_prior_floor" data-scale="100">
-        <span class="val" id="val-pawn_prior_floor">0.00</span>
-      </div>
-      <div class="panel-row">
-        <label>Dir α</label>
-        <input type="range" min="1" max="100" step="1" value="30" data-key="root_dirichlet_alpha" data-scale="100">
-        <span class="val" id="val-root_dirichlet_alpha">0.30</span>
-      </div>
-      <div class="panel-row">
-        <label>Noise Frac</label>
-        <input type="range" min="0" max="50" step="1" value="25" data-key="root_exploration_fraction" data-scale="100">
-        <span class="val" id="val-root_exploration_fraction">0.25</span>
-      </div>
-      <div style="display:flex;gap:4px;margin-top:6px;">
+
+      <details class="settings-group">
+        <summary>Exploration (advanced)</summary>
+        <div class="settings-row">
+          <label>CPUCT init</label>
+          <input type="range" min="0" max="500" step="5" value="175" data-key="cpuct_init" data-scale="100">
+          <span class="val" id="val-cpuct_init">1.75</span>
+        </div>
+        <div class="settings-row">
+          <label>CPUCT base</label>
+          <input type="range" min="0" max="200000" step="100" value="38739" data-key="cpuct_base" data-scale="1">
+          <span class="val" id="val-cpuct_base">38739</span>
+        </div>
+        <div class="settings-row">
+          <label>CPUCT factor</label>
+          <input type="range" min="0" max="1000" step="1" value="389" data-key="cpuct_factor" data-scale="100">
+          <span class="val" id="val-cpuct_factor">3.89</span>
+        </div>
+        <div class="settings-row">
+          <label>FPU</label>
+          <input type="range" min="0" max="100" step="1" value="33" data-key="fpu_reduction" data-scale="100">
+          <span class="val" id="val-fpu_reduction">0.33</span>
+        </div>
+        <div class="settings-row">
+          <label>Pawn prior floor</label>
+          <input type="range" min="0" max="50" step="1" value="0" data-key="pawn_prior_floor" data-scale="100">
+          <span class="val" id="val-pawn_prior_floor">0.00</span>
+        </div>
+        <div class="settings-row">
+          <label>Policy temp</label>
+          <input type="range" min="0" max="200" step="1" value="100" data-key="policy_temperature" data-scale="100">
+          <span class="val" id="val-policy_temperature">1.00</span>
+        </div>
+        <div class="settings-row">
+          <label>Dir α</label>
+          <input type="range" min="1" max="100" step="1" value="30" data-key="root_dirichlet_alpha" data-scale="100">
+          <span class="val" id="val-root_dirichlet_alpha">0.30</span>
+        </div>
+        <div class="settings-row">
+          <label>Noise frac</label>
+          <input type="range" min="0" max="50" step="1" value="25" data-key="root_exploration_fraction" data-scale="100">
+          <span class="val" id="val-root_exploration_fraction">0.25</span>
+        </div>
+        <div class="settings-row">
+          <label>Lead weight</label>
+          <input type="range" min="0" max="100" step="1" value="1" data-key="lead_weight" data-scale="100">
+          <span class="val" id="val-lead_weight">0.01</span>
+        </div>
+        <div class="settings-row">
+          <label>Lead scale</label>
+          <input type="range" min="0" max="500" step="1" value="100" data-key="lead_scale" data-scale="10">
+          <span class="val" id="val-lead_scale">10.0</span>
+        </div>
+        <div class="settings-row checkbox">
+          <label>Root noise</label>
+          <input type="checkbox" data-key="add_root_noise" checked>
+        </div>
+      </details>
+
+      <div class="preset-row">
         <button class="btn btn-success btn-small" onclick="applySettings()">Apply</button>
         <button class="btn btn-primary btn-small" onclick="loadSettings()">Reload</button>
+        <button class="btn btn-ghost btn-small" onclick="savePreset()">Save</button>
+        <button class="btn btn-ghost btn-small" onclick="loadPreset()">Load</button>
       </div>
-    </div>
-
-    <div class="panel" id="stats-panel">
-      <h3>Search Stats</h3>
-      <div id="stats-content"><em>Make a move</em></div>
-      <div id="diagnostics-row"></div>
-    </div>
+    </section>
   </div>
 </div>
 
@@ -293,9 +663,26 @@ canvas {
 // Board rendering constants
 // ============================================================
 const BOARD_SIZE = 9;
+const WALL_BOARD_SIZE = 8;
 const CELL = 56;
 const CANVAS_W = CELL * BOARD_SIZE;
 const CANVAS_H = CELL * BOARD_SIZE;
+
+// Action-encoding constants (must mirror barricade_env.py)
+const MOVE_ACTIONS = 4;
+const WALL_ACTIONS_PER_ORIENTATION = WALL_BOARD_SIZE * WALL_BOARD_SIZE; // 64
+const HORIZONTAL_WALL_OFFSET = MOVE_ACTIONS;                              // 4
+const VERTICAL_WALL_OFFSET = HORIZONTAL_WALL_OFFSET + WALL_ACTIONS_PER_ORIENTATION; // 68
+const DIAGONAL_HOP_OFFSET = MOVE_ACTIONS + WALL_ACTIONS_PER_ORIENTATION * 2; // 132
+const DIAGONAL_HOP_ACTIONS = 4;
+const ACTION_SIZE = DIAGONAL_HOP_OFFSET + DIAGONAL_HOP_ACTIONS;            // 136
+
+const MOVE_DELTAS = [
+  [-1,  0], // UP
+  [ 1,  0], // DOWN
+  [ 0, -1], // LEFT
+  [ 0,  1], // RIGHT
+];
 
 const COLOR_BG = '#1e1e2e';
 const COLOR_CELL1 = '#2a2a3e';
@@ -309,8 +696,12 @@ const COLOR_HOVER_VALID = 'rgba(100, 255, 100, 0.4)';
 const COLOR_HOVER_INVALID = 'rgba(255, 80, 80, 0.3)';
 const COLOR_PREVIEW_VALID = 'rgba(200, 200, 50, 0.5)';
 const COLOR_PREVIEW_INVALID = 'rgba(255, 50, 50, 0.5)';
+const COLOR_HEAT_RED = 'rgba(255, 107, 107, 0.45)';
+const COLOR_HEAT_BLUE = 'rgba(107, 159, 255, 0.45)';
+const COLOR_AI_HINT = 'rgba(240, 192, 64, 0.85)';
 
 let canvas, ctx;
+let futureCanvas, futureCtx;
 
 // ============================================================
 // State
@@ -323,13 +714,18 @@ let aiThinking = false;
 let searchStats = [];
 let blueValue = null;
 let blueLead = null;
+let networkValue = null;
+let networkLead = null;
 let diagnostics = null;
 let hoverCell = null;
 let hoverWall = null;
 let gameOver = false;
 let showFutureOverlay = false;
+let showPolicyHeatmap = true;
 let futureMapData = null;
 let lastEvalData = null;
+let futureThreshold = 0.15;
+let moveHistory = []; // {action, player, label}
 
 // ============================================================
 // Player side
@@ -339,6 +735,7 @@ function setPlayerSide(side) {
   playerSide = side;
   document.getElementById('side-red').classList.toggle('active', side === 'RED');
   document.getElementById('side-blue').classList.toggle('active', side === 'BLUE');
+  saveConfigToStorage();
 }
 
 // ============================================================
@@ -347,14 +744,34 @@ function setPlayerSide(side) {
 document.addEventListener('DOMContentLoaded', () => {
   canvas = document.getElementById('board');
   ctx = canvas.getContext('2d');
+  futureCanvas = document.getElementById('future-canvas');
+  futureCtx = futureCanvas.getContext('2d');
   canvas.addEventListener('mousemove', onMouseMove);
   canvas.addEventListener('click', onClick);
   canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); toggleWallOrientation(); });
   document.addEventListener('keydown', onKey);
 
-  document.querySelectorAll('#settings-panel input[type="range"]').forEach(slider => {
-    slider.addEventListener('input', onSliderChange);
+  // Settings controls (sliders, number inputs, checkboxes)
+  document.querySelectorAll('#settings-panel input').forEach(input => {
+    input.addEventListener('input', onSettingChange);
+    input.addEventListener('change', onSettingChange);
   });
+
+  // Game config inputs
+  ['cfg-red-row','cfg-red-col','cfg-blue-row','cfg-blue-col','cfg-red-walls','cfg-blue-walls'].forEach(id => {
+    document.getElementById(id).addEventListener('change', saveConfigToStorage);
+  });
+
+  // Future map threshold
+  document.getElementById('future-thresh').addEventListener('input', (e) => {
+    futureThreshold = parseInt(e.target.value, 10) / 100;
+    document.getElementById('future-thresh-val').textContent = futureThreshold.toFixed(2);
+    if (showFutureOverlay) draw();
+    drawFutureCanvas();
+  });
+
+  // Load saved config
+  loadConfigFromStorage();
 
   loadSettings().then(() => newGame());
 });
@@ -381,26 +798,36 @@ async function newGame() {
   setThinking(false);
   futureMapData = null;
   lastEvalData = null;
+  searchStats = [];
+  blueValue = null;
+  blueLead = null;
+  networkValue = null;
+  networkLead = null;
+  diagnostics = null;
+  hoverCell = null;
+  hoverWall = null;
+  moveHistory = [];
+  renderHistory();
+  clearEvalDisplay();
   try {
-    const body = JSON.stringify({ player_side: playerSide });
+    const cfg = readConfigFromUI();
+    if (!validateConfig(cfg)) return;
+    saveConfigToStorage();
+    const body = JSON.stringify(Object.assign({ player_side: playerSide }, cfg));
     const data = await api('/api/new_game', { method: 'POST', body });
     gameState = data.state;
     validMoves = data.valid_moves;
-    searchStats = [];
-    blueValue = null;
-    blueLead = null;
-    diagnostics = null;
-    hoverCell = null;
-    hoverWall = null;
+    if (data.ai_first_move) {
+      // data.state.previous_pawns holds the positions BEFORE the AI's first
+      // move; pass them explicitly so the destination is computed from the
+      // actual starting square.
+      const aiPreState = (data.state.previous_pawns)
+        ? { pawns: data.state.previous_pawns, previous_pawns: null }
+        : data.state;
+      pushHistoryFromAction(data.ai_first_move.action, 'RED', data.state, aiPreState);
+    }
     updateUI();
     draw();
-    if (data.ai_first_move) {
-      const stateResp = await api('/api/state', { method: 'GET' });
-      gameState = stateResp.state;
-      validMoves = stateResp.valid_moves;
-      updateUI();
-      draw();
-    }
     // Run model evaluation on the new state
     runEval();
   } catch (e) { alert('Error: ' + e.message); }
@@ -409,12 +836,14 @@ async function newGame() {
 async function makeMove(action) {
   if (aiThinking || gameOver) return;
   setThinking(true);
-  clearEvalDisplay();
+  // Record this move as the human's
+  const humanPlayer = gameState ? gameState.current_player : playerSide;
   try {
     const data = await api('/api/move', {
       method: 'POST',
       body: JSON.stringify({ action }),
     });
+    pushHistoryFromAction(action, humanPlayer, data.state);
     gameState = data.state;
     validMoves = data.valid_moves;
     searchStats = data.stats || [];
@@ -422,6 +851,18 @@ async function makeMove(action) {
     blueLead = data.blue_lead;
     diagnostics = data.diagnostics || null;
     gameOver = data.game_over;
+    if (data.ai_move) {
+      // AI always plays the opposite color from the human, regardless of
+      // whose turn is next in gameState (gameState is already post-AI-move).
+      const aiPlayer = humanPlayer === 'RED' ? 'BLUE' : 'RED';
+      // Build a state object whose pawns are the positions BEFORE the AI
+      // moved (data.state.previous_pawns); describeActionMeta uses those to
+      // compute the destination from the actual starting square.
+      const aiPreState = (data.state.previous_pawns)
+        ? { pawns: data.state.previous_pawns, previous_pawns: null }
+        : data.state;
+      pushHistoryFromAction(data.ai_move.action, aiPlayer, data.state, aiPreState);
+    }
     hoverCell = null;
     hoverWall = null;
     updateUI();
@@ -442,15 +883,28 @@ async function runEval() {
     const data = await api('/api/evaluate', { method: 'POST', body: '{}' });
     lastEvalData = data;
     futureMapData = data.future_map;
+    // Compute the network's BLUE-perspective value (used in delta)
+    networkValue = data.blue_value;
+    networkLead = data.blue_lead;
     displayEval(data);
+    drawFutureCanvas();
     if (showFutureOverlay) draw();
   } catch (e) { /* silently ignore eval errors after game over */ }
 }
 
 function toggleFutureOverlay() {
   showFutureOverlay = !showFutureOverlay;
-  document.getElementById('btn-future').style.background = showFutureOverlay ? '#4361ee' : '#333';
-  document.getElementById('btn-future').style.color = showFutureOverlay ? '#fff' : '#aaa';
+  const btn = document.getElementById('btn-future');
+  btn.style.background = showFutureOverlay ? '#4361ee' : '#333';
+  btn.style.color = showFutureOverlay ? '#fff' : '#aaa';
+  draw();
+}
+
+function togglePolicyHeatmap() {
+  showPolicyHeatmap = !showPolicyHeatmap;
+  const btn = document.getElementById('btn-heatmap');
+  btn.style.background = showPolicyHeatmap ? '#4361ee' : '#333';
+  btn.style.color = showPolicyHeatmap ? '#fff' : '#aaa';
   draw();
 }
 
@@ -460,76 +914,399 @@ function setThinking(val) {
 }
 
 function clearEvalDisplay() {
-  document.getElementById('eval-value').textContent = '—';
-  document.getElementById('eval-lead').textContent = '—';
-  document.getElementById('eval-score').textContent = '—';
-  document.getElementById('root-value').textContent = '—';
-  document.getElementById('root-lead').textContent = '—';
-  document.getElementById('top-policy').textContent = '—';
+  const ids = ['ne-value','ne-lead','ne-score','ne-value-sub','ne-lead-sub','ne-score-sub',
+               'ne-red-pl','ne-blue-pl','ne-gap',
+               'root-value','root-lead','root-value-sub','root-lead-sub',
+               'root-ai-action','root-ai-action-sub',
+               'd-sims','d-batches','d-collisions','d-leaves','d-flushes','d-time','d-sps','d-msps',
+               'diag-time','root-delta-pill','settings-status','net-eval-side'];
+  ids.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = '—';
+  });
+  document.getElementById('ne-bar-left').style.width = '50%';
+  document.getElementById('ne-bar-right').style.width = '50%';
+  document.getElementById('root-bar-left').style.width = '50%';
+  document.getElementById('root-bar-right').style.width = '50%';
+  const policyBars = document.getElementById('ne-policy-bars');
+  policyBars.innerHTML = '<em class="muted">Run a move to populate</em>';
+  const statsBody = document.getElementById('stats-body');
+  if (statsBody) statsBody.innerHTML = '';
+  document.getElementById('stats-table').classList.add('hidden');
+  document.getElementById('stats-empty').classList.remove('hidden');
+  if (futureCtx) futureCtx.clearRect(0, 0, futureCanvas.width, futureCanvas.height);
 }
 
 function displayEval(data) {
-  setValueSpan('eval-value', data.blue_value, 4);
-  setValueSpan('eval-lead', data.blue_lead, 4);
-  document.getElementById('eval-score').textContent = data.score.toFixed(2);
-  document.getElementById('eval-score').className = 'value val-neutral';
+  // Network eval (BLUE perspective)
+  const v = data.blue_value;
+  const l = data.blue_lead;
+  const s = data.score;
+  document.getElementById('net-eval-side').textContent = `Side to move: ${data.current_player}`;
 
+  setValColored('ne-value', v, 4);
+  const wp = (v + 1) / 2;
+  setWinBar('ne-bar-left', 'ne-bar-right', wp);
+  document.getElementById('ne-value-sub').textContent =
+    `BLUE win prob ${(wp*100).toFixed(1)}%`;
+
+  setValColored('ne-lead', l, 2);
+  document.getElementById('ne-lead-sub').textContent =
+    l > 0.05 ? 'favours BLUE' : l < -0.05 ? 'favours RED' : 'balanced';
+
+  document.getElementById('ne-score').textContent = s.toFixed(2);
+  document.getElementById('ne-score').className = 'val num val-neutral';
+  // Confidence: difference between score and current path length
+  const myPath = data.current_player === 'RED'
+    ? gameState.red_path_length : gameState.blue_path_length;
+  if (myPath !== null && myPath !== undefined) {
+    const conf = s - myPath;
+    document.getElementById('ne-score-sub').textContent =
+      `vs current path ${myPath} → ${conf >= 0 ? '+' : ''}${conf.toFixed(2)}`;
+  } else {
+    document.getElementById('ne-score-sub').textContent = 'path length n/a';
+  }
+
+  // Path lengths + gap
+  if (gameState) {
+    const r = gameState.red_path_length, b = gameState.blue_path_length;
+    document.getElementById('ne-red-pl').textContent = (r === null || r === undefined) ? '—' : r;
+    document.getElementById('ne-blue-pl').textContent = (b === null || b === undefined) ? '—' : b;
+    if (r !== null && r !== undefined && b !== null && b !== undefined) {
+      const gap = b - r;
+      const gapEl = document.getElementById('ne-gap');
+      gapEl.textContent = (gap > 0 ? '+' : '') + gap;
+      gapEl.className = 'v num ' + (gap > 0 ? 'win-blue' : gap < 0 ? 'win-red' : '');
+    } else {
+      document.getElementById('ne-gap').textContent = '—';
+    }
+  }
+
+  // Root value/lead (BLUE perspective)
   if (blueValue !== null) {
-    setValueSpan('root-value', blueValue, 4);
+    setValColored('root-value', blueValue, 4);
+    const rwp = (blueValue + 1) / 2;
+    setWinBar('root-bar-left', 'root-bar-right', rwp);
+    document.getElementById('root-value-sub').textContent = `BLUE win prob ${(rwp*100).toFixed(1)}%`;
   }
   if (blueLead !== null) {
-    setValueSpan('root-lead', blueLead, 4);
+    setValColored('root-lead', blueLead, 2);
+    document.getElementById('root-lead-sub').textContent =
+      blueLead > 0.05 ? 'favours BLUE' : blueLead < -0.05 ? 'favours RED' : 'balanced';
   }
 
-  // Top policy text
+  // MCTS-delta pill
+  const pill = document.getElementById('root-delta-pill');
+  if (networkValue !== null && blueValue !== null) {
+    const delta = blueValue - networkValue;
+    if (Math.abs(delta) < 0.02) {
+      pill.textContent = 'MCTS agrees';
+      pill.className = 'badge pill agree';
+    } else if (delta > 0) {
+      pill.textContent = `MCTS +${delta.toFixed(2)} more bullish (BLUE)`;
+      pill.className = 'badge pill bull';
+    } else {
+      pill.textContent = `MCTS ${delta.toFixed(2)} more bearish (BLUE)`;
+      pill.className = 'badge pill bear';
+    }
+  } else {
+    pill.textContent = '—';
+    pill.className = 'badge pill';
+  }
+
+  // AI's pick (from searchStats) -> human-readable label
+  if (searchStats && searchStats.length) {
+    const top = searchStats[0];
+    const label = describeAction(top.action, gameState, data.current_player);
+    document.getElementById('root-ai-action').textContent = `#${top.action}  ${label}`;
+    document.getElementById('root-ai-action-sub').textContent =
+      `${top.visits} visits · Q ${top.q.toFixed(2)} · winP ${((top.q+1)/2*100).toFixed(0)}%`;
+  }
+
+  // Top policy bars
+  const bars = document.getElementById('ne-policy-bars');
+  bars.innerHTML = '';
   if (data.top_policy && data.top_policy.length) {
-    const txt = data.top_policy.slice(0, 4).map(p => `a${p.action}=${(p.prob*100).toFixed(1)}%`).join(' ');
-    document.getElementById('top-policy').textContent = txt;
-    document.getElementById('top-policy').className = 'value val-neutral';
+    const maxP = Math.max(...data.top_policy.map(p => p.prob));
+    const side = data.current_player;
+    for (const p of data.top_policy) {
+      const meta = describeActionMeta(p.action, gameState, side);
+      let cls = '';
+      if (meta.kind === 'wall') cls = 'is-wall';
+      else if (meta.kind === 'move' || meta.kind === 'hop') cls = side === 'RED' ? 'is-move-red' : 'is-move-blue';
+      const row = document.createElement('div');
+      row.className = `policy-bar ${cls}`;
+      const widthPct = maxP > 0 ? (p.prob / maxP) * 100 : 0;
+      const isHumanTurn = side === playerSide;
+      row.innerHTML =
+        `<span class="act">a${p.action}</span>` +
+        `<div class="track"><div class="fill" style="width:${widthPct.toFixed(1)}%"></div></div>` +
+        `<span class="pct">${(p.prob*100).toFixed(1)}%</span>` +
+        (isHumanTurn
+          ? `<button class="btn btn-ghost btn-small play-btn" onclick="makeMove(${p.action})">Play</button>`
+          : `<span class="muted mono" style="font-size:0.66rem;text-align:right;">${meta.short}</span>`);
+      bars.appendChild(row);
+    }
   }
 }
 
-function setValueSpan(elId, val, decimals) {
+function setWinBar(leftId, rightId, blueWinProb) {
+  const blueFrac = Math.max(0, Math.min(1, blueWinProb));
+  document.getElementById(leftId).style.width  = ((1 - blueFrac) * 100).toFixed(1) + '%';
+  document.getElementById(rightId).style.width = (blueFrac * 100).toFixed(1) + '%';
+}
+
+function setValColored(elId, val, decimals) {
   const el = document.getElementById(elId);
-  if (val === null || val === undefined) { el.textContent = '—'; return; }
-  el.textContent = (val >= 0 ? '+' : '') + val.toFixed(decimals || 4);
-  el.className = 'value ' + (val > 0.05 ? 'val-positive' : val < -0.05 ? 'val-negative' : 'val-neutral');
+  if (val === null || val === undefined) { el.textContent = '—'; el.className = 'val num val-neutral'; return; }
+  el.textContent = (val >= 0 ? '+' : '') + Number(val).toFixed(decimals);
+  el.className = 'val num ' + (val > 0.05 ? 'win-blue' : val < -0.05 ? 'win-red' : 'val-neutral');
+}
+
+// ============================================================
+// Action decoding (mirrors barricade_env.py)
+// ============================================================
+function decodeActionMeta(action) {
+  if (action < 0 || action >= ACTION_SIZE) {
+    return { kind: 'unknown', short: '?', label: '?' };
+  }
+  if (action < MOVE_ACTIONS) {
+    const [dr, dc] = MOVE_DELTAS[action];
+    const names = ['UP', 'DOWN', 'LEFT', 'RIGHT'];
+    return { kind: 'move', short: names[action], label: `MOVE ${names[action]}` };
+  }
+  if (action < VERTICAL_WALL_OFFSET) {
+    const local = action - HORIZONTAL_WALL_OFFSET;
+    const row = Math.floor(local / WALL_BOARD_SIZE);
+    const col = local % WALL_BOARD_SIZE;
+    return { kind: 'wall', short: `H(${row},${col})`, label: `WALL H @ (${row},${col})` };
+  }
+  if (action < DIAGONAL_HOP_OFFSET) {
+    const local = action - VERTICAL_WALL_OFFSET;
+    const row = Math.floor(local / WALL_BOARD_SIZE);
+    const col = local % WALL_BOARD_SIZE;
+    return { kind: 'wall', short: `V(${row},${col})`, label: `WALL V @ (${row},${col})` };
+  }
+  const local = action - DIAGONAL_HOP_OFFSET;
+  const diags = [[-1,-1],[-1,1],[1,-1],[1,1]];
+  const [dr, dc] = diags[local];
+  return { kind: 'hop', short: `J(${dr > 0 ? '+' : ''}${dr},${dc > 0 ? '+' : ''}${dc})`, label: `JUMP (${dr > 0 ? '+' : ''}${dr},${dc > 0 ? '+' : ''}${dc})` };
+}
+
+function describeActionMeta(action, state, sideToMove) {
+  const meta = decodeActionMeta(action);
+  if ((meta.kind === 'move' || meta.kind === 'hop') && state && sideToMove) {
+    const pawn = state.pawns[sideToMove];
+    const delta = (meta.kind === 'move')
+      ? MOVE_DELTAS[action]
+      : [[-1,-1],[-1,1],[1,-1],[1,1]][action - DIAGONAL_HOP_OFFSET];
+    if (delta && pawn) {
+      const nr = pawn[0] + delta[0];
+      const nc = pawn[1] + delta[1];
+      if (nr >= 0 && nr < BOARD_SIZE && nc >= 0 && nc < BOARD_SIZE) {
+        return Object.assign({}, meta, {
+          dest: [nr, nc],
+          short: `${meta.short}→(${nr},${nc})`,
+          label: `${meta.label} → (${nr},${nc})`,
+        });
+      }
+    }
+    return meta;
+  }
+  if (meta.kind === 'wall' && meta.short) {
+    // meta.short is like "H(4,2)" or "V(3,7)" — extract row/col
+    const m = meta.short.match(/[HV]\((\d+),(\d+)\)/);
+    if (m) {
+      const wr = parseInt(m[1], 10);
+      const wc = parseInt(m[2], 10);
+      return Object.assign({}, meta, {
+        wall: { row: wr, col: wc, orientation: meta.kind === 'wall' && meta.short.startsWith('V') ? 'VERTICAL' : 'HORIZONTAL' },
+      });
+    }
+  }
+  return meta;
+}
+
+function describeAction(action, state, sideToMove) {
+  return describeActionMeta(action, state, sideToMove).label;
 }
 
 // ============================================================
 // Settings
 // ============================================================
-function onSliderChange(e) {
-  const slider = e.target;
-  const key = slider.dataset.key;
-  const scale = parseFloat(slider.dataset.scale || '1');
-  const val = parseInt(slider.value) / scale;
-  document.getElementById(`val-${key}`).textContent = val.toFixed(2);
+function onSettingChange(e) {
+  const el = e.target;
+  const key = el.dataset.key;
+  if (!key) return;
+  if (el.type === 'checkbox') {
+    document.getElementById(`val-${key}`).textContent = el.checked ? 'on' : 'off';
+  } else {
+    const scale = parseFloat(el.dataset.scale || '1');
+    const raw = el.type === 'range' ? parseInt(el.value, 10) : parseFloat(el.value);
+    const val = raw / scale;
+    const decimals = (scale === 1 || el.type === 'number') ? 0 : 2;
+    document.getElementById(`val-${key}`).textContent = val.toFixed(decimals);
+  }
 }
 
 async function applySettings() {
   const body = {};
-  document.querySelectorAll('#settings-panel input[type="range"]').forEach(slider => {
-    const key = slider.dataset.key;
-    const scale = parseFloat(slider.dataset.scale || '1');
-    body[key] = parseInt(slider.value) / scale;
+  document.querySelectorAll('#settings-panel input[data-key]').forEach(input => {
+    const key = input.dataset.key;
+    if (input.type === 'checkbox') body[key] = input.checked;
+    else {
+      const scale = parseFloat(input.dataset.scale || '1');
+      body[key] = (input.type === 'range' ? parseInt(input.value, 10) : parseFloat(input.value)) / scale;
+    }
   });
-  try { await api('/api/settings', { method: 'POST', body: JSON.stringify(body) }); }
-  catch (e) { console.error('Settings error:', e); }
+  try {
+    await api('/api/settings', { method: 'POST', body: JSON.stringify(body) });
+    document.getElementById('settings-status').textContent = 'Applied';
+    setTimeout(() => {
+      const s = document.getElementById('settings-status');
+      if (s.textContent === 'Applied') s.textContent = '—';
+    }, 1500);
+  } catch (e) { console.error('Settings error:', e); document.getElementById('settings-status').textContent = 'Error'; }
 }
 
 async function loadSettings() {
   try {
     const data = await api('/api/settings', { method: 'GET' });
     for (const [key, val] of Object.entries(data)) {
-      const slider = document.querySelector(`#settings-panel input[data-key="${key}"]`);
-      if (slider) {
-        const scale = parseFloat(slider.dataset.scale || '1');
-        slider.value = Math.round(val * scale);
-        document.getElementById(`val-${key}`).textContent = Number(val).toFixed(2);
+      const input = document.querySelector(`#settings-panel input[data-key="${key}"]`);
+      if (!input) continue;
+      if (input.type === 'checkbox') {
+        input.checked = !!val;
+        document.getElementById(`val-${key}`).textContent = val ? 'on' : 'off';
+      } else {
+        const scale = parseFloat(input.dataset.scale || '1');
+        const raw = Math.round(Number(val) * scale);
+        input.value = raw;
+        const decimals = (scale === 1) ? 0 : 2;
+        document.getElementById(`val-${key}`).textContent = Number(val).toFixed(decimals);
       }
     }
+    document.getElementById('settings-status').textContent = 'Reloaded';
   } catch (e) { console.error('Load settings error:', e); }
+}
+
+const PRESET_KEY = 'barricade_mcts_preset';
+function savePreset() {
+  const data = {};
+  document.querySelectorAll('#settings-panel input[data-key]').forEach(input => {
+    const key = input.dataset.key;
+    if (input.type === 'checkbox') data[key] = input.checked;
+    else {
+      const scale = parseFloat(input.dataset.scale || '1');
+      data[key] = (input.type === 'range' ? parseInt(input.value, 10) : parseFloat(input.value)) / scale;
+    }
+  });
+  localStorage.setItem(PRESET_KEY, JSON.stringify(data));
+  document.getElementById('settings-status').textContent = 'Saved';
+  setTimeout(() => { const s = document.getElementById('settings-status'); if (s.textContent === 'Saved') s.textContent = '—'; }, 1500);
+}
+function loadPreset() {
+  const raw = localStorage.getItem(PRESET_KEY);
+  if (!raw) {
+    document.getElementById('settings-status').textContent = 'No preset';
+    return;
+  }
+  const data = JSON.parse(raw);
+  for (const [key, val] of Object.entries(data)) {
+    const input = document.querySelector(`#settings-panel input[data-key="${key}"]`);
+    if (!input) continue;
+    if (input.type === 'checkbox') {
+      input.checked = !!val;
+      document.getElementById(`val-${key}`).textContent = val ? 'on' : 'off';
+    } else {
+      const scale = parseFloat(input.dataset.scale || '1');
+      input.value = Math.round(Number(val) * scale);
+      const decimals = (scale === 1) ? 0 : 2;
+      document.getElementById(`val-${key}`).textContent = Number(val).toFixed(decimals);
+    }
+  }
+  document.getElementById('settings-status').textContent = 'Loaded';
+}
+
+// ============================================================
+// Game config
+// ============================================================
+const CFG_KEY = 'barricade_game_cfg';
+const DEFAULT_CFG = { red_row: 0, red_col: 4, blue_row: 8, blue_col: 4, red_walls: 10, blue_walls: 10 };
+
+function readConfigFromUI() {
+  return {
+    red_start: [parseInt(document.getElementById('cfg-red-row').value, 10),
+                parseInt(document.getElementById('cfg-red-col').value, 10)],
+    blue_start: [parseInt(document.getElementById('cfg-blue-row').value, 10),
+                 parseInt(document.getElementById('cfg-blue-col').value, 10)],
+    red_walls: parseInt(document.getElementById('cfg-red-walls').value, 10),
+    blue_walls: parseInt(document.getElementById('cfg-blue-walls').value, 10),
+  };
+}
+
+function readConfigObject() {
+  const [rr, rc] = readConfigFromUI().red_start;
+  const [br, bc] = readConfigFromUI().blue_start;
+  return {
+    red_row: rr, red_col: rc,
+    blue_row: br, blue_col: bc,
+    red_walls: parseInt(document.getElementById('cfg-red-walls').value, 10),
+    blue_walls: parseInt(document.getElementById('cfg-blue-walls').value, 10),
+  };
+}
+
+function writeConfigToUI(cfg) {
+  document.getElementById('cfg-red-row').value = cfg.red_row;
+  document.getElementById('cfg-red-col').value = cfg.red_col;
+  document.getElementById('cfg-blue-row').value = cfg.blue_row;
+  document.getElementById('cfg-blue-col').value = cfg.blue_col;
+  document.getElementById('cfg-red-walls').value = cfg.red_walls;
+  document.getElementById('cfg-blue-walls').value = cfg.blue_walls;
+}
+
+function validateConfig(cfg) {
+  const errEl = document.getElementById('cfg-error');
+  const inRange = (v) => Number.isInteger(v) && v >= 0 && v < BOARD_SIZE;
+  if (!inRange(cfg.red_start[0]) || !inRange(cfg.red_start[1]) ||
+      !inRange(cfg.blue_start[0]) || !inRange(cfg.blue_start[1])) {
+    errEl.textContent = 'Start positions must be 0–8 on both axes';
+    return false;
+  }
+  if (cfg.red_start[0] === cfg.blue_start[0] && cfg.red_start[1] === cfg.blue_start[1]) {
+    errEl.textContent = 'Starting positions overlap';
+    return false;
+  }
+  if (cfg.red_walls < 0 || cfg.red_walls > 20 || cfg.blue_walls < 0 || cfg.blue_walls > 20) {
+    errEl.textContent = 'Walls per player must be 0–20';
+    return false;
+  }
+  errEl.textContent = '';
+  return true;
+}
+
+function saveConfigToStorage() {
+  const cfg = readConfigObject();
+  cfg.player_side = playerSide;
+  localStorage.setItem(CFG_KEY, JSON.stringify(cfg));
+}
+
+function loadConfigFromStorage() {
+  try {
+    const raw = localStorage.getItem(CFG_KEY);
+    if (raw) {
+      const cfg = JSON.parse(raw);
+      writeConfigToUI(Object.assign({}, DEFAULT_CFG, cfg));
+      if (cfg.player_side === 'BLUE' || cfg.player_side === 'RED') setPlayerSide(cfg.player_side);
+    } else {
+      writeConfigToUI(DEFAULT_CFG);
+    }
+  } catch (e) { writeConfigToUI(DEFAULT_CFG); }
+}
+
+function resetConfigDefaults() {
+  writeConfigToUI(DEFAULT_CFG);
+  saveConfigToStorage();
 }
 
 // ============================================================
@@ -549,10 +1326,14 @@ function toggleWallOrientation() {
 }
 
 function onKey(e) {
+  // Ignore when typing in a number/text field
+  const tag = (e.target.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea') return;
   if (e.key === 'r' || e.key === 'R') toggleWallOrientation();
   if (e.key === 'w' || e.key === 'W') setMode(mode === 'move' ? 'wall' : 'move');
   if (e.key === 'n' || e.key === 'N') newGame();
   if (e.key === 'f' || e.key === 'F') toggleFutureOverlay();
+  if (e.key === 'h' || e.key === 'H') togglePolicyHeatmap();
 }
 
 // ============================================================
@@ -614,34 +1395,93 @@ function updateUI() {
 }
 
 function drawStats() {
-  const el = document.getElementById('stats-content');
+  const body = document.getElementById('stats-body');
+  const tbl = document.getElementById('stats-table');
+  const empty = document.getElementById('stats-empty');
   if (!searchStats || searchStats.length === 0) {
-    el.innerHTML = '<em>Make a move</em>';
-    document.getElementById('diagnostics-row').innerHTML = '';
-    return;
+    body.innerHTML = '';
+    tbl.classList.add('hidden');
+    empty.classList.remove('hidden');
+  } else {
+    empty.classList.add('hidden');
+    tbl.classList.remove('hidden');
+    const sorted = [...searchStats].sort((a, b) => b.visits - a.visits).slice(0, 15);
+    body.innerHTML = sorted.map((s, i) => {
+      const winP = (s.q + 1) / 2;
+      const wpWidth = Math.max(0, Math.min(1, winP)) * 100;
+      return `<tr class="move-row" onclick="makeMove(${s.action})">` +
+        `<td>${i + 1}</td>` +
+        `<td>${s.action}</td>` +
+        `<td>${s.prior.toFixed(3)}</td>` +
+        `<td>${s.visits}</td>` +
+        `<td>${s.q.toFixed(3)}</td>` +
+        `<td><span class="wp-bar"><i style="width:${wpWidth.toFixed(0)}%"></i></span>${(winP*100).toFixed(0)}%</td>` +
+        `<td>${(s.lead_q !== undefined ? s.lead_q : 0).toFixed(3)}</td>` +
+        `</tr>`;
+    }).join('');
   }
-  const sorted = [...searchStats].sort((a, b) => b.visits - a.visits).slice(0, 15);
-  let html = '<table><tr><th>#</th><th>Act</th><th>Prior</th><th>Visits</th><th>Q</th><th>LeadQ</th></tr>';
-  sorted.forEach((s, i) => {
-    html += `<tr class="move-row" onclick="makeMove(${s.action})">
-      <td>${i + 1}</td>
-      <td>${s.action}</td>
-      <td>${s.prior.toFixed(3)}</td>
-      <td>${s.visits}</td>
-      <td>${s.q.toFixed(3)}</td>
-      <td>${(s.lead_q !== undefined ? s.lead_q : 0).toFixed(3)}</td>
-    </tr>`;
-  });
-  html += '</table>';
-  el.innerHTML = html;
-
   // Diagnostics
   if (diagnostics) {
-    document.getElementById('diagnostics-row').innerHTML =
-      `<span>Sims: <b class="val">${diagnostics.simulations}</b></span>` +
-      `<span>Batches: <b class="val">${diagnostics.neural_batches}</b></span>` +
-      `<span>Collisions: <b class="val">${diagnostics.collisions}</b></span>`;
+    document.getElementById('d-sims').textContent = diagnostics.simulations ?? '—';
+    document.getElementById('d-batches').textContent = diagnostics.neural_batches ?? '—';
+    document.getElementById('d-collisions').textContent = diagnostics.collisions ?? '—';
+    document.getElementById('d-leaves').textContent = diagnostics.evaluated_leaves ?? '—';
+    document.getElementById('d-flushes').textContent = diagnostics.collision_flushes ?? '—';
+    const t = diagnostics.search_time_ms;
+    document.getElementById('d-time').textContent = t !== undefined ? `${t.toFixed(0)} ms` : '—';
+    document.getElementById('diag-time').textContent = t !== undefined ? `${t.toFixed(0)} ms` : '—';
+    const sps = diagnostics.sims_per_sec;
+    document.getElementById('d-sps').textContent = sps !== undefined ? sps.toFixed(1) : '—';
+    if (t && diagnostics.simulations) {
+      document.getElementById('d-msps').textContent = (t / diagnostics.simulations).toFixed(2);
+    } else {
+      document.getElementById('d-msps').textContent = '—';
+    }
   }
+}
+
+// ============================================================
+// Move history
+// ============================================================
+// `stateForMeta` should hold the pawn positions BEFORE the action was
+// applied (so destinations are computed from the actual starting square).
+// When omitted, we fall back to the global gameState (which is the correct
+// pre-move state when the human plays, since gameState isn't updated until
+// after pushHistory is called).
+function pushHistoryFromAction(action, player, newState, stateForMeta) {
+  if (action === null || action === undefined) return;
+  const refState = stateForMeta || gameState;
+  const meta = describeActionMeta(action, refState, player);
+  moveHistory.push({ action, player, label: meta.label, short: meta.short });
+  renderHistory();
+}
+
+function renderHistory() {
+  const list = document.getElementById('history-list');
+  const count = document.getElementById('history-count');
+  count.textContent = String(moveHistory.length);
+  if (moveHistory.length === 0) {
+    list.innerHTML = '<em class="muted">No moves yet</em>';
+    return;
+  }
+  list.innerHTML = moveHistory.map((m, i) => {
+    const whoCls = m.player === 'RED' ? 'who-red' : 'who-blue';
+    const who = m.player === 'RED' ? 'R' : 'B';
+    return `<div class="hm"><span class="idx">${i + 1}.</span><span class="${whoCls}">${who}:</span><span class="text">${m.label}</span></div>`;
+  }).join('');
+  list.scrollTop = list.scrollHeight;
+}
+
+function copyHistory() {
+  if (moveHistory.length === 0) return;
+  const text = moveHistory.map((m, i) => {
+    const who = m.player === 'RED' ? 'R' : 'B';
+    return `${i + 1}. ${who}: ${m.label}`;
+  }).join('\n');
+  navigator.clipboard.writeText(text).then(
+    () => { document.getElementById('history-count').textContent = `${moveHistory.length} ✓`; setTimeout(() => renderHistory(), 1200); },
+    () => { alert(text); }
+  );
 }
 
 // ============================================================
@@ -655,8 +1495,12 @@ function draw() {
   }
   drawWalls();
   drawPawns();
+  drawLastMoveArrow();
+  drawPolicyHeatmap();
+  drawAIHint();
   drawHighlights();
   drawHover();
+  drawCoords();
 }
 
 function drawBoard() {
@@ -676,6 +1520,20 @@ function drawBoard() {
   ctx.fillRect(0, (BOARD_SIZE - 1) * CELL, CANVAS_W, CELL);
   ctx.fillStyle = 'rgba(107, 159, 255, 0.08)';
   ctx.fillRect(0, 0, CANVAS_W, CELL);
+}
+
+function drawCoords() {
+  ctx.fillStyle = '#888';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for (let c = 0; c < BOARD_SIZE; c++) {
+    ctx.fillText(String(c + 1), c * CELL + CELL / 2, -6);
+  }
+  ctx.textAlign = 'right';
+  for (let r = 0; r < BOARD_SIZE; r++) {
+    ctx.fillText(String.fromCharCode(65 + r), -6, r * CELL + CELL / 2);
+  }
 }
 
 function drawWalls() {
@@ -710,29 +1568,108 @@ function drawPawns() {
   }
 }
 
+function drawLastMoveArrow() {
+  if (!gameState || !gameState.previous_pawns) return;
+  const prev = gameState.previous_pawns;
+  // Figure out which pawn moved by comparing prev vs current
+  for (const player of ['RED', 'BLUE']) {
+    const before = prev[player];
+    const after = gameState.pawns[player];
+    if (!before || !after) continue;
+    if (before[0] !== after[0] || before[1] !== after[1]) {
+      const x0 = before[1] * CELL + CELL / 2;
+      const y0 = before[0] * CELL + CELL / 2;
+      const x1 = after[1] * CELL + CELL / 2;
+      const y1 = after[0] * CELL + CELL / 2;
+      const color = player === 'RED' ? COLOR_RED : COLOR_BLUE;
+      ctx.save();
+      ctx.globalAlpha = 0.45;
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.lineTo(x1, y1);
+      ctx.stroke();
+      // Arrowhead
+      const ang = Math.atan2(y1 - y0, x1 - x0);
+      const ah = 9;
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x1 - ah * Math.cos(ang - Math.PI / 6), y1 - ah * Math.sin(ang - Math.PI / 6));
+      ctx.lineTo(x1 - ah * Math.cos(ang + Math.PI / 6), y1 - ah * Math.sin(ang + Math.PI / 6));
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+}
+
+function drawPolicyHeatmap() {
+  if (!showPolicyHeatmap || !lastEvalData || !lastEvalData.top_policy || !gameState) return;
+  if (aiThinking) return;
+  if (gameState.current_player !== playerSide) return;
+  const cp = gameState.current_player;
+  const thick = 8;
+  for (let i = 0; i < Math.min(3, lastEvalData.top_policy.length); i++) {
+    const p = lastEvalData.top_policy[i];
+    const meta = describeActionMeta(p.action, gameState, cp);
+    const alpha = 0.55 - i * 0.12;
+    ctx.save();
+    ctx.globalAlpha = Math.max(0.2, alpha);
+    if (meta.dest) {
+      const tint = cp === 'RED' ? COLOR_HEAT_RED : COLOR_HEAT_BLUE;
+      ctx.fillStyle = tint;
+      ctx.fillRect(meta.dest[1] * CELL, meta.dest[0] * CELL, CELL, CELL);
+    } else if (meta.wall) {
+      ctx.fillStyle = 'rgba(240, 192, 64, 0.45)';
+      if (meta.wall.orientation === 'HORIZONTAL') {
+        ctx.fillRect(meta.wall.col * CELL, (meta.wall.row + 1) * CELL - thick / 2, CELL * 2, thick);
+      } else {
+        ctx.fillRect((meta.wall.col + 1) * CELL - thick / 2, meta.wall.row * CELL, thick, CELL * 2);
+      }
+    }
+    ctx.restore();
+  }
+}
+
+function drawAIHint() {
+  if (!searchStats || searchStats.length === 0) return;
+  if (!gameState) return;
+  if (gameState.current_player === playerSide) return; // not AI's turn
+  const top = searchStats[0];
+  const meta = describeActionMeta(top.action, gameState, gameState.current_player);
+  const thick = 8;
+  ctx.save();
+  ctx.strokeStyle = COLOR_AI_HINT;
+  ctx.lineWidth = 3;
+  if (meta.dest) {
+    const r = meta.dest[0], c = meta.dest[1];
+    ctx.strokeRect(c * CELL + 4, r * CELL + 4, CELL - 8, CELL - 8);
+  } else if (meta.wall) {
+    if (meta.wall.orientation === 'HORIZONTAL') {
+      ctx.strokeRect(meta.wall.col * CELL - 2, (meta.wall.row + 1) * CELL - thick / 2 - 2, CELL * 2 + 4, thick + 4);
+    } else {
+      ctx.strokeRect((meta.wall.col + 1) * CELL - thick / 2 - 2, meta.wall.row * CELL - 2, thick + 4, CELL * 2 + 4);
+    }
+  }
+  ctx.restore();
+}
+
 // ============================================================
 // Future Map Overlay
 // ============================================================
 function drawFutureOverlay() {
   if (!futureMapData || !gameState) return;
   const cp = gameState.current_player;
-  // side_to_move probabilities: channel 0 (current player's future occupancy)
-  // opponent probabilities: channel 1
-  // We colour each cell based on which player the model expects to occupy it:
-  //   Red tint for RED, Blue tint for BLUE
-  // Intensity = probability
-  const sideProbs = futureMapData.side_to_move;    // 9x9 list
-  const oppProbs = futureMapData.opponent;          // 9x9 list
-
+  const sideProbs = futureMapData.side_to_move;
+  const oppProbs = futureMapData.opponent;
   for (let r = 0; r < BOARD_SIZE; r++) {
     for (let c = 0; c < BOARD_SIZE; c++) {
       const pSide = sideProbs[r][c];
       const pOpp = oppProbs[r][c];
       const maxP = Math.max(pSide, pOpp);
-      if (maxP < 0.15) continue;  // skip low-confidence cells
-
-      // Determine colour: side = current player, opp = opponent
-      // current player's colour depends on who is to move
+      if (maxP < futureThreshold) continue;
       let rTint = 0, bTint = 0;
       if (cp === 'RED') {
         rTint = pSide * 255;
@@ -746,14 +1683,45 @@ function drawFutureOverlay() {
       ctx.fillRect(c * CELL, r * CELL, CELL, CELL);
     }
   }
-
   // Legend
   ctx.fillStyle = 'rgba(0,0,0,0.7)';
-  ctx.fillRect(4, 4, 120, 18);
+  ctx.fillRect(4, 4, 220, 18);
   ctx.fillStyle = '#ddd';
   ctx.font = '11px sans-serif';
   ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-  ctx.fillText('🗺 Future occupancy (model)', 8, 7);
+  ctx.fillText(`🗺 Future (≥ ${futureThreshold.toFixed(2)})`, 8, 7);
+}
+
+function drawFutureCanvas() {
+  if (!futureCtx) return;
+  futureCtx.clearRect(0, 0, futureCanvas.width, futureCanvas.height);
+  if (!futureMapData || !gameState) return;
+  const cp = gameState.current_player;
+  const W = futureCanvas.width, H = futureCanvas.height;
+  const cell = W / BOARD_SIZE;
+  const sideProbs = futureMapData.side_to_move;
+  const oppProbs = futureMapData.opponent;
+  for (let r = 0; r < BOARD_SIZE; r++) {
+    for (let c = 0; c < BOARD_SIZE; c++) {
+      const pSide = sideProbs[r][c];
+      const pOpp = oppProbs[r][c];
+      const maxP = Math.max(pSide, pOpp);
+      if (maxP < futureThreshold) continue;
+      let rTint = 0, bTint = 0;
+      if (cp === 'RED') { rTint = pSide * 255; bTint = pOpp * 255; }
+      else              { bTint = pSide * 255; rTint = pOpp * 255; }
+      const alpha = Math.min(0.85, maxP);
+      futureCtx.fillStyle = `rgba(${rTint | 0}, 0, ${bTint | 0}, ${alpha})`;
+      futureCtx.fillRect(c * cell, r * cell, cell, cell);
+    }
+  }
+  // Grid
+  futureCtx.strokeStyle = 'rgba(255,255,255,0.05)';
+  futureCtx.lineWidth = 1;
+  for (let i = 0; i <= BOARD_SIZE; i++) {
+    futureCtx.beginPath(); futureCtx.moveTo(i * cell, 0); futureCtx.lineTo(i * cell, H); futureCtx.stroke();
+    futureCtx.beginPath(); futureCtx.moveTo(0, i * cell); futureCtx.lineTo(W, i * cell); futureCtx.stroke();
+  }
 }
 
 function drawHighlights() {

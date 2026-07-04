@@ -14,6 +14,7 @@ import json
 import math
 import random
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -113,6 +114,10 @@ game_state = None  # type: Optional[BarricadeState]
 mcts = None        # type: Optional[MCTS]
 mcts_root = None   # type: Optional[SearchNode]
 game_history = []  # type: List[BarricadeState]
+# Pawn positions immediately before the last applied action (None until
+# at least one move has been played in the current game). Used by the
+# frontend to draw the last-move arrow.
+previous_pawns = None  # type: Optional[Dict[str, List[int]]]
 
 # Default MCTS config — can be overridden via /settings
 current_mcts_config = MCTSConfig(
@@ -148,6 +153,8 @@ def _build_mcts() -> MCTS:
 
 def _serialize_state(state: BarricadeState) -> Dict[str, Any]:
     """Serialize game state for the frontend."""
+    red_pl = state.shortest_path_length(Player.RED)
+    blue_pl = state.shortest_path_length(Player.BLUE)
     return {
         "board_size": state.board_size,
         "pawns": {
@@ -171,6 +178,12 @@ def _serialize_state(state: BarricadeState) -> Dict[str, Any]:
             "BLUE": state.walls_left[Player.BLUE],
         },
         "is_terminal": state.is_terminal(),
+        "previous_pawns": previous_pawns,
+        "red_path_length": red_pl,
+        "blue_path_length": blue_pl,
+        "path_gap": (
+            (blue_pl - red_pl) if (red_pl is not None and blue_pl is not None) else None
+        ),
     }
 
 
@@ -211,7 +224,7 @@ def index():
 
 @app.route("/api/new_game", methods=["POST"])
 def new_game():
-    global game_state, mcts, mcts_root, game_history
+    global game_state, mcts, mcts_root, game_history, previous_pawns
     data = request.get_json(silent=True) or {}
     red_start = tuple(data.get("red_start", (0, 4)))
     blue_start = tuple(data.get("blue_start", (8, 4)))
@@ -233,15 +246,21 @@ def new_game():
     mcts = _build_mcts()
     mcts_root = None
     game_history = []
+    previous_pawns = None
 
     # If the AI (RED) is to move first, run MCTS now and return the AI's move
     ai_first_move = None
     if starting_player == "RED" and player_side == "BLUE":
         result = mcts.search(game_state)
         ai_action = mcts.select_action(result, temperature=current_mcts_config.action_temperature)
+        pre_ai_pawns = {
+            Player.RED.name: list(game_state.pawns[Player.RED]),
+            Player.BLUE.name: list(game_state.pawns[Player.BLUE]),
+        }
         game_history.append(game_state.copy())
         game_state = game_state.apply_action(ai_action, validate=False)
         mcts_root = mcts.advance_root(result.root, ai_action)
+        previous_pawns = pre_ai_pawns
         ai_first_move = {
             "action": int(ai_action),
             "value": round(float(result.root_value), 4),
@@ -268,7 +287,7 @@ def get_state():
 
 @app.route("/api/move", methods=["POST"])
 def make_move():
-    global game_state, mcts, mcts_root, game_history
+    global game_state, mcts, mcts_root, game_history, previous_pawns
     if game_state is None:
         return jsonify({"error": "No game in progress"}), 400
     if game_state.is_terminal():
@@ -284,8 +303,13 @@ def make_move():
         return jsonify({"error": f"Illegal action {action}"}), 400
 
     # Apply human move
+    pre_human_pawns = {
+        Player.RED.name: list(game_state.pawns[Player.RED]),
+        Player.BLUE.name: list(game_state.pawns[Player.BLUE]),
+    }
     game_history.append(game_state.copy())
     game_state = game_state.apply_action(action, validate=False)
+    previous_pawns = pre_human_pawns
 
     if game_state.is_terminal():
         mcts_root = None
@@ -304,16 +328,23 @@ def make_move():
     if mcts_root is not None:
         mcts_root = mcts.advance_root(mcts_root, action)
 
+    search_t0 = time.perf_counter()
     result = mcts.search(
         game_state,
         history=game_history[-current_mcts_config.history_length:] if current_mcts_config.history_length > 0 else None,
         root=mcts_root,
     )
+    search_dt_ms = (time.perf_counter() - search_t0) * 1000.0
     ai_action = mcts.select_action(result, temperature=current_mcts_config.action_temperature)
 
     # Apply AI move
+    pre_ai_pawns = {
+        Player.RED.name: list(game_state.pawns[Player.RED]),
+        Player.BLUE.name: list(game_state.pawns[Player.BLUE]),
+    }
     game_history.append(game_state.copy())
     game_state = game_state.apply_action(ai_action, validate=False)
+    previous_pawns = pre_ai_pawns
 
     # Advance MCTS root for the AI move (root is now at the state after AI's move)
     mcts_root = mcts.advance_root(result.root, ai_action)
@@ -337,6 +368,12 @@ def make_move():
         blue_perspective_value = -blue_perspective_value
         blue_perspective_lead = -blue_perspective_lead
 
+    completed_sims = int(result.diagnostics.get("completed_simulations", 0))
+    sims_per_sec = (
+        completed_sims / (search_dt_ms / 1000.0)
+        if search_dt_ms > 0 else 0.0
+    )
+
     return jsonify({
         "state": _serialize_state(game_state),
         "valid_moves": _serialize_valid_moves(game_state),
@@ -349,9 +386,13 @@ def make_move():
         "blue_lead": round(blue_perspective_lead, 4),
         "stats": stats,
         "diagnostics": {
-            "simulations": result.diagnostics.get("completed_simulations", 0),
-            "neural_batches": result.diagnostics.get("neural_batches", 0),
-            "collisions": result.diagnostics.get("collisions", 0),
+            "simulations": completed_sims,
+            "neural_batches": int(result.diagnostics.get("neural_batches", 0)),
+            "collisions": int(result.diagnostics.get("collisions", 0)),
+            "evaluated_leaves": int(result.diagnostics.get("evaluated_leaves", 0)),
+            "collision_flushes": int(result.diagnostics.get("collision_flushes", 0)),
+            "search_time_ms": round(search_dt_ms, 2),
+            "sims_per_sec": round(sims_per_sec, 1),
         },
         "game_over": game_state.is_terminal(),
     })

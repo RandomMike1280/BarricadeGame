@@ -38,9 +38,14 @@ from barricade_env import (
     MoveDirection,
     Player,
 )
-from canonical import canonical_action, canonicalize_action_vector
+from canonical import (
+    canonical_action,
+    canonicalize_action_vector,
+    canonicalize_lr_mirror_action_vector,
+)
 from mcts import MCTS, MCTSConfig
 from network import (
+    BASE_PLANES_PER_POSITION,
     EncoderConfig,
     build_network,
     encode_state_stack,
@@ -129,6 +134,16 @@ class TrainConfig:
     grad_clip: float = 1.0
     weight_decay: float = 1e-4
     seed: int = 1
+    # LR-mirror data augmentation. Doubles the effective epoch-time dataset
+    # by flipping each replay sample about the vertical axis with probability
+    # ``mirror_augment_p``. The augmentation is applied at __getitem__ time on
+    # already-converted tensors, so it is memory-free and gives a different
+    # random view every epoch. Quoridor is symmetric about the vertical axis
+    # in the canonical side-to-move frame, so the mirrored sample is a
+    # guaranteed-equivalent training example.
+    mirror_augment: bool = False
+    mirror_augment_p: float = 0.5
+    mirror_augment_seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -525,6 +540,9 @@ class ReplayDataset(Dataset):
         *,
         max_iteration: Optional[int] = None,
         min_iteration: Optional[int] = None,
+        mirror_augment: bool = False,
+        mirror_augment_p: float = 0.5,
+        mirror_augment_seed: int = 0,
     ) -> None:
         self.replay_dir = Path(replay_dir)
         samples: List[Dict[str, Any]] = []
@@ -580,6 +598,19 @@ class ReplayDataset(Dataset):
         # epochs.
         self._converted: Optional[List[Tuple[Tensor, ...]]] = None
 
+        # LR-mirror augmentation. Doubles the effective epoch-time dataset by
+        # randomly flipping samples about the vertical axis. The flip is
+        # applied at __getitem__ time on already-converted tensors, so it is
+        # memory-free and gives a different random view every epoch. The
+        # ``mirror_augment_p`` knob (default 0.5) controls the flip probability
+        # per sample; lower values provide less regularization.
+        self.mirror_augment = bool(mirror_augment)
+        self.mirror_augment_p = float(mirror_augment_p)
+        # Per-instance RNG so DataLoader worker processes get independent
+        # streams and the augmentation is deterministic across reruns when
+        # the seed is fixed.
+        self._mirror_augment_rng = random.Random(int(mirror_augment_seed))
+
         if limit is not None and limit > 0 and len(self.samples) > limit:
             self.samples = self.samples[-limit:]
         if not self.samples:
@@ -600,7 +631,10 @@ class ReplayDataset(Dataset):
         if converted is None:
             self._ensure_converted()
             converted = self._converted
-        return converted[index]
+        sample = converted[index]
+        if self.mirror_augment and self._mirror_augment_rng.random() < self.mirror_augment_p:
+            sample = _apply_lr_mirror_to_sample(sample)
+        return sample
 
     def _ensure_converted(self) -> None:
         """Pre-convert every sample to its final tensor tuple.
@@ -670,6 +704,63 @@ class ReplayDataset(Dataset):
                 score_mask,
             )
         self._converted = converted
+
+
+def _apply_lr_mirror_to_sample(
+    sample: Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Return the column-reflected counterpart of a converted replay sample.
+
+    The replay stores samples in the canonical side-to-move frame, so the only
+    residual geometric symmetry of the 9x9 Quoridor board that survives the
+    canonical frame is the left-right mirror about the vertical axis through
+    the center column. Reflecting a position about that axis produces a
+    board state with the same value, lead, score, and the same optimal policy
+    distribution (just reindexed by ``LR_MIRROR_ACTION_PERMUTATION``), so the
+    mirrored sample is a guaranteed-equivalent training example.
+
+    Applied transforms:
+      - ``state_planes``: column flip on the spatial axes. Channel 0 (side-to-move
+        indicator), 5/6 (walls-left fractions), and 7/8 (goal rows) are either
+        scalar-like or full-row and are unaffected by the column flip.
+      - ``mask``, ``policy_target``: reindexed by ``LR_MIRROR_ACTION_PERMUTATION``.
+        The permutation is an involution and a bijection, so renormalization is
+        unnecessary.
+      - ``future_map_target``: column flip on the spatial axes; channels (own /
+        opp) are unchanged.
+      - scalar targets (``value_target``, ``lead_target``, ``lead_mask``,
+        ``future_map_mask``, ``score_target``, ``score_mask``): invariant.
+    """
+    (
+        state_planes,
+        mask,
+        policy_target,
+        value_target,
+        lead_target,
+        lead_mask,
+        future_map_target,
+        future_map_mask,
+        score_target,
+        score_mask,
+    ) = sample
+
+    mirrored_planes = torch.flip(state_planes, dims=[-1])
+    mirrored_mask = canonicalize_lr_mirror_action_vector(mask)
+    mirrored_policy = canonicalize_lr_mirror_action_vector(policy_target)
+    mirrored_future_map = torch.flip(future_map_target, dims=[-1])
+
+    return (
+        mirrored_planes,
+        mirrored_mask,
+        mirrored_policy,
+        value_target,
+        lead_target,
+        lead_mask,
+        mirrored_future_map,
+        future_map_mask,
+        score_target,
+        score_mask,
+    )
 
 
 # ======================================================================
@@ -1494,6 +1585,9 @@ def train_from_replay(
         config.replay_limit,
         max_iteration=replay_max_iteration,
         min_iteration=replay_min_iteration,
+        mirror_augment=config.mirror_augment,
+        mirror_augment_p=config.mirror_augment_p,
+        mirror_augment_seed=config.mirror_augment_seed,
     )
     use_pin_memory = resolved_device.type == "cuda"
     use_num_workers = 0 if resolved_device.type == "cpu" else 2
@@ -2515,11 +2609,184 @@ def _setup_cpu_perf(
 # CLI
 # ======================================================================
 
+def _selftest_lr_mirror_augment() -> None:
+    """Verify the LR-mirror augmentation against geometric invariants.
+
+    Run with ``python train.py --selftest-augment``. Constructs synthetic
+    replay-shaped samples with known pawn and wall placements and a known
+    policy target, then asserts that ``_apply_lr_mirror_to_sample`` produces
+    the column-reflected counterpart under the documented transform rules.
+
+    The invariants checked:
+
+      1. ``state_planes`` channel flip on the spatial axes: pawn at
+         ``(r, c)`` in channel 1 (side-to-move) and channel 2 (opponent)
+         moves to ``(r, BOARD_SIZE - 1 - c)``; horizontal walls in channel 3
+         and vertical walls in channel 4 at ``(r, c)`` move to
+         ``(r, BOARD_SIZE - 1 - c)``. The orientation channels (3 vs 4) are
+         preserved because a wall reflected about a vertical axis keeps its
+         orientation.
+      2. ``mask`` and ``policy_target`` are reindexed by
+         ``LR_MIRROR_ACTION_PERMUTATION``: the mass at action ``i`` before
+         the mirror equals the mass at ``LR_MIRROR_ACTION_PERMUTATION[i]``
+         after the mirror.
+      3. ``future_map_target`` is column-flipped on the spatial axes; the
+         own/opp channel assignment is preserved.
+      4. Scalar targets (``value_target``, ``lead_*``, ``score_*``) are
+         unchanged.
+      5. Applying the mirror twice returns the original tensors byte-for-byte.
+    """
+    from canonical import (
+        DIAGONAL_HOP_OFFSET,
+        HORIZONTAL_WALL_OFFSET,
+        LR_MIRROR_ACTION_PERMUTATION,
+        VERTICAL_WALL_OFFSET,
+        WALL_BOARD_SIZE,
+    )
+
+    board_size = BOARD_SIZE
+    last = board_size - 1
+
+    # Synthetic state planes: own pawn at (3, 2), opp pawn at (5, 7),
+    # horizontal wall at (4, 5), vertical wall at (6, 1), and the
+    # full-board channels (0, 5, 6, 7, 8) populated with sentinel values
+    # so we can also confirm they survive the flip unchanged.
+    state_planes = torch.zeros((BASE_PLANES_PER_POSITION, board_size, board_size), dtype=torch.float32)
+    state_planes[0] = 1.0  # side-to-move indicator
+    state_planes[1, 3, 2] = 1.0  # own pawn
+    state_planes[2, 5, 7] = 1.0  # opp pawn
+    state_planes[3, 4, 5] = 1.0  # horizontal wall
+    state_planes[4, 6, 1] = 1.0  # vertical wall
+    state_planes[5] = 0.42  # own walls-left fraction
+    state_planes[6] = 0.37  # opp walls-left fraction
+    state_planes[7, last, :] = 1.0  # own goal row
+    state_planes[8, 0, :] = 1.0  # opp goal row
+
+    # Synthetic mask and policy target: assign distinct positive mass to a
+    # few pawn-move, wall, and diagonal-hop slots so each action group is
+    # exercised by the reindex.
+    mask = torch.zeros(ACTION_SIZE, dtype=torch.bool)
+    policy = torch.zeros(ACTION_SIZE, dtype=torch.float32)
+    test_indices = [
+        MoveDirection.UP.value,
+        MoveDirection.DOWN.value,
+        MoveDirection.LEFT.value,
+        MoveDirection.RIGHT.value,
+        HORIZONTAL_WALL_OFFSET + 0 * WALL_BOARD_SIZE + 3,  # H-wall (0,3)
+        VERTICAL_WALL_OFFSET + 2 * WALL_BOARD_SIZE + 5,    # V-wall (2,5)
+        DIAGONAL_HOP_OFFSET + 0,                            # diag UL
+        DIAGONAL_HOP_OFFSET + 3,                            # diag DR
+    ]
+    for index in test_indices:
+        mask[index] = True
+        policy[index] = float(index + 1)  # distinct mass per slot
+    # Pre-normalize the synthetic policy so the equality check below works
+    # on raw reindexed mass (no rescaling needed because the permutation
+    # preserves total mass).
+    policy = policy / policy.sum()
+
+    # Synthetic future map: own pawn visits (3, 4), opp pawn visits (5, 1).
+    future_map = torch.zeros((2, board_size, board_size), dtype=torch.float32)
+    future_map[0, 3, 4] = 1.0
+    future_map[1, 5, 1] = 1.0
+
+    sample = (
+        state_planes,
+        mask,
+        policy,
+        torch.tensor(0.25, dtype=torch.float32),  # value_target
+        torch.tensor(2.0, dtype=torch.float32),   # lead_target
+        torch.tensor(1.0, dtype=torch.float32),   # lead_mask
+        future_map,
+        torch.tensor(1.0, dtype=torch.float32),   # future_map_mask
+        torch.tensor(7.0, dtype=torch.float32),   # score_target
+        torch.tensor(1.0, dtype=torch.float32),   # score_mask
+    )
+
+    mirrored = _apply_lr_mirror_to_sample(sample)
+    twice = _apply_lr_mirror_to_sample(mirrored)
+
+    # --- Invariant 1: state planes column flip ---
+    m_state, m_mask, m_policy, m_value, m_lead, m_lead_mask, m_future, m_future_mask, m_score, m_score_mask = mirrored
+
+    # Own pawn (3, 2) -> (3, last-2)
+    assert m_state[1, 3, last - 2].item() == 1.0, "own pawn must move to mirrored column"
+    assert m_state[1, 3, 2].item() == 0.0, "own pawn must vacate original column"
+    # Opp pawn (5, 7) -> (5, last-7) = (5, 1)
+    assert m_state[2, 5, 1].item() == 1.0, "opp pawn must move to mirrored column"
+    # Horizontal wall (4, 5) -> (4, last-5) = (4, 3), still in channel 3
+    assert m_state[3, 4, 3].item() == 1.0, "horizontal wall must remain in channel 3"
+    assert m_state[3, 4, 5].item() == 0.0
+    # Vertical wall (6, 1) -> (6, last-1) = (6, 7), still in channel 4
+    assert m_state[4, 6, 7].item() == 1.0, "vertical wall must remain in channel 4"
+    assert m_state[4, 6, 1].item() == 0.0
+    # Scalar/full-row channels are unaffected by a column flip.
+    assert torch.equal(m_state[0], state_planes[0]), "side-to-move indicator must be unchanged"
+    assert torch.equal(m_state[5], state_planes[5]), "own walls-left fraction must be unchanged"
+    assert torch.equal(m_state[6], state_planes[6]), "opp walls-left fraction must be unchanged"
+    assert torch.equal(m_state[7], state_planes[7]), "own goal row must be unchanged"
+    assert torch.equal(m_state[8], state_planes[8]), "opp goal row must be unchanged"
+
+    # --- Invariant 2: mask + policy reindexed by LR_MIRROR_ACTION_PERMUTATION ---
+    # mass at the permuted slot after the mirror equals mass at the original slot before
+    tolerance = 1.0e-6
+    for index in test_indices:
+        permuted = LR_MIRROR_ACTION_PERMUTATION[index]
+        assert abs(m_policy[permuted].item() - policy[index].item()) <= tolerance, (
+            f"policy mass must move from index {index} to {permuted}; "
+            f"got {m_policy[permuted].item()} vs {policy[index].item()}"
+        )
+        assert bool(m_mask[permuted].item()) == bool(mask[index].item()), (
+            f"mask bit must move from index {index} to {permuted}"
+        )
+
+    # --- Invariant 3: future map column flip, own/opp channels preserved ---
+    # own pawn (3, 4) -> (3, 4 mirrored col = last-4 = 4) -- so own row stays in row 3, col 4 -> col 4 (centered)
+    assert m_future[0, 3, last - 4].item() == 1.0, "future-map own pawn must be column-flipped"
+    # opp pawn (5, 1) -> (5, last-1 = 7) in channel 1
+    assert m_future[1, 5, last - 1].item() == 1.0, "future-map opp pawn must be column-flipped"
+    assert m_future[0, 5, 1].item() == 0.0
+    assert m_future[1, 3, 4].item() == 0.0
+
+    # --- Invariant 4: scalar targets invariant ---
+    assert m_value.item() == sample[3].item()
+    assert m_lead.item() == sample[4].item()
+    assert m_lead_mask.item() == sample[5].item()
+    assert m_future_mask.item() == sample[7].item()
+    assert m_score.item() == sample[8].item()
+    assert m_score_mask.item() == sample[9].item()
+
+    # --- Invariant 5: applying the mirror twice returns the original ---
+    for original_tensor, twice_tensor in zip(sample, twice):
+        assert torch.equal(original_tensor, twice_tensor), (
+            "double-mirror must be identity (the permutation is an involution)"
+        )
+
+    print(
+        "[selftest] LR-mirror augmentation invariants verified: "
+        f"{len(test_indices)} action slots, "
+        f"{BASE_PLANES_PER_POSITION} plane channels, "
+        "future map, and all scalar targets."
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Barricade AlphaZero training pipeline"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Standalone maintenance / verification entry points. Listed on the
+    # top-level parser so they bypass the subcommand requirement and run
+    # without any of the regular pipeline wiring.
+    parser.add_argument(
+        "--selftest-augment",
+        action="store_true",
+        help=(
+            "Run the LR-mirror augmentation selftest and exit. Asserts the "
+            "geometric invariants of the augmentation on synthetic samples."
+        ),
+    )
 
     def add_network_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("--history-length", type=int, default=4)
@@ -2633,6 +2900,9 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--grad-clip", type=float, default=1.0)
     train.add_argument("--weight-decay", type=float, default=1e-4)
     train.add_argument("--seed", type=int, default=1)
+    train.add_argument("--mirror-augment", action="store_true")
+    train.add_argument("--mirror-augment-p", type=float, default=0.5)
+    train.add_argument("--mirror-augment-seed", type=int, default=0)
 
     # --- eval ---
     eval_parser = subparsers.add_parser("eval")
@@ -2681,6 +2951,9 @@ def parse_args() -> argparse.Namespace:
     loop.add_argument("--score-loss-weight", type=float, default=0.01)
     loop.add_argument("--grad-clip", type=float, default=1.0)
     loop.add_argument("--weight-decay", type=float, default=1e-4)
+    loop.add_argument("--mirror-augment", action="store_true")
+    loop.add_argument("--mirror-augment-p", type=float, default=0.5)
+    loop.add_argument("--mirror-augment-seed", type=int, default=0)
     loop.add_argument("--eval-games", type=int, default=10)
     loop.add_argument("--eval-simulations", type=int, default=64)
     loop.add_argument(
@@ -2712,6 +2985,11 @@ def network_config_from_args(args: argparse.Namespace) -> NetworkConfig:
 
 
 def main() -> None:
+    # The selftest is a top-level maintenance entry point that runs before
+    # any pipeline wiring (no subcommand, no model, no replay loading).
+    if "--selftest-augment" in sys.argv:
+        _selftest_lr_mirror_augment()
+        return
     args = parse_args()
     if args.command in {"train", "loop"}:
         _start_train_log_capture()
@@ -2791,6 +3069,9 @@ def main() -> None:
             grad_clip=args.grad_clip,
             weight_decay=args.weight_decay,
             seed=args.seed,
+            mirror_augment=args.mirror_augment,
+            mirror_augment_p=args.mirror_augment_p,
+            mirror_augment_seed=args.mirror_augment_seed,
         )
         train_from_replay(
             model,
@@ -2873,6 +3154,9 @@ def main() -> None:
             grad_clip=args.grad_clip,
             weight_decay=args.weight_decay,
             seed=args.seed,
+            mirror_augment=args.mirror_augment,
+            mirror_augment_p=args.mirror_augment_p,
+            mirror_augment_seed=args.mirror_augment_seed,
         )
         eval_config = EvalConfig(
             games=args.eval_games,
