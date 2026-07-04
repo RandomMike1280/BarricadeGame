@@ -8,7 +8,7 @@ if it's advancing towards the last row.
 
 import torch
 from torch import Tensor
-from typing import Tuple
+from typing import Tuple, Dict
 
 from barricade_env import (
     BOARD_SIZE,
@@ -23,6 +23,12 @@ MOVE_ACTIONS = 4
 WALL_ACTIONS_PER_ORIENTATION = WALL_BOARD_SIZE * WALL_BOARD_SIZE
 HORIZONTAL_WALL_OFFSET = MOVE_ACTIONS
 VERTICAL_WALL_OFFSET = HORIZONTAL_WALL_OFFSET + WALL_ACTIONS_PER_ORIENTATION
+
+# Per-device cached permutation tensor. Without this, every call to
+# ``canonicalize_action_vector`` would allocate a fresh long tensor via
+# ``torch.as_tensor``. On post-Alder Lake CPUs this matters when batched
+# training samples each touch a freshly-cloned policy vector.
+_CANONICAL_FLIP_PERM_CACHE: Dict[torch.device, Tensor] = {}
 
 def _build_canonical_flip_permutation() -> Tuple[int, ...]:
     """Action permutation applied when the side-to-move is BLUE.
@@ -65,7 +71,13 @@ def canonicalize_action_vector(vector: Tensor, player: Player) -> Tensor:
     """Reindex a per-action vector (policy target / mask) into canonical frame."""
     if player == Player.RED:
         return vector
-    index = torch.as_tensor(CANONICAL_FLIP_PERMUTATION, dtype=torch.long, device=vector.device)
+    device = vector.device
+    cached_index = _CANONICAL_FLIP_PERM_CACHE.get(device)
+    if cached_index is None:
+        cached_index = torch.as_tensor(
+            CANONICAL_FLIP_PERMUTATION, dtype=torch.long, device=device
+        )
+        _CANONICAL_FLIP_PERM_CACHE[device] = cached_index
     canonical = torch.empty_like(vector)
-    canonical[index] = vector
+    canonical[cached_index] = vector
     return canonical

@@ -15,6 +15,7 @@ from barricade_env import (
     MoveDirection,
     Player,
     WallOrientation,
+    decode_action,
 )
 from mcts import MCTS, MCTSConfig
 from mini_bench import (
@@ -307,6 +308,24 @@ class MCTSTests(unittest.TestCase):
             state.apply_action(DIAGONAL_HOP_OFFSET + 2).pawns[Player.RED],
             (5, 3),
         )
+
+    def test_apply_move_rejects_move_onto_opponent(self) -> None:
+        state = BarricadeState(
+            red_start=(4, 4),
+            blue_start=(5, 4),
+            red_walls=0,
+            blue_walls=0,
+            starting_player=Player.RED,
+        )
+
+        self.assertEqual(decode_action(MoveDirection.DOWN.value), ("move", MoveDirection.DOWN))
+
+        with self.assertRaises(ValueError):
+            state.apply_move(decode_action(MoveDirection.DOWN.value))
+
+        next_state = state.apply_action(MoveDirection.DOWN.value)
+        self.assertEqual(next_state.pawns[Player.RED], (6, 4))
+        self.assertEqual(next_state.pawns[Player.BLUE], (5, 4))
 
     def test_side_hop_requires_unblocked_side_edge(self) -> None:
         state = BarricadeState(

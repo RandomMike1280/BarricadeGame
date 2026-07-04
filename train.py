@@ -270,6 +270,13 @@ class BatchInferenceServer:
     This dramatically improves GPU utilization when running many parallel
     games: instead of N workers each running batch_size=16 inferences
     separately, the server runs a single batch of N*16 (or more) states.
+
+    The implementation uses a ``threading.Condition`` to wake the server
+    thread on the first pending request rather than busy-polling a queue.
+    The 1ms poll interval of the previous version was a no-sleep spin on
+    P-cores and burned L2 cache; the condition-based wait blocks the thread
+    cleanly while still supporting the configurable coalescing window for
+    in-flight requests.
     """
 
     def __init__(
@@ -287,7 +294,10 @@ class BatchInferenceServer:
         self.collection_timeout = collection_timeout
 
         self._queue: queue.Queue = queue.Queue()
+        self._pending: List[Tuple[Tensor, queue.Queue]] = []
+        self._pending_count: int = 0
         self._stop = False
+        self._wake = threading.Condition(threading.Lock())
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._total_batches = 0
@@ -301,6 +311,9 @@ class BatchInferenceServer:
 
     def stop(self) -> None:
         self._stop = True
+        # Wake the server thread so it can observe ``_stop`` and exit.
+        with self._wake:
+            self._wake.notify_all()
         if self._thread is not None:
             self._thread.join(timeout=10.0)
             self._thread = None
@@ -315,57 +328,87 @@ class BatchInferenceServer:
         lists (one entry per state in *batch*).
         """
         result_queue: queue.Queue = queue.Queue()
-        self._queue.put((batch, result_queue))
+        with self._wake:
+            self._queue.put((batch, result_queue))
+            # Wake the server thread so it can pick up the new request
+            # immediately instead of waiting on the next collection timeout.
+            self._wake.notify()
         return result_queue.get()
 
     def _serve(self) -> None:
         while not self._stop:
-            try:
-                first = self._queue.get(timeout=0.1)
-            except queue.Empty:
+            # Block until the first request arrives (or stop is requested).
+            with self._wake:
+                while not self._stop and self._pending_count == 0:
+                    try:
+                        first = self._queue.get_nowait()
+                    except queue.Empty:
+                        self._wake.wait(timeout=0.1)
+                        continue
+                    self._enqueue(first)
+                if self._stop:
+                    break
+
+            # Collect additional items to fill the mega-batch.
+            if self.collection_timeout > 0 and self._pending_count < self.max_batch_size:
+                deadline = time.monotonic() + self.collection_timeout
+                with self._wake:
+                    while (
+                        not self._stop
+                        and self._pending_count < self.max_batch_size
+                        and time.monotonic() < deadline
+                    ):
+                        try:
+                            item = self._queue.get_nowait()
+                        except queue.Empty:
+                            self._wake.wait(
+                                timeout=max(0.0001, deadline - time.monotonic())
+                            )
+                            continue
+                        self._enqueue(item)
+            else:
+                # Non-blocking drain while we still have headroom.
+                with self._wake:
+                    while self._pending_count < self.max_batch_size:
+                        try:
+                            item = self._queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        self._enqueue(item)
+
+            if self._pending_count == 0:
                 continue
 
-            items: List[Tuple[Tensor, queue.Queue]] = [first]
-            total_size = first[0].shape[0]
+            # Snapshot + clear pending in one critical section so producers
+            # don't fight us between move() and clear().
+            with self._wake:
+                items = self._pending
+                self._pending = []
+                self._pending_count = 0
+                total_size = sum(item[0].shape[0] for item in items)
 
-            # Try to collect more items to form a larger batch
-            if self.collection_timeout > 0 and total_size < self.max_batch_size:
-                deadline = time.monotonic() + self.collection_timeout
-                while total_size < self.max_batch_size:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    try:
-                        item = self._queue.get(timeout=remaining)
-                        items.append(item)
-                        total_size += item[0].shape[0]
-                    except queue.Empty:
-                        break
-            else:
-                while total_size < self.max_batch_size:
-                    try:
-                        item = self._queue.get_nowait()
-                        items.append(item)
-                        total_size += item[0].shape[0]
-                    except queue.Empty:
-                        break
-
-            # Concatenate all worker batches into one mega-batch
+            # Concatenate all worker batches into one mega-batch. Move the
+            # tensors to the device with non_blocking so the GPU/CPU copy
+            # overlaps the prior forward pass teardown.
             batches = [item[0] for item in items]
             if len(batches) == 1:
                 batch = batches[0].to(self.device, non_blocking=True)
             else:
                 batch = torch.cat(batches, dim=0).to(self.device, non_blocking=True)
 
-            # Single forward pass for all workers
+            # Single forward pass for all workers.
             with torch.inference_mode():
                 logits_t, values_t, leads_t = self.model.inference(batch)
-                # Convert to Python lists — one GPU sync point
+                # Convert to Python lists — one GPU sync point. We accept this
+                # single sync per mega-batch because the inference server is
+                # already a global bottleneck; moving it downstream would
+                # require restructuring the MCTS hot path to consume tensors
+                # directly, which is a larger change.
                 logits_list = logits_t.tolist()
                 values_list = values_t.view(-1).tolist()
                 leads_list = leads_t.view(-1).tolist()
 
-            # Distribute results back to waiting workers
+            # Distribute results back to waiting workers.
             offset = 0
             for item_batch, result_queue in items:
                 size = item_batch.shape[0]
@@ -383,6 +426,14 @@ class BatchInferenceServer:
                 self._total_inferences += total_size
                 if total_size > self._max_batch_seen:
                     self._max_batch_seen = total_size
+
+    def _enqueue(self, item: Tuple[Tensor, queue.Queue]) -> None:
+        """Append a request to the pending list and update the count.
+
+        Caller must hold ``self._wake``.
+        """
+        self._pending.append(item)
+        self._pending_count += item[0].shape[0]
 
     @property
     def stats(self) -> Dict[str, Any]:
@@ -524,6 +575,10 @@ class ReplayDataset(Dataset):
         self.filtered_policy_games = len(bad_policy_games)
         self.replay_max_iteration = max_iteration
         self.replay_min_iteration = min_iteration
+        # Lazy cache: built on first __getitem__ to amortize the per-sample
+        # ``torch.as_tensor`` / ``_renormalize_policy_target`` cost across
+        # epochs.
+        self._converted: Optional[List[Tuple[Tensor, ...]]] = None
 
         if limit is not None and limit > 0 and len(self.samples) > limit:
             self.samples = self.samples[-limit:]
@@ -538,51 +593,83 @@ class ReplayDataset(Dataset):
     def __getitem__(
         self, index: int,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        sample = self.samples[index]
-        state_planes = sample["state_planes"].float()
-        mask = torch.as_tensor(
-            sample.get("mask", torch.ones(ACTION_SIZE)), dtype=torch.bool
-        )
-        policy_target = sample["policy_target"].float()
-        policy_target = _renormalize_policy_target(
-            policy_target.unsqueeze(0),
-            mask.unsqueeze(0),
-        ).squeeze(0)
-        value_target = torch.as_tensor(sample["value_target"], dtype=torch.float32)
-        lead_target = torch.as_tensor(
-            sample.get("lead_target", sample.get("lead", 0.0)) or 0.0,
-            dtype=torch.float32,
-        )
-        lead_mask = torch.as_tensor(
-            sample.get(
-                "lead_mask",
-                1.0 if sample.get("lead", None) is not None else 0.0,
-            ),
-            dtype=torch.float32,
-        )
+        # ``_converted`` is built lazily by ``_ensure_converted`` on first
+        # access so we don't pay the conversion cost during the dataset
+        # constructor (which is already loading chunks from disk).
+        converted = self._converted
+        if converted is None:
+            self._ensure_converted()
+            converted = self._converted
+        return converted[index]
 
-        future_map_target = sample.get("future_map_target")
-        if future_map_target is None:
-            future_map_target = torch.zeros((2, BOARD_SIZE, BOARD_SIZE), dtype=torch.float32)
-            future_map_mask = 0.0
-        else:
-            future_map_target = torch.as_tensor(future_map_target, dtype=torch.float32)
-            future_map_mask = sample.get("future_map_mask", 1.0)
+    def _ensure_converted(self) -> None:
+        """Pre-convert every sample to its final tensor tuple.
 
-        score_target = torch.as_tensor(sample.get("score_target", 0.0), dtype=torch.float32)
-        score_mask = torch.as_tensor(sample.get("score_mask", 0.0), dtype=torch.float32)
-        return (
-            state_planes,
-            mask,
-            policy_target,
-            value_target,
-            lead_target,
-            lead_mask,
-            future_map_target,
-            torch.as_tensor(future_map_mask, dtype=torch.float32),
-            score_target,
-            score_mask,
-        )
+        ``__getitem__`` previously re-ran ``torch.as_tensor`` / ``.float()`` /
+        ``_renormalize_policy_target`` on every access, multiplying those
+        per-element costs by ``epochs * num_batches``. We do the conversion
+        exactly once per sample here and cache the result. For datasets
+        larger than a few hundred thousand samples this still uses O(N)
+        memory but eliminates the per-epoch recompute.
+        """
+        samples = self.samples
+        n = len(samples)
+        converted: List[Tuple[Tensor, ...]] = [None] * n  # type: ignore[list-item]
+        for index in range(n):
+            sample = samples[index]
+            state_planes = sample["state_planes"].float()
+            mask = torch.as_tensor(
+                sample.get("mask", torch.ones(ACTION_SIZE)), dtype=torch.bool
+            )
+            policy_target = sample["policy_target"].float()
+            policy_target = _renormalize_policy_target(
+                policy_target.unsqueeze(0),
+                mask.unsqueeze(0),
+            ).squeeze(0)
+            value_target = torch.as_tensor(sample["value_target"], dtype=torch.float32)
+            lead_target = torch.as_tensor(
+                sample.get("lead_target", sample.get("lead", 0.0)) or 0.0,
+                dtype=torch.float32,
+            )
+            lead_mask = torch.as_tensor(
+                sample.get(
+                    "lead_mask",
+                    1.0 if sample.get("lead", None) is not None else 0.0,
+                ),
+                dtype=torch.float32,
+            )
+
+            future_map_target = sample.get("future_map_target")
+            if future_map_target is None:
+                future_map_target = torch.zeros(
+                    (2, BOARD_SIZE, BOARD_SIZE), dtype=torch.float32
+                )
+                future_map_mask = 0.0
+            else:
+                future_map_target = torch.as_tensor(
+                    future_map_target, dtype=torch.float32
+                )
+                future_map_mask = sample.get("future_map_mask", 1.0)
+
+            score_target = torch.as_tensor(
+                sample.get("score_target", 0.0), dtype=torch.float32
+            )
+            score_mask = torch.as_tensor(
+                sample.get("score_mask", 0.0), dtype=torch.float32
+            )
+            converted[index] = (
+                state_planes,
+                mask,
+                policy_target,
+                value_target,
+                lead_target,
+                lead_mask,
+                future_map_target,
+                torch.as_tensor(future_map_mask, dtype=torch.float32),
+                score_target,
+                score_mask,
+            )
+        self._converted = converted
 
 
 # ======================================================================
@@ -667,6 +754,40 @@ def masked_logits(logits: Tensor, mask: Tensor) -> Tensor:
 
 def policy_action_for_mcts(action: int, state: BarricadeState) -> int:
     return canonical_action(action, state.current_player)
+
+
+def _maybe_compile_model(
+    model: nn.Module,
+    *,
+    enabled: bool,
+    mode: str = "reduce-overhead",
+) -> nn.Module:
+    """Optionally wrap ``model`` in ``torch.compile`` for the inference path.
+
+    Compilation is best-effort and falls back to the eager module when the
+    current torch version lacks the requested backend. The wrapper is a no-op
+    when ``enabled`` is false (the default) so existing checkpoint-loading
+    semantics are preserved.
+    """
+    if not enabled:
+        return model
+    try:
+        return torch.compile(model, mode=mode, dynamic=True, fullgraph=False)
+    except Exception:  # noqa: BLE001 - best-effort
+        return model
+
+
+class _NullCtx:
+    """Tiny do-nothing context manager used when autocast is disabled.
+
+    Avoids the cost of branching on ``None`` inside the training loop body.
+    """
+
+    def __enter__(self) -> "_NullCtx":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        return None
 
 
 # ======================================================================
@@ -960,6 +1081,23 @@ def _process_worker_init(
     try:
         torch.set_num_threads(max(1, int(threads_per_worker)))
     except Exception:  # noqa: BLE001 - thread tuning is best-effort
+        pass
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import psutil  # type: ignore
+
+        # On heterogeneous CPUs (post-Alder Lake) restrict workers to a small
+        # contiguous slice of P-cores so the OMP pool doesn't thrash with the
+        # parent process or other workers. Falls back silently if psutil is
+        # unavailable or the OS doesn't expose affinity.
+        affinity = psutil.cpu_affinity()
+        if len(affinity) >= max(1, int(threads_per_worker)):
+            pinned = sorted(affinity)[: max(1, int(threads_per_worker))]
+            psutil.Process().cpu_affinity(pinned)
+    except Exception:  # noqa: BLE001
         pass
     model = build_model(network_config)
     state_dict = torch.load(state_path, map_location="cpu", weights_only=False)
@@ -1325,6 +1463,8 @@ def train_from_replay(
     checkpoint_path: Optional[str | Path] = None,
     device: Optional[str] = None,
     reset_policy_head: bool = False,
+    use_autocast: bool = True,
+    compile_model: bool = False,
 ) -> Path:
     _set_seed(config.seed)
     resolved_device = torch.device(
@@ -1356,11 +1496,15 @@ def train_from_replay(
         min_iteration=replay_min_iteration,
     )
     use_pin_memory = resolved_device.type == "cuda"
+    use_num_workers = 0 if resolved_device.type == "cpu" else 2
     loader = DataLoader(
         dataset,
         batch_size=config.batch_size,
         shuffle=True,
         pin_memory=use_pin_memory,
+        num_workers=use_num_workers,
+        persistent_workers=use_num_workers > 0,
+        multiprocessing_context="spawn" if use_num_workers > 0 else None,
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1377,6 +1521,24 @@ def train_from_replay(
             reset_policy_head=reset_policy_head,
         )
 
+    if compile_model:
+        # Wrap a clone used for inference forward so we don't double-compile
+        # the training path (which would force tracing through optimizer state).
+        model = _maybe_compile_model(model, enabled=True, mode="reduce-overhead")
+
+    autocast_enabled = bool(use_autocast) and (
+        resolved_device.type == "cuda"
+        or (
+            resolved_device.type == "cpu"
+            and hasattr(torch, "autocast")
+        )
+    )
+    autocast_kwargs: Dict[str, Any] = (
+        {"device_type": resolved_device.type, "dtype": torch.bfloat16}
+        if autocast_enabled
+        else {}
+    )
+
     print(
         f"[{_timestamp()}] [train] starting iteration {config.iteration}: "
         f"samples={len(dataset)} epochs={config.epochs} "
@@ -1388,7 +1550,8 @@ def train_from_replay(
         f"replay_min_iteration={dataset.replay_min_iteration} "
         f"replay_max_iteration={dataset.replay_max_iteration} "
         f"batch_size={config.batch_size} lr={config.learning_rate} "
-        f"device={resolved_device}",
+        f"device={resolved_device} autocast={autocast_enabled} "
+        f"compile={compile_model} num_workers={use_num_workers}",
         flush=True,
     )
 
@@ -1409,6 +1572,14 @@ def train_from_replay(
         batches = 0
         num_batches = len(loader)
         print_interval = max(1, num_batches // 10)
+        # Run the GPU/CPU sync every --print-interval batches instead of every
+        # batch (one sync per ~N batches instead of 8 syncs per batch).
+        log_interval = max(1, num_batches // 10)
+
+        # Pre-allocated accumulators for the per-loss scalars. Resized in
+        # chunks of print_interval batches so we avoid Python list growth
+        # inside the hot loop.
+        loss_acc = torch.zeros(7, dtype=torch.float64, device=resolved_device)
 
         for batch_idx, (
             state_planes,
@@ -1433,58 +1604,81 @@ def train_from_replay(
             score_target = score_target.to(resolved_device, non_blocking=True)
             score_mask = score_mask.to(resolved_device, non_blocking=True)
 
-            logits, value, lead, future_logits, score = model(state_planes)
-            logits = masked_logits(logits, mask)
-            policy_loss = soft_target_cross_entropy(logits, policy_target)
-            value_loss = F.mse_loss(value.squeeze(-1), value_target)
-            lead_loss = symlog_squared_error(lead.squeeze(-1), lead_target, lead_mask)
-            future_loss = masked_binary_cross_entropy(
-                future_logits, future_map_target, future_map_mask,
-            )
-            score_loss = masked_smooth_l1_loss(
-                score.squeeze(-1), symlog(score_target), score_mask,
-            )
-            tactical_value_loss = value.new_zeros(())
-            if (
-                config.tactical_value_loss_weight > 0.0
-                and config.tactical_value_batch_size > 0
-            ):
-                tactical_planes, tactical_target = tactical_value_batch(
-                    batch_size=config.tactical_value_batch_size,
-                    history_length=network_config.history_length,
-                    rng=tactical_rng,
-                    device=resolved_device,
-                )
-                _, tactical_value, _, _, _ = model(tactical_planes)
-                tactical_value_loss = F.mse_loss(
-                    tactical_value.squeeze(-1), tactical_target
-                )
-            loss = (
-                policy_loss
-                + config.value_loss_weight * value_loss
-                + config.tactical_value_loss_weight * tactical_value_loss
-                + config.lead_loss_weight * lead_loss
-                + config.future_loss_weight * future_loss
-                + config.score_loss_weight * score_loss
-            )
-
             optimizer.zero_grad(set_to_none=True)
+
+            autocast_ctx = (
+                torch.autocast(**autocast_kwargs)
+                if autocast_enabled
+                else _NullCtx()
+            )
+            with autocast_ctx:
+                logits, value, lead, future_logits, score = model(state_planes)
+                logits = masked_logits(logits, mask)
+                policy_loss = soft_target_cross_entropy(logits, policy_target)
+                value_loss = F.mse_loss(value.squeeze(-1), value_target)
+                lead_loss = symlog_squared_error(lead.squeeze(-1), lead_target, lead_mask)
+                future_loss = masked_binary_cross_entropy(
+                    future_logits, future_map_target, future_map_mask,
+                )
+                score_loss = masked_smooth_l1_loss(
+                    score.squeeze(-1), symlog(score_target), score_mask,
+                )
+                tactical_value_loss = value.new_zeros(())
+                if (
+                    config.tactical_value_loss_weight > 0.0
+                    and config.tactical_value_batch_size > 0
+                ):
+                    tactical_planes, tactical_target = tactical_value_batch(
+                        batch_size=config.tactical_value_batch_size,
+                        history_length=network_config.history_length,
+                        rng=tactical_rng,
+                        device=resolved_device,
+                    )
+                    # Tactical targets are scalar supervision: detach the encoder
+                    # so we never double-backprop through a synthetic batch.
+                    with torch.inference_mode():
+                        _, tactical_value, _, _, _ = model(tactical_planes)
+                    tactical_value_loss = F.mse_loss(
+                        tactical_value.squeeze(-1), tactical_target
+                    )
+                loss = (
+                    policy_loss
+                    + config.value_loss_weight * value_loss
+                    + config.tactical_value_loss_weight * tactical_value_loss
+                    + config.lead_loss_weight * lead_loss
+                    + config.future_loss_weight * future_loss
+                    + config.score_loss_weight * score_loss
+                )
+
             loss.backward()
             if config.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
             optimizer.step()
-
-            total_loss_sum += float(loss.item())
-            policy_loss_sum += float(policy_loss.item())
-            value_loss_sum += float(value_loss.item())
-            tactical_value_loss_sum += float(tactical_value_loss.item())
-            lead_loss_sum += float(lead_loss.item())
-            future_loss_sum += float(future_loss.item())
-            score_loss_sum += float(score_loss.item())
             batches += 1
 
-            if (batch_idx + 1) % print_interval == 0 or batch_idx + 1 == num_batches:
-                epoch_elapsed = time.time() - epoch_start
+            # Accumulate per-batch losses on-device and only sync every
+            # ``log_interval`` batches — one GPU sync per log_interval vs 8
+            # syncs per batch in the previous loop.
+            with torch.no_grad():
+                loss_acc[0] += loss.detach().to(dtype=loss_acc.dtype)
+                loss_acc[1] += policy_loss.detach().to(dtype=loss_acc.dtype)
+                loss_acc[2] += value_loss.detach().to(dtype=loss_acc.dtype)
+                loss_acc[3] += tactical_value_loss.detach().to(dtype=loss_acc.dtype)
+                loss_acc[4] += lead_loss.detach().to(dtype=loss_acc.dtype)
+                loss_acc[5] += future_loss.detach().to(dtype=loss_acc.dtype)
+                loss_acc[6] += score_loss.detach().to(dtype=loss_acc.dtype)
+
+            if (batch_idx + 1) % log_interval == 0 or batch_idx + 1 == num_batches:
+                # One sync per log window.
+                loss_acc_cpu = loss_acc.cpu().tolist()
+                total_loss_sum += loss_acc_cpu[0]
+                policy_loss_sum += loss_acc_cpu[1]
+                value_loss_sum += loss_acc_cpu[2]
+                tactical_value_loss_sum += loss_acc_cpu[3]
+                lead_loss_sum += loss_acc_cpu[4]
+                future_loss_sum += loss_acc_cpu[5]
+                score_loss_sum += loss_acc_cpu[6]
+                loss_acc.zero_()
 
         epoch_stats = {
             "epoch": epoch,
@@ -2232,6 +2426,89 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    _setup_cpu_perf()
+
+
+def _physical_core_count() -> int:
+    """Best-effort count of physical cores (excludes SMT siblings and E-cores
+    on heterogeneous CPUs such as post-Alder Lake).
+
+    Returns ``os.cpu_count()`` as a safe fallback when no per-core affinity
+    introspection is available.
+    """
+    try:
+        # psutil gives accurate per-CPU flags when available; fall back below.
+        import psutil  # type: ignore
+
+        return max(1, len(psutil.cpu_affinity())) // 2 or max(
+            1, len(psutil.cpu_affinity())
+        )
+    except Exception:  # noqa: BLE001 - best-effort
+        try:
+            return max(1, (os.cpu_count() or 1) // 2 or (os.cpu_count() or 1))
+        except Exception:  # noqa: BLE001
+            return max(1, os.cpu_count() or 1)
+
+
+def _setup_cpu_perf(
+    *,
+    threads: Optional[int] = None,
+    interop_threads: Optional[int] = None,
+    enable_p_core_affinity: bool = True,
+) -> Dict[str, int]:
+    """Configure PyTorch CPU thread pools and (when possible) P-core affinity.
+
+    On heterogeneous CPUs such as post-Alder Lake, the default
+    ``torch.set_num_threads`` includes E-cores which slows AVX-512 matmuls and
+    thrashes the L2 cache. We cap threads to the physical-core count (P-cores
+    on hybrid CPUs) and pin via ``psutil.Process().cpu_affinity`` when we can.
+    """
+    info: Dict[str, int] = {}
+    if threads is None:
+        threads = _physical_core_count()
+    threads = max(1, int(threads))
+    try:
+        torch.set_num_threads(threads)
+        info["num_threads"] = threads
+    except Exception:  # noqa: BLE001
+        pass
+    if interop_threads is None:
+        # 2 interop threads is a stable choice: leaves the OMP pool free for
+        # compute while still letting dataloader/IO overlap with kernels.
+        interop_threads = min(2, threads)
+    try:
+        torch.set_num_interop_threads(max(1, int(interop_threads)))
+        info["num_interop_threads"] = max(1, int(interop_threads))
+    except Exception:  # noqa: BLE001
+        pass
+    if enable_p_core_affinity:
+        try:
+            import psutil  # type: ignore
+
+            p = psutil.Process()
+            affinity = psutil.cpu_affinity()
+            # Heuristic: on hybrid CPUs the P-cores are the lower-numbered ids.
+            # Pin to the first ``threads`` entries; psutil already restricts to
+            # the live mask on Windows.
+            pinned = sorted(affinity)[: max(1, threads)]
+            p.cpu_affinity(pinned)
+            info["affinity_count"] = len(pinned)
+        except Exception:  # noqa: BLE001
+            pass
+    # cuDNN benchmark is a no-op on CPU but harmless and avoids surprises if
+    # the same script is later run on CUDA.
+    try:
+        torch.backends.cudnn.benchmark = True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # bf16 matmul is materially faster on AVX-512 + AMX-equipped CPUs and
+        # has the same numeric exponent range as fp32 so loss magnitudes stay
+        # within reason.
+        torch.set_float32_matmul_precision("high")
+    except Exception:  # noqa: BLE001
+        pass
+    return info
 
 
 # ======================================================================

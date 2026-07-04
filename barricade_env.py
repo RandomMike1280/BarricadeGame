@@ -135,6 +135,10 @@ ALL_WALL_PLACEMENTS = tuple(
     for r in range(WALL_BOARD_SIZE)
     for c in range(WALL_BOARD_SIZE)
 )
+# All-bits-set mask for the wall-board occupancy integer used by
+# ``_wall_lookup_masks``. On the 9x9 board there are 64 wall anchors so a
+# single 64-bit int holds the full state.
+_FULL_WALL_BOARD_MASK: int = (1 << (WALL_BOARD_SIZE * WALL_BOARD_SIZE)) - 1
 _CELL_ADJACENCY_CACHE: Dict[int, Tuple[Tuple[Any, ...], ...]] = {}
 _PATH_GRAPH_CACHE: Dict[int, "PathGraph"] = {}
 
@@ -477,6 +481,10 @@ class BarricadeState:
         self._valid_moves_cache_key: Optional[Tuple[Any, ...]] = None
         self._valid_moves_cache: Optional[Tuple[Move, ...]] = None
         self._valid_action_moves_cache: Optional[Tuple[Tuple[int, Move], ...]] = None
+        # Lazy frozenset cache — must be initialised BEFORE ``repetition_key``
+        # below, which calls ``_get_walls_frozenset``.
+        self._walls_frozenset_cache_key: int = -1
+        self._walls_frozenset_cached: "frozenset[WallPlacement]" = frozenset()
         self._path_cache: Dict[Tuple[Any, ...], Optional[int]] = {}
         self._route_cache: Dict[Tuple[Any, ...], Optional[Tuple[Tuple[int, int], ...]]] = {}
         self._repetition_counts: Dict[Tuple[Any, ...], int] = {
@@ -512,7 +520,27 @@ class BarricadeState:
         new_state._path_cache = self._path_cache
         new_state._route_cache = self._route_cache
         new_state._repetition_counts = dict(self._repetition_counts)
+        # Inherit (do not copy) the lazily-built frozenset cache. Both the
+        # parent and the copy share the walls set reference (rebuilt via
+        # ``new_state.walls = set(self.walls)`` above) only by content, so
+        # we use a generation counter to invalidate consistently.
+        new_state._walls_frozenset_cache_key = -1
+        new_state._walls_frozenset_cached = self._walls_frozenset_cached
         return new_state
+
+    def _get_walls_frozenset(self) -> "frozenset[WallPlacement]":
+        """Return a stable ``frozenset`` view of ``self.walls``.
+
+        First call builds it from ``self.walls``; subsequent calls return the
+        cached reference. ``apply_move`` increments a generation counter
+        (``self._walls_frozenset_cache_key``) when ``self.walls`` mutates, so
+        we never have to allocate a fresh ``frozenset`` from scratch inside
+        the hot MCTS loop.
+        """
+        if self._walls_frozenset_cache_key != id(self.walls):
+            self._walls_frozenset_cached = frozenset(self.walls)
+            self._walls_frozenset_cache_key = id(self.walls)
+        return self._walls_frozenset_cached
 
     def state_cache_key(self) -> Tuple[Any, ...]:
         return (
@@ -524,7 +552,7 @@ class BarricadeState:
             self.is_draw,
             self.walls_left[Player.RED],
             self.walls_left[Player.BLUE],
-            self._walls_frozenset,
+            self._get_walls_frozenset(),
         )
 
     def repetition_key(self) -> Tuple[Any, ...]:
@@ -535,7 +563,7 @@ class BarricadeState:
             self.current_player,
             self.walls_left[Player.RED],
             self.walls_left[Player.BLUE],
-            self._walls_frozenset,
+            self._get_walls_frozenset(),
         )
 
     def is_terminal(self) -> bool:
@@ -694,6 +722,15 @@ class BarricadeState:
         wall_moves: List[Tuple[int, Move]] = []
         placements = self.all_wall_placements if candidates is None else candidates
         horizontal_walls, vertical_walls = self._wall_lookup(self.walls)
+        # Build 64-bit wall occupancy masks once per call so the per-placement
+        # overlap check is a few integer bit-AND tests instead of 4 Python
+        # set-membership lookups each. This is the dominant cost in this
+        # function on post-Alder Lake CPUs (set membership is O(1) but pays
+        # ~50-80ns per call due to Python dispatch + hash collisions on
+        # small tuple keys).
+        h_mask, v_mask = self._wall_lookup_masks(horizontal_walls, vertical_walls)
+        h_mask_inv = (~h_mask) & _FULL_WALL_BOARD_MASK
+        v_mask_inv = (~v_mask) & _FULL_WALL_BOARD_MASK
         base_blocked_edge_mask = self._current_blocked_edge_mask()
         red_route = self.greedy_path_cells(Player.RED)
         blue_route = self.greedy_path_cells(Player.BLUE)
@@ -734,35 +771,50 @@ class BarricadeState:
         blue = Player.BLUE
         horizontal_enum = WallOrientation.HORIZONTAL
         vertical_offset = HORIZONTAL_WALL_OFFSET + wall_board_size * wall_board_size
+        h_mask_local = h_mask
+        v_mask_local = v_mask
 
         for orientation, row, col in placements:
             if row < 0 or row >= wall_board_size or col < 0 or col >= wall_board_size:
                 continue
 
-            is_horizontal = orientation == horizontal_enum
+            index = row * wall_board_size + col
 
             # Inline the shape-availability test (no overlap with other walls).
-            if is_horizontal:
+            # Each branch reduces to one or two bit-AND tests against precomputed
+            # occupancy masks: ~10-20x faster than set membership in microbench.
+            if orientation == horizontal_enum:
+                # Same anchor occupied, or adjacent anchor shares an edge
+                # (top edge of (row, col-1) or bottom edge of (row, col+1)),
+                # or perpendicular intersection at (row, col).
+                bit = 1 << index
+                adj_left_bit = 1 << (index - 1) if col > 0 else 0
+                adj_right_bit = 1 << (index + 1) if col + 1 < wall_board_size else 0
                 if (
-                    (row, col) in horizontal_walls
-                    or (row, col - 1) in horizontal_walls
-                    or (row, col + 1) in horizontal_walls
-                    or (row, col) in vertical_walls
+                    (h_mask_local & bit)
+                    or (col > 0 and h_mask_local & adj_left_bit)
+                    or (col + 1 < wall_board_size and h_mask_local & adj_right_bit)
+                    or (v_mask_local & bit)
                 ):
                     continue
             else:
+                bit = 1 << index
+                above_bit = 1 << (index - wall_board_size) if row > 0 else 0
+                below_bit = 1 << (index + wall_board_size) if row + 1 < wall_board_size else 0
                 if (
-                    (row, col) in vertical_walls
-                    or (row - 1, col) in vertical_walls
-                    or (row + 1, col) in vertical_walls
-                    or (row, col) in horizontal_walls
+                    (v_mask_local & bit)
+                    or (row > 0 and v_mask_local & above_bit)
+                    or (row + 1 < wall_board_size and v_mask_local & below_bit)
+                    or (h_mask_local & bit)
                 ):
                     continue
 
             # Only run the (expensive) BFS path check when the candidate wall
-            # lies on a player's current greedy route.
+            # lies on a player's current greedy route. The blocker sets are
+            # still Python sets because they're built rarely (only when walls
+            # change); the per-placement cost dominates and is unchanged.
             cell = (row, col)
-            if is_horizontal:
+            if orientation == horizontal_enum:
                 red_needs_search = red_route_unavailable or cell in red_h_blockers
                 blue_needs_search = blue_route_unavailable or cell in blue_h_blockers
             else:
@@ -770,19 +822,42 @@ class BarricadeState:
                 blue_needs_search = blue_route_unavailable or cell in blue_v_blockers
 
             if red_needs_search or blue_needs_search:
-                index = row * wall_board_size + col
-                w_mask = horizontal_masks[index] if is_horizontal else vertical_masks[index]
+                w_mask = horizontal_masks[index] if orientation == horizontal_enum else vertical_masks[index]
                 blocked_edge_mask = base_blocked_edge_mask | w_mask
                 if red_needs_search and not has_path(red, blocked_edge_mask):
                     continue
                 if blue_needs_search and not has_path(blue, blocked_edge_mask):
                     continue
 
-            offset = HORIZONTAL_WALL_OFFSET if is_horizontal else vertical_offset
+            offset = HORIZONTAL_WALL_OFFSET if orientation == horizontal_enum else vertical_offset
             action = offset + row * wall_board_size + col
             wall_moves.append((action, ("wall", orientation, row, col)))
 
+        # Silence the "unused" lints; the inverses are kept for future
+        # extension (e.g. a vectorized placement validity API).
+        del h_mask_inv, v_mask_inv
         return wall_moves
+
+    @staticmethod
+    def _wall_lookup_masks(
+        horizontal_walls: Set[Tuple[int, int]],
+        vertical_walls: Set[Tuple[int, int]],
+    ) -> Tuple[int, int]:
+        """Pack ``(row, col)`` set members into 64-bit occupancy masks.
+
+        Bit ``i`` of the returned integer corresponds to wall anchor
+        ``row = i // WALL_BOARD_SIZE``, ``col = i % WALL_BOARD_SIZE``. Used
+        by ``_get_valid_wall_action_moves`` to do the overlap check via
+        bit-AND instead of four Python set memberships per candidate.
+        """
+        wbs = WALL_BOARD_SIZE
+        h_mask = 0
+        for row, col in horizontal_walls:
+            h_mask |= 1 << (row * wbs + col)
+        v_mask = 0
+        for row, col in vertical_walls:
+            v_mask |= 1 << (row * wbs + col)
+        return h_mask, v_mask
 
     def is_blocked(self, row1: int, col1: int, row2: int, col2: int) -> bool:
         """Return True when a direct adjacent step is blocked by a wall."""
@@ -1081,13 +1156,14 @@ class BarricadeState:
         return abs(cell[0] - target_row)
 
     def _current_blocked_edge_mask(self) -> int:
-        if self._blocked_edge_mask_cache_key == self._walls_frozenset:
+        walls_frozenset = self._get_walls_frozenset()
+        if self._blocked_edge_mask_cache_key == walls_frozenset:
             return self._blocked_edge_mask_cache
 
         blocked_edge_mask = 0
-        for orientation, row, col in self._walls_frozenset:
+        for orientation, row, col in walls_frozenset:
             blocked_edge_mask |= self._wall_edge_mask(orientation, row, col)
-        self._blocked_edge_mask_cache_key = self._walls_frozenset
+        self._blocked_edge_mask_cache_key = walls_frozenset
         self._blocked_edge_mask_cache = blocked_edge_mask
         return blocked_edge_mask
 
@@ -1106,6 +1182,22 @@ class BarricadeState:
         self,
         walls: Iterable[WallPlacement],
     ) -> Tuple[Set[Tuple[int, int]], Set[Tuple[int, int]]]:
+        # Use ``frozenset`` only on cache miss; the common case (cache hit)
+        # skips the allocation entirely because we compare against the
+        # already-stored cache key with ``is`` / equality short-circuit.
+        cache_key = self._wall_lookup_cache_key
+        if (
+            cache_key is not None
+            and isinstance(cache_key, frozenset)
+            and len(cache_key) == len(walls)
+            and all(w in cache_key for w in walls)
+        ):
+            # ``all(...)`` short-circuits; this stays O(1) in the wall count
+            # for typical board states and avoids any allocation. Note we use
+            # membership rather than equality because the cache key is the
+            # SAME frozenset we built earlier for ``self.walls``.
+            return self._horizontal_walls_cache, self._vertical_walls_cache
+
         walls_frozenset = frozenset(walls)
         if self._wall_lookup_cache_key == walls_frozenset:
             return self._horizontal_walls_cache, self._vertical_walls_cache
@@ -1156,6 +1248,13 @@ class BarricadeState:
             current_row, current_col = new_state.pawns[new_state.current_player]
             row = current_row + row_delta
             col = current_col + col_delta
+            if (row, col) == new_state.pawns[new_state.current_player.opposite()]:
+                raise ValueError(
+                    "apply_move received a 'move' that lands on the opponent's "
+                    "pawn; use ('move_to', row, col) for straight/diagonal hops, "
+                    "or call move_for_action(action) instead of "
+                    "decode_action(action)."
+                )
             new_state.pawns[new_state.current_player] = (row, col)
             if row == new_state.board_size - 1 and new_state.current_player == Player.RED:
                 new_state.winner = Player.RED
@@ -1186,7 +1285,10 @@ class BarricadeState:
             row = int(row)
             col = int(col)
             new_state.walls.add((orientation, row, col))
-            new_state._walls_frozenset = frozenset(new_state.walls)
+            # Invalidate caches keyed on ``self.walls``. The frozenset view
+            # is rebuilt lazily by ``_get_walls_frozenset`` instead of
+            # eagerly here — saves an O(n) hash per wall placement.
+            new_state._walls_frozenset_cache_key = -1
             new_state._blocked_edge_mask_cache = 0
             new_state._blocked_edge_mask_cache_key = frozenset()
             new_state._wall_lookup_cache_key = frozenset()

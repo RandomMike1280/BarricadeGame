@@ -240,8 +240,7 @@ def new_game():
         result = mcts.search(game_state)
         ai_action = mcts.select_action(result, temperature=current_mcts_config.action_temperature)
         game_history.append(game_state.copy())
-        ai_move = game_state.decode_action(ai_action)
-        game_state = game_state.apply_move(ai_move)
+        game_state = game_state.apply_action(ai_action, validate=False)
         mcts_root = mcts.advance_root(result.root, ai_action)
         ai_first_move = {
             "action": int(ai_action),
@@ -286,8 +285,7 @@ def make_move():
 
     # Apply human move
     game_history.append(game_state.copy())
-    move = game_state.decode_action(action)
-    game_state = game_state.apply_move(move)
+    game_state = game_state.apply_action(action, validate=False)
 
     if game_state.is_terminal():
         mcts_root = None
@@ -315,8 +313,7 @@ def make_move():
 
     # Apply AI move
     game_history.append(game_state.copy())
-    ai_move = game_state.decode_action(ai_action)
-    game_state = game_state.apply_move(ai_move)
+    game_state = game_state.apply_action(ai_action, validate=False)
 
     # Advance MCTS root for the AI move (root is now at the state after AI's move)
     mcts_root = mcts.advance_root(result.root, ai_action)
@@ -374,7 +371,7 @@ def evaluate():
         action = int(action)
         if action not in set(game_state.legal_actions()):
             return jsonify({"error": f"Illegal action {action}"}), 400
-        eval_state = game_state.apply_move(game_state.decode_action(action))
+        eval_state = game_state.apply_action(action, validate=False)
         eval_history = game_history + [game_state]
     else:
         eval_state = game_state
