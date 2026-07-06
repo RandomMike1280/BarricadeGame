@@ -1,0 +1,12 @@
+---
+description: Core code-quality principles: prioritize readability, favor compiler-verified logic, and practice defensive programming.
+alwaysApply: true
+---
+
+# Code Quality Principles
+
+**Prioritize Readability:** Keeping functions small makes code easier to audit, even if you don't hit the exact 60-line limit.
+
+**Favor the Compiler:** As noted by developers, if you can write code that the compiler can verify (avoiding ambiguous logic), do it! Using modern static analysis tools can catch bugs before they reach production.
+
+**Defensive Programming:** The practice of checking all return values and being explicit about your intent is a great habit for any developer looking to write cleaner, safer code.
